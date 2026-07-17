@@ -2,14 +2,26 @@
 
 ## Live Deployment
 
-- **Live base URL:** `https://<your-app>.onrender.com` &nbsp;— _replace after deploying (see below)._
-- **Interactive docs (live):** `https://<your-app>.onrender.com/docs`
-- **Health check:** `https://<your-app>.onrender.com/health` → `{"status":"ok"}`
+- **Live base URL:** `https://swapify-3.onrender.com`
+- **Interactive docs (live):** `https://swapify-3.onrender.com/docs`
+- **Health check:** `https://swapify-3.onrender.com/health` → `{"status":"ok", "uptime_seconds": …}`
+
+The backend runs on Render as a **persistent, managed web service** — gunicorn with
+two uvicorn workers, supervised by Render's infrastructure. It is not attached to
+any terminal: closing the terminal, logging out, or shutting the laptop has no
+effect on it, and a crashed worker is respawned automatically. `GET /health`
+reports `uptime_seconds`, which is the simplest proof — the number keeps climbing
+across your machine being switched off entirely.
+
+**Keeping it awake.** Render's free tier spins an instance down after ~15 minutes
+of inactivity, and the next request then pays a ~30-50s cold start. An UptimeRobot
+monitor pings `/health` every 5 minutes, which keeps the instance warm and doubles
+as a downtime alert. Setup: [`DEPLOYMENT.md`](DEPLOYMENT.md) §10.
 
 All endpoints below are relative to the base URL — use `http://127.0.0.1:8000`
-locally or the live URL above once deployed. The full step-by-step deployment
-process (Render / Railway / PythonAnywhere), environment variables, and the
-database-first + sync workflow are documented in
+locally or the live URL above. The full step-by-step deployment process
+(Render / Railway / PythonAnywhere), environment variables, uptime monitoring, and
+the database-first + sync workflow are documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 **Database-first & CSV sync:** the API reads product data only from the SQLite
@@ -369,8 +381,17 @@ curl -X POST http://127.0.0.1:8000/compare-multiple \
 
 ### 5. Similar Products API ("Better Alternatives")
 This endpoint returns healthier alternatives: products in the **same category** as
-the scanned product with a **higher** health score, limited to 3 items. If the
-scanned product has no category, all other products are considered.
+the scanned product with a **higher** health score, limited to 3 items.
+
+> **Category matching (strict).** Alternatives are drawn **only** from the exact
+> same category as the scanned product, using the shared category taxonomy in
+> `src/category_taxonomy.py` (also used by the CSV seed, `sync_db.py` and
+> `import_data.py`, so every code path agrees). If a product's category is
+> unknown/`other`, the endpoint returns an **empty list** rather than a
+> grab-bag — so, for example, *Ching's Schezwan Chutney* (category `sauce`)
+> never surfaces *Maggi noodles* (category `noodles`) as an "alternative". A
+> genuinely category-less product yields `[]`, which is the correct answer:
+> better no suggestion than a mismatched one.
 
 **Personalization (dietary preferences):** when the request identifies a user —
 either via an `Authorization: Bearer <token>` header **or** an explicit
@@ -397,14 +418,17 @@ generic one: ordered by health score descending.
 
 **Example using `curl`:**
 ```bash
-# Generic (anonymous)
-curl http://127.0.0.1:8000/similar/8901262176224
+# Generic (anonymous) — 8906127540016 = Farmley Datebites (category protein_bar)
+curl http://127.0.0.1:8000/similar/8906127540016
 
 # Personalized for a logged-in user (high-protein preference ranks protein bars first)
-curl -H "Authorization: Bearer <YOUR_TOKEN>" http://127.0.0.1:8000/similar/8901262176224
+curl -H "Authorization: Bearer <YOUR_TOKEN>" http://127.0.0.1:8000/similar/8906127540016
 
 # Personalized via explicit user_id
-curl "http://127.0.0.1:8000/similar/8901262176224?user_id=2"
+curl "http://127.0.0.1:8000/similar/8906127540016?user_id=2"
+
+# Category-less / singleton category -> empty list (no cross-category grab-bag)
+curl http://127.0.0.1:8000/similar/8901595862962   # Ching's Schezwan Chutney -> []
 ```
 
 **Expected JSON Response (200 OK):**
@@ -456,7 +480,8 @@ curl http://127.0.0.1:8000/recent
 ```
 
 ### 7. Health Check API
-This endpoint checks the health status of the API.
+Liveness + readiness probe. Render polls this to decide whether an instance is
+healthy (and restarts it if not), and it is the endpoint UptimeRobot monitors.
 
 - **URL:** `/health`
 - **Method:** `GET`
@@ -469,8 +494,89 @@ curl http://127.0.0.1:8000/health
 **Expected JSON Response (200 OK):**
 ```json
 {
-  "status": "ok"
+  "status": "ok",
+  "uptime_seconds": 86412.7,
+  "uptime_human": "1d 0h 0m 12s",
+  "started_at": "2026-07-12T15:37:35.628068+00:00",
+  "server_time": "2026-07-13T15:37:48.310000+00:00",
+  "database": "ok",
+  "products_loaded": 252,
+  "pid": 23180
 }
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `"ok"`, or `"degraded"` if the database probe failed. |
+| `uptime_seconds` / `uptime_human` | How long this worker has been alive. **This is the proof the service is not tied to a terminal** — poll it before and after closing your terminal (or shutting the laptop) and the number will have grown, not reset. |
+| `started_at` | When the worker booted (UTC). |
+| `database` | `"ok"` if SQLite is readable from this worker, else `"unavailable"`. |
+| `products_loaded` | Row count in `products` — catches a booted-but-empty database. |
+| `pid` | Worker process ID. With `--workers 2` you will see this alternate between two values across requests; if it *changes unexpectedly*, a worker was respawned. |
+
+A failed database probe returns `status: "degraded"` with **HTTP 200**, not a 5xx —
+deliberately, so a transient DB blip doesn't cause Render to kill an otherwise
+healthy instance. Only a genuinely dead process fails the health check.
+
+`status` is still `"ok"` in the normal case, so any existing caller checking that
+field keeps working unchanged.
+
+#### Lightweight ping — `/ping`
+
+- **URL:** `/ping`
+- **Method:** `GET`
+
+Answers without touching the database, so a monitor polling every 5 minutes adds
+essentially no load to the free tier. Use `/health` when you want the full picture,
+`/ping` when you only need to know the process is answering.
+
+#### Live product count — `/product-count`
+
+Returns the **live** "Products available" figure for the frontend, counted from
+the database on every request (never hard-coded).
+
+- **URL:** `/product-count`
+- **Method:** `GET`
+
+**Example using `curl`:**
+```bash
+curl http://127.0.0.1:8000/product-count
+```
+
+**Expected JSON Response (200 OK):**
+```json
+{
+  "curated_count": 252,
+  "categories": 23,
+  "by_category": {
+    "chocolate": 48,
+    "chips": 34,
+    "soft_drink": 30,
+    "juice": 20,
+    "biscuit": 18,
+    "...": "..."
+  },
+  "external_source": "Open Food Facts",
+  "external_coverage": "on-demand",
+  "total_coverage_note": "252 products are curated in Swapify's database; any other barcode is resolved live against Open Food Facts at scan time, so total reachable products also include that external catalogue.",
+  "generated_at": "2026-07-17T20:51:15.895081+00:00"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `curated_count` | **Live** row count of Swapify's curated `products` table — the headline "Products available" number. Reflects the real architecture, not a constant. |
+| `categories` / `by_category` | Number of distinct categories and the per-category breakdown (also demonstrates the count is genuine). |
+| `external_source` / `external_coverage` | Swapify also resolves any barcode **not** in the curated DB against Open Food Facts at scan time (`on-demand`), so total *coverage* is far larger than `curated_count`. |
+| `total_coverage_note` | A ready-to-display sentence describing curated + external coverage. |
+| `generated_at` | UTC timestamp the count was computed. |
+
+Returns **HTTP 503** if the database is unreadable. Intended for the frontend's
+"Products available" widget (share `curated_count` for the headline, and
+optionally `total_coverage_note` for the "+ millions via Open Food Facts" line).
+
+```json
+{ "status": "ok", "uptime_seconds": 86412.7 }
 ```
 
 ### 8. Get Scan History API
@@ -729,7 +835,7 @@ own data. It integrates with **free AI APIs** — **OpenRouter** (many free-tier
 models) as the primary provider, with **Google Gemini** as an optional automatic
 failover — so a rate-limited free tier still returns a genuine AI answer.
 
-It is built to answer four kinds of questions:
+It is built to answer five kinds of questions:
 1. **Product ingredients and their risks** — e.g. *"What ingredients here are
    risky and why?"* (uses the product's flagged ingredients and risk levels).
 2. **Health scores and why** — e.g. *"Why did this get such a low score?"* The
@@ -738,12 +844,44 @@ It is built to answer four kinds of questions:
    passed to the model, so it explains the real math instead of guessing.
 3. **Ingredient substitutions** — e.g. *"What can I use instead of sugar?"* (see
    below).
-4. **General nutrition & food-transparency** questions — e.g. *"Why do vague
+4. **Top picks from the catalogue** — e.g. *"What are the top picks from all
+   products?"* or *"best chocolates"* (see **Structured top picks** below).
+5. **General nutrition & food-transparency** questions — e.g. *"Why do vague
    ingredient labels matter?"* (works with no barcode).
 
 When a `barcode` is supplied, the product's nutrition, ingredients, health score,
 flagged ingredients **and score breakdown** are passed to the model as grounding
 context.
+
+#### Greeting fast-path (performance)
+A bare greeting or smalltalk message (`"hi"`, `"hello"`, `"thanks"`, `"how are
+you"`, …) with no barcode is answered **instantly from a canned welcome — the LLM
+is never called**. This is what keeps a one-word "hi" at a few **milliseconds**
+instead of the multi-second (previously ~25s) round-trip a free-tier model + its
+failover chain would otherwise cost. Such a response has `source: "fast-path"`.
+The match is conservative: anything beyond a plain greeting (e.g. *"hi, is Maggi
+healthy?"*) still goes to the AI. Provider HTTP timeouts are also lowered and
+configurable (`OPENROUTER_TIMEOUT` / `GEMINI_TIMEOUT`, default 12s) so a slow
+model fails over sooner.
+
+#### Structured top picks (7+ rule)
+When the question asks for the best/top/healthiest products (*"what are the top
+picks from all products"*, *"best chocolates"*, *"healthiest noodles"*), the
+endpoint answers **from the real scored catalogue**, not with a generic
+paragraph. It scores every product with the same engine the Home page and product
+pages use and applies the **7+ rule** — a genuinely good, "Swapify Recommended"
+pick scores **≥ 7/10** (grade A/B). The matched picks are:
+1. passed to the LLM as grounding so the prose cites the actual products, and
+2. returned as a structured **`top_picks`** array (each item has `barcode`,
+   `product_name`, `brand`, `category`, `score`, `grade`, `recommended` and the
+   key nutrients), plus a `top_picks_category` field naming the applied filter
+   (or `null` for all products).
+
+A category can be inferred from the question (*"best chocolates"* → the
+`chocolate` category). If **no** product clears the 7+ bar (this catalogue is
+packaged snacks), the array is **never empty** — it returns the highest-scoring
+products instead, each flagged `recommended: false`, and the prose says so
+honestly.
 
 #### Ingredient Substitution Suggestions
 When the question asks **what to use instead of an ingredient** — e.g. *"What can
@@ -775,6 +913,8 @@ Set at least one provider key in `server/.env` (see "How to run the backend"):
 | `OPENROUTER_FALLBACK_MODELS` | Comma-separated models tried in order if the primary is busy. |
 | `GEMINI_API_KEY` | Optional second provider. Free key: https://aistudio.google.com/apikey |
 | `GEMINI_MODEL` | Gemini model (default `gemini-2.0-flash`). |
+| `OPENROUTER_TIMEOUT` | Per-request OpenRouter HTTP timeout in seconds (default `12`). Lower = faster failover when a model hangs. |
+| `GEMINI_TIMEOUT` | Per-request Gemini HTTP timeout in seconds (default `12`). |
 
 **Free-tier rate limits are handled gracefully.** Free models are frequently
 rate-limited (HTTP 429). The backend:
@@ -840,18 +980,66 @@ curl -X POST http://127.0.0.1:8000/chat \
 }
 ```
 
+**Example using `curl` (top picks — structured, uses the 7+ rule):**
+```bash
+curl -X POST http://127.0.0.1:8000/chat \
+-H "Content-Type: application/json" \
+-d '{"question": "what are the top picks from all products"}'
+```
+
+**Expected JSON Response (200 OK):**
+```json
+{
+  "response": "None of the products reach the 7+/10 recommended bar, but here are the highest-scoring options:\n1. Let's Try roasted channa — 6.0/10 (grade C)\n2. Yu whole wheat noodles — 6.0/10 (grade C)\n...",
+  "barcode": null,
+  "product_found": false,
+  "source": "openrouter",
+  "model": "openai/gpt-oss-120b:free",
+  "ai_enabled": true,
+  "top_picks_category": null,
+  "top_picks": [
+    {
+      "barcode": "8906161390870",
+      "product_name": "Let's Try roasted channa",
+      "brand": "Let's Try",
+      "category": "chips",
+      "score": 6.0,
+      "grade": "C",
+      "recommended": false,
+      "sugar_g_per_serving": 1.0,
+      "protein_g_per_serving": 7.0,
+      "sodium_mg_per_serving": 32.0,
+      "fiber_g_per_serving": 5.0,
+      "image_url": "/product-images/_placeholder.svg"
+    }
+  ]
+}
+```
+
+**Example using `curl` (greeting fast-path — instant, no LLM):**
+```bash
+curl -X POST http://127.0.0.1:8000/chat \
+-H "Content-Type: application/json" \
+-d '{"question": "hi"}'
+# -> {"response": "Hi! I'm Swapify's AI nutritionist...", "source": "fast-path", ...}
+```
+
 **Response fields:**
 - `response` (string): The AI-generated (or fallback) answer.
 - `barcode` (string|null): Echoes the requested barcode.
 - `product_found` (bool): Whether product context was located.
-- `source` (string): Which provider answered — `"openrouter"`, `"gemini"`, or
-  `"fallback"` (deterministic) when every provider failed.
-- `model` (string|null): The exact model that answered (null on fallback).
+- `source` (string): Which provider answered — `"openrouter"`, `"gemini"`,
+  `"fallback"` (deterministic) when every provider failed, or `"fast-path"` for an
+  instant greeting reply.
+- `model` (string|null): The exact model that answered (null on fallback/fast-path).
 - `ai_enabled` (bool): Whether any AI provider key is configured.
 - `fallback_reason` (string): included **only** on the fallback path, explaining
   why no provider answered.
 - `substitutions` (array): included **only** when the question asks for an
   ingredient alternative; each item has `ingredient`, `alternatives` (list) and `reason`.
+- `top_picks` (array) / `top_picks_category` (string|null): included **only** for
+  top-picks questions; the structured, ranked list (see **Structured top picks**)
+  and the category filter applied (or `null` for all products).
 - `product_name`, `score`, `grade`, `ingredient_flags`: included only when a product was found.
 
 **Expected Error Response (400 Bad Request):** when `question` is empty.
@@ -2295,6 +2483,206 @@ them at scoring time and returns them in the `ingredient_flags` array of the
 
 Beneficial ingredients (e.g. oats, whey protein) are not assigned a risk level and
 do not appear in `ingredient_flags`.
+
+---
+
+### 30. Real-World Experiment Logging API
+
+An append-only log of scans performed by real test devices in the field, plus the
+analytics computed over it. Built for the "does this actually work in a shop, on a
+real phone?" experiments.
+
+**Why it is separate from the other logs.** `scan_history` is a side effect of a
+successful `/product/{barcode}` lookup (catalogue products only), and `/activity`
+records in-app behaviour for a *logged-in* user. An experiment log has to accept a
+scan from an anonymous phone, record barcodes that aren't in the catalogue (a
+failed scan is the most interesting data point), and stay stable no matter how the
+product endpoints change. So it gets its own table, `experiment_scan_logs`.
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /experiment/log-scan` | none (optional Bearer) | Record one scan from a test device |
+| `GET /experiment/logs` | **admin** | Retrieve the log, filtered + paginated |
+| `GET /experiment/analytics` | **admin** | Just the counts, without the rows |
+
+#### Admin authentication
+
+The two read endpoints are admin-only — the log is a device-level record. Prove
+admin in **either** of two ways:
+
+1. **Shared secret** — send the `X-Admin-Token` header. The value comes from the
+   `ADMIN_TOKEN` environment variable.
+   ```bash
+   curl -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/experiment/logs"
+   ```
+2. **Admin user** — log in normally and send the JWT as `Authorization: Bearer
+   <token>`. This works only if that user's email is listed in the `ADMIN_EMAILS`
+   env var (comma-separated).
+   ```bash
+   curl -H "Authorization: Bearer $JWT" "$BASE/experiment/logs"
+   ```
+
+Anything else gets **403**. If `ADMIN_TOKEN` is not set the app falls back to the
+dev token `swapify-admin-dev` and logs a warning at startup — never deploy that.
+
+#### A. Log a scan — `POST /experiment/log-scan`
+
+Deliberately open: a phone in a shop aisle is not logged in. If a Bearer token
+*is* present the scan is additionally attributed to that user.
+
+**Request body**
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `barcode` | string | **yes** | The scanned code. Not validated against the catalogue — failed/unknown scans are exactly what an experiment wants to capture. |
+| `device_type` | string | no | One of `mobile`, `tablet`, `desktop`, `scanner`, `unknown`. **Auto-detected from the User-Agent when omitted.** Common synonyms (`phone`, `android`, `ios`, `ipad`, `laptop`, `pc`) are folded into the canonical buckets; anything unrecognised becomes `unknown` rather than being rejected. |
+| `device_info` | string *or* object | no | Free-form. A plain string (`"iPhone 14, iOS 17.4"`) or a JSON object (`{"os":"Android 14","model":"Pixel 8"}`). Objects are stored as JSON and returned as objects. |
+| `timestamp` | string (ISO-8601) | no | When the scan happened on the device. Defaults to server time. Normalised to UTC on write, so a phone in another timezone still lands in the right day bucket. An unparseable value falls back to server time (and is logged) rather than failing the request. |
+| `device_id` | string | no | Stable per-device ID — this is what `unique_devices` counts. When omitted, a fingerprint is derived by hashing `device_info` + User-Agent. **Send a real `device_id` if you can:** two identical phones with byte-identical User-Agents will otherwise collapse into one device. |
+| `notes` | string | no | Free-text field note, e.g. `"aisle 4, poor lighting"`. |
+
+The minimum viable call is just a barcode — everything else is inferred:
+
+```bash
+curl -X POST "$BASE/experiment/log-scan" \
+  -H "Content-Type: application/json" \
+  -d '{"barcode": "8901491101837"}'
+```
+
+```json
+{
+  "message": "Scan logged",
+  "log": {
+    "id": 1,
+    "barcode": "8901491101837",
+    "device_type": "mobile",
+    "device_info": null,
+    "device_id": "fp_05f02457b0badcfa",
+    "user_id": null,
+    "notes": null,
+    "timestamp": "2026-07-13T15:38:59.712171+00:00",
+    "created_at": "2026-07-13 15:38:59"
+  }
+}
+```
+
+`device_type` came out as `mobile` because the request carried an iPhone
+User-Agent. A fully explicit call from a known device:
+
+```bash
+curl -X POST "$BASE/experiment/log-scan" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "barcode": "8901491101837",
+        "device_type": "phone",
+        "device_id": "dev-pixel-01",
+        "device_info": {"os": "Android 14", "browser": "Chrome", "model": "Pixel 8"},
+        "timestamp": "2026-07-12T09:15:00Z",
+        "notes": "aisle 4, store test"
+      }'
+```
+
+`"phone"` is normalised to `"mobile"`, and the `Z` timestamp is stored as
+`2026-07-12T09:15:00+00:00`.
+
+**Errors:** `400` if `barcode` is missing or empty.
+
+#### B. Retrieve the log — `GET /experiment/logs` *(admin)*
+
+Newest first. All query parameters are optional:
+
+| Param | Default | Notes |
+|---|---|---|
+| `start_date` | — | Inclusive `YYYY-MM-DD`. |
+| `end_date` | — | Inclusive — `end_date=2026-07-13` covers through 23:59:59 on the 13th. |
+| `device_type` | — | Same buckets and synonyms as the write path, so `?device_type=phone` works. |
+| `barcode` | — | Exact match — every scan of one product. |
+| `limit` | `100` | Clamped to 1–500. |
+| `offset` | `0` | For paging. |
+
+A malformed date returns **400** (`start_date must be in YYYY-MM-DD format`)
+rather than silently matching nothing.
+
+```bash
+curl -H "X-Admin-Token: $ADMIN_TOKEN" \
+  "$BASE/experiment/logs?device_type=mobile&start_date=2026-07-01&end_date=2026-07-13&limit=50"
+```
+
+```json
+{
+  "filters": { "start_date": "2026-07-01", "end_date": "2026-07-13", "device_type": "mobile", "barcode": null },
+  "pagination": { "limit": 50, "offset": 0, "returned": 2, "matched": 2, "has_more": false },
+  "analytics": {
+    "total_scans": 2,
+    "unique_devices": 2,
+    "unique_barcodes": 1,
+    "scans_by_device_type": { "mobile": 2 },
+    "top_barcodes": [ { "barcode": "8901491101837", "scans": 2 } ],
+    "scans_per_day": [ { "date": "2026-07-12", "scans": 1 }, { "date": "2026-07-13", "scans": 1 } ]
+  },
+  "logs": [
+    {
+      "id": 2,
+      "barcode": "8901491101837",
+      "device_type": "mobile",
+      "device_info": { "os": "Android 14", "browser": "Chrome", "model": "Pixel 8" },
+      "device_id": "dev-pixel-01",
+      "user_id": null,
+      "notes": "aisle 4, store test",
+      "timestamp": "2026-07-12T09:15:00+00:00",
+      "created_at": "2026-07-13 15:38:59"
+    }
+  ]
+}
+```
+
+Note that `analytics` is computed over the **filtered** set, not the whole table —
+so "mobile scans in the first half of July" reports its own totals, and
+`pagination.matched` tells you how many rows matched regardless of `limit`.
+
+#### C. Analytics — `GET /experiment/analytics` *(admin)*
+
+The same three headline counts required for the experiment, without dragging back
+thousands of rows to render them. Takes the identical filters as `/experiment/logs`.
+
+| Field | Meaning |
+|---|---|
+| `total_scans` | Rows matching the filter. |
+| `unique_devices` | Distinct `device_id` values (see the fingerprint caveat above). |
+| `unique_barcodes` | Distinct products scanned. |
+| `scans_by_device_type` | Scan count per device bucket. |
+| `top_barcodes` | Ten most-scanned barcodes, descending. |
+| `scans_per_day` | Daily scan counts, ascending — the adoption curve. |
+| `first_scan_at` / `last_scan_at` | Time span the data covers. |
+
+```bash
+curl -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/experiment/analytics"
+```
+
+```json
+{
+  "filters": { "start_date": null, "end_date": null, "device_type": null, "barcode": null },
+  "first_scan_at": "2026-07-12T09:15:00+00:00",
+  "last_scan_at": "2026-07-13T15:38:59.809884+00:00",
+  "total_scans": 3,
+  "unique_devices": 3,
+  "unique_barcodes": 2,
+  "scans_by_device_type": { "mobile": 2, "desktop": 1 },
+  "top_barcodes": [
+    { "barcode": "8901491101837", "scans": 2 },
+    { "barcode": "8901719110018", "scans": 1 }
+  ],
+  "scans_per_day": [
+    { "date": "2026-07-12", "scans": 1 },
+    { "date": "2026-07-13", "scans": 2 }
+  ]
+}
+```
+
+> **Retention caveat.** On Render's free tier the filesystem is wiped on every
+> restart and redeploy, so the log survives only as long as the instance does.
+> Export anything you need to keep (`GET /experiment/logs?limit=500`) before
+> redeploying. See [`DEPLOYMENT.md`](DEPLOYMENT.md) §11.
 
 ## Health Scoring Logic (V2)
 
