@@ -26,6 +26,16 @@ try:
 except ImportError:  # pragma: no cover - import style fallback
     from . import ocr_label_scanner
 
+# Shared product-category taxonomy (Task 2). The single source of truth for how a
+# product name/brand maps to a category, used by the CSV seed here and by the ops
+# scripts (sync_db.py, import_data.py). "Better alternatives" only compares within
+# a category, so this is what keeps Maggi (noodles) from being offered as an
+# alternative to a Schezwan chutney (sauce). Same dual import style as above.
+try:
+    from category_taxonomy import guess_category
+except ImportError:  # pragma: no cover - import style fallback
+    from .category_taxonomy import guess_category
+
 # In-memory caching (Task 1C). cachetools is the preferred production library;
 # fall back to a tiny time-to-live cache with the same subset of the API we use
 # so the app still runs if the dependency is unavailable.
@@ -157,6 +167,15 @@ OPENROUTER_MODELS = [OPENROUTER_MODEL] + [
 ]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
+# Per-request HTTP timeouts for the LLM providers (Task 1 — chat performance).
+# These were hard-coded at 25s, so a single wedged free-tier request could hang
+# /chat for the full 25s before failover even began; with a fallback model that
+# stacks into ~25s+ for a message as trivial as "hi". A 12s ceiling still gives a
+# healthy model ample time to answer but fails over to the next model/provider far
+# sooner when one is slow. Overridable via the environment for tuning per deploy.
+OPENROUTER_TIMEOUT_S = float(os.environ.get("OPENROUTER_TIMEOUT", "12"))
+GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT", "12"))
+
 # --- Provider 2 (optional): Google Gemini (generous free tier) ----------------
 # Used as an automatic failover when every OpenRouter free model is rate-limited,
 # so the chatbot keeps giving real AI answers instead of dropping to the
@@ -209,6 +228,30 @@ def get_current_user_optional(token: Optional[str] = Depends(OAuth2PasswordBeare
 
 app = FastAPI()
 
+# Wall-clock start of this worker process. /health reports the delta, which is how
+# you prove the service outlived the terminal that launched it: the uptime keeps
+# climbing across SSH disconnects, laptop sleep and lid-close (Task 1B).
+APP_STARTED_AT = time.time()
+APP_STARTED_AT_ISO = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _format_uptime(seconds: float) -> str:
+    """Render an uptime like ``3d 4h 12m 5s`` (largest non-zero unit first)."""
+    total = int(seconds)
+    days, rem = divmod(total, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    if minutes or hours or days:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 recent_scans = []
 
 # CORS origins are configurable for deployment (Task 1): set ``CORS_ORIGINS`` to a
@@ -223,12 +266,27 @@ else:
     ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
     _allow_credentials = True
 
+# Mobile clients (Task 1C). A phone *browser* hitting the API sends a normal
+# https:// origin and is covered by the list above, but a hybrid shell (Capacitor,
+# Cordova, a WebView loading local files) sends `capacitor://localhost`,
+# `ionic://localhost` or `http://localhost:<port>` instead. Those are matched by
+# regex so locking CORS_ORIGINS down to the production web origin does not
+# silently break the phone build. Override with CORS_ORIGIN_REGEX if needed.
+CORS_ORIGIN_REGEX = os.environ.get(
+    "CORS_ORIGIN_REGEX",
+    r"^(https?://localhost(:\d+)?|https?://127\.0\.0\.1(:\d+)?|capacitor://localhost|ionic://localhost)$",
+).strip() or None
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX,
     allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Let the browser cache the preflight for 10 minutes: mobile networks are
+    # high-latency, and an OPTIONS round-trip before every request is felt.
+    max_age=600,
 )
 
 # Task 1D — Gzip compression. Responses larger than ``minimum_size`` bytes are
@@ -236,6 +294,41 @@ app.add_middleware(
 # most HTTP clients do). Big JSON payloads (/search, /home-feed, /recommendations)
 # shrink dramatically over the wire; tiny responses are left uncompressed.
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# ------------------------------------------------------------------------------
+# Error tracking (Task 2) — Sentry
+# ------------------------------------------------------------------------------
+# No-ops entirely unless SENTRY_DSN is set, so local dev and the test suite are
+# unaffected and the app still boots if sentry-sdk isn't installed. See
+# observability.py for what context is attached and what is scrubbed.
+try:
+    from observability import (init_sentry, install_request_context,
+                               capture_message as obs_capture_message)
+except ImportError:  # running as a package (src.app) rather than from src/
+    from .observability import (init_sentry, install_request_context,
+                                capture_message as obs_capture_message)
+
+
+def _user_id_from_auth_header(auth_header):
+    """Best-effort user id from a Bearer token, for Sentry's user context.
+
+    Deliberately silent: a bad or absent token means an anonymous event, never an
+    error — error tracking must not be able to generate errors.
+    """
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        return None
+    try:
+        payload = jwt.decode(auth_header.split(None, 1)[1], SECRET_KEY,
+                             algorithms=[ALGORITHM])
+        return payload.get("user_id")
+    except Exception:
+        return None
+
+
+SENTRY_ENABLED = init_sentry()
+# Installed unconditionally: even with Sentry off it assigns the X-Request-ID that
+# ties a user's bug report to a line in the logs.
+install_request_context(app, _user_id_from_auth_header)
 
 # ------------------------------------------------------------------------------
 # Product images (Task 2)
@@ -297,10 +390,37 @@ PRODUCT_CACHE_TTL = 3600  # 1 hour
 _product_cache = TTLCache(maxsize=512, ttl=PRODUCT_CACHE_TTL)
 _popular_cache = TTLCache(maxsize=8, ttl=PRODUCT_CACHE_TTL)
 
+# Hit/miss counters. Without these "is the cache working?" is unanswerable from the
+# outside: a cache that never hits and a cache that always hits look identical from
+# a response body, and a warm endpoint being fast proves nothing on its own. Exposed
+# via GET /cache-stats. Plain ints — the GIL makes += safe enough for a counter whose
+# exact value under a race does not matter.
+_cache_stats = {"product_hits": 0, "product_misses": 0,
+                "popular_hits": 0, "popular_misses": 0,
+                "leaderboard_hits": 0, "leaderboard_misses": 0,
+                "invalidations": 0}
+
+# The leaderboard is the most expensive read in the API (~28ms server-side): ranking
+# users means a weighted aggregate over user_activity, and then resolving each user's
+# badges, which evaluates live challenge progress per user. Batching the SQL only goes
+# so far — the badge evaluation is a nested N+1 inside the challenge logic.
+#
+# But a leaderboard is an aggregate that changes slowly and is read far more often than
+# it changes, so it is a textbook cache. A short TTL keeps it honest: at 60s the board
+# is never more than a minute stale, which is invisible to a user and turns the endpoint
+# from ~28ms into a dict lookup. Keyed by (period, limit) — a small, bounded key space.
+LEADERBOARD_CACHE_TTL = 60  # seconds
+_leaderboard_cache = TTLCache(maxsize=32, ttl=LEADERBOARD_CACHE_TTL)
+
 
 def cache_get_product(barcode):
     """Return a cached generic scored product for ``barcode`` (or None)."""
-    return _product_cache.get(barcode)
+    hit = _product_cache.get(barcode)
+    if hit is None:
+        _cache_stats["product_misses"] += 1
+    else:
+        _cache_stats["product_hits"] += 1
+    return hit
 
 
 def cache_set_product(barcode, payload):
@@ -317,6 +437,52 @@ def invalidate_product_cache(barcode=None):
     else:
         _product_cache.pop(barcode, None)
     _popular_cache.clear()
+    _cache_stats["invalidations"] += 1
+
+
+def _hit_rate(hits, misses):
+    total = hits + misses
+    return round(hits / total, 4) if total else None
+
+
+@app.get("/cache-stats")
+def cache_stats():
+    """Cache hit/miss counters — the evidence that caching is actually working.
+
+    ``hit_rate`` is None until the cache has been asked for something; a rate that
+    stays near zero under repeat traffic means entries are being evicted or
+    invalidated faster than they are reused, which is a cache that costs memory and
+    buys nothing. Counters are per-worker and reset on restart, so read them from a
+    single worker (or expect them to differ between them).
+    """
+    s = _cache_stats
+    return {
+        "product_cache": {
+            "hits": s["product_hits"],
+            "misses": s["product_misses"],
+            "hit_rate": _hit_rate(s["product_hits"], s["product_misses"]),
+            "entries": len(_product_cache),
+            "maxsize": _product_cache.maxsize,
+        },
+        "popular_cache": {
+            "hits": s["popular_hits"],
+            "misses": s["popular_misses"],
+            "hit_rate": _hit_rate(s["popular_hits"], s["popular_misses"]),
+            "entries": len(_popular_cache),
+            "maxsize": _popular_cache.maxsize,
+        },
+        "leaderboard_cache": {
+            "hits": s["leaderboard_hits"],
+            "misses": s["leaderboard_misses"],
+            "hit_rate": _hit_rate(s["leaderboard_hits"], s["leaderboard_misses"]),
+            "entries": len(_leaderboard_cache),
+            "maxsize": _leaderboard_cache.maxsize,
+            "ttl_seconds": LEADERBOARD_CACHE_TTL,
+        },
+        "invalidations": s["invalidations"],
+        "ttl_seconds": PRODUCT_CACHE_TTL,
+        "pid": os.getpid(),
+    }
 
 
 # ------------------------------------------------------------------------------
@@ -336,9 +502,26 @@ CSV_SEED_PATH = os.environ.get("SWAPIFY_CSV_PATH") or os.path.join(
 )
 
 
+# A live deployment runs several gunicorn workers against this one SQLite file, so
+# every connection opts into WAL (readers never block the writer) and waits out a
+# concurrent writer instead of failing instantly with "database is locked".
+SQLITE_BUSY_TIMEOUT_S = float(os.environ.get("SQLITE_BUSY_TIMEOUT", "15"))
+_wal_enabled = False
+
+
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
+    global _wal_enabled
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
+    if not _wal_enabled:
+        # journal_mode is a persistent property of the database file, so this only
+        # needs to succeed once; the flag keeps it off the per-request hot path.
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            _wal_enabled = True
+        except sqlite3.Error as exc:  # pragma: no cover - e.g. read-only volume
+            logger.warning("could not enable WAL mode: %s", exc)
+    conn.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_S * 1000)}")
     return conn
 
 @app.post("/register")
@@ -573,6 +756,16 @@ def generic_scored_product(barcode: str):
 BARCODE_FORMATS = {8: "EAN-8", 12: "UPC-A", 13: "EAN-13"}
 
 
+def normalize_barcode(barcode) -> str:
+    """Strip the separators a barcode is never stored with (spaces, hyphens).
+
+    A scanner emits bare digits, so a stored barcode carrying a space can never be
+    matched by a scan — the CSV's Red Bull row ('0000 901626026') was exactly this.
+    Normalising on the way in keeps the key in the form a scan will actually arrive in.
+    """
+    return re.sub(r"[\s\-]", "", ("" if barcode is None else str(barcode)).strip())
+
+
 def gs1_check_digit(payload: str) -> int:
     """Return the GS1 modulo-10 check digit for ``payload`` (all data digits,
     without the check digit). Rightmost data digit is weighted x3, then x1, ..."""
@@ -657,6 +850,32 @@ def validate_barcode(barcode: str) -> dict:
     return result
 
 
+def lookup_by_gs1_payload(cursor, barcode: str):
+    """Find a product by its GS1 payload, ignoring the check digit. None if no match.
+
+    A scanner verifies the check digit before it emits anything, so it can only ever
+    hand us a *valid* barcode. Much of the catalogue was transcribed by hand from the
+    physical packs, and 47 of those rows carry a check digit that does not match their
+    payload — a code no scanner will ever produce. On an exact match alone those
+    products are permanently unscannable.
+
+    Everything before the check digit is the GS1 item number, which identifies the
+    product on its own (the check digit is *derived* from it, carrying no identity).
+    So matching on the payload recovers the row without guessing at a correction, and
+    it cannot mismatch: one payload belongs to exactly one item. A transcription error
+    in the payload itself still misses, which is the honest outcome — the fix for that
+    is re-scanning the pack, not inventing a barcode here.
+    """
+    cleaned = normalize_barcode(barcode)
+    if not cleaned.isdigit() or len(cleaned) not in BARCODE_FORMATS:
+        return None
+    cursor.execute(
+        "SELECT * FROM products WHERE length(barcode) = ? AND substr(barcode, 1, ?) = ?",
+        (len(cleaned), len(cleaned) - 1, cleaned[:-1]),
+    )
+    return cursor.fetchone()
+
+
 @app.get("/validate-barcode/{barcode}")
 def validate_barcode_endpoint(barcode: str):
     """Validate a barcode and, if invalid, return a suggested correction."""
@@ -674,6 +893,16 @@ def get_product(barcode: str, device_id: Optional[str] = None, user_id: Optional
 
     cursor.execute("SELECT * FROM products WHERE barcode = ?", (barcode,))
     row = cursor.fetchone()
+
+    # The scan we were handed is check-digit-valid by construction, but the row it
+    # belongs to may have been transcribed with a bad one. Retry on the GS1 payload,
+    # then continue under the *stored* barcode so history, scoring and the cache all
+    # key off one canonical value.
+    scanned_barcode = barcode
+    if row is None:
+        row = lookup_by_gs1_payload(cursor, barcode)
+        if row is not None:
+            barcode = row["barcode"]
 
     if row and (device_id or user_id):
         cursor.execute(
@@ -721,6 +950,19 @@ def get_product(barcode: str, device_id: Optional[str] = None, user_id: Optional
         p_dict['image_url'] = image_or_placeholder(p_dict.get('image_url'))
         if not validation["valid"]:
             p_dict['barcode_validation'] = validation
+        if scanned_barcode != barcode:
+            # Resolved on the GS1 payload, not an exact hit — say so, so a bad
+            # stored check digit shows up in testing instead of passing silently.
+            p_dict['barcode_matched_on'] = {
+                "scanned": scanned_barcode,
+                "stored": barcode,
+                "reason": "check_digit_mismatch",
+                "detail": (
+                    "The stored barcode's check digit does not match its GS1 payload; "
+                    "matched on the payload. The stored value needs re-verifying "
+                    "against the physical pack."
+                ),
+            }
         return p_dict
 
     # Fallback: fetch & score from Open Food Facts when not in the local DB.
@@ -1374,12 +1616,22 @@ def find_better_alternatives(barcode: str, preferences: dict = None):
     scanned_dict = dict(scanned_product)
     scanned_score, _, _, _ = calculate_health_score_v2(scanned_dict, 1, preferences)
 
-    category = scanned_dict.get('category')
+    category = (scanned_dict.get('category') or "").strip().lower()
 
-    if category:
-        cursor.execute("SELECT * FROM products WHERE barcode != ? AND category = ?", (barcode, category))
-    else:
-        cursor.execute("SELECT * FROM products WHERE barcode != ?", (barcode,))
+    # Alternatives must come from the *same real* category, never a grab-bag. When
+    # the product has no meaningful category ("other"/unknown), we deliberately
+    # return no alternatives rather than pull unrelated products — that is exactly
+    # the bug this guard prevents (e.g. a Schezwan chutney offering Maggi noodles
+    # because both had collapsed into "other"). Better an empty list than a
+    # mismatched suggestion.
+    if not category or category == "other":
+        conn.close()
+        return []
+
+    cursor.execute(
+        "SELECT * FROM products WHERE barcode != ? AND lower(category) = ?",
+        (barcode, category),
+    )
     all_products = cursor.fetchall()
     conn.close()
 
@@ -1994,7 +2246,104 @@ def get_recent():
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Liveness + readiness probe, and the endpoint UptimeRobot polls (Task 2).
+
+    Still returns ``status: "ok"`` for every existing caller, but now also proves
+    the process is genuinely serving rather than merely accepting connections:
+    ``uptime_seconds`` climbs for as long as the worker has been alive (so it
+    demonstrates the service is not tied to a terminal session) and ``database``
+    confirms the SQLite file is readable from this worker.
+
+    ``status`` is ``"degraded"`` — not a 5xx — if the DB probe fails, so a blip in
+    the database does not make Render kill an otherwise healthy instance.
+    """
+    db_status = "ok"
+    product_count = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM products")
+        product_count = cur.fetchone()[0]
+        conn.close()
+    except Exception as exc:
+        logger.warning("health check: database probe failed: %s", exc)
+        db_status = "unavailable"
+
+    uptime = time.time() - APP_STARTED_AT
+    return {
+        "status": "ok" if db_status == "ok" else "degraded",
+        "uptime_seconds": round(uptime, 1),
+        "uptime_human": _format_uptime(uptime),
+        "started_at": APP_STARTED_AT_ISO,
+        "server_time": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "database": db_status,
+        "products_loaded": product_count,
+        # Whether error tracking is actually live in this environment. A deploy that
+        # forgets SENTRY_DSN looks completely healthy otherwise — the errors just go
+        # nowhere, which you'd only discover when you needed them.
+        "error_tracking": "sentry" if SENTRY_ENABLED else "disabled",
+        "pid": os.getpid(),
+    }
+
+
+@app.get("/ping")
+def ping():
+    """Cheapest possible liveness check — no database, no work.
+
+    Exists so an uptime monitor polling every 5 minutes cannot itself become load
+    on the free tier. ``/health`` is the richer probe; this one just answers.
+    """
+    return {"status": "ok", "uptime_seconds": round(time.time() - APP_STARTED_AT, 1)}
+
+
+@app.get("/product-count")
+def product_count():
+    """Live product-count for the "Products available" figure (Task 3).
+
+    Returns the *real* architecture instead of a hard-coded number:
+
+      - ``curated_count``  : products in Swapify's own curated database, counted
+                             live from the ``products`` table on every request.
+      - ``by_category``    : the live per-category breakdown (also proves the
+                             count is genuine, not a constant).
+      - ``external_*``     : Swapify also resolves any barcode not in the curated
+                             DB against Open Food Facts at scan time, so total
+                             *coverage* is far larger than the curated count. That
+                             catalogue has no fixed size we can assert, so it is
+                             described rather than invented.
+
+    Shaped for the frontend (Rashi): show ``curated_count`` as the headline and,
+    optionally, ``total_coverage_note`` for the "+ millions via Open Food Facts".
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM products")
+        curated = cur.fetchone()[0]
+        cur.execute(
+            "SELECT COALESCE(NULLIF(TRIM(category), ''), 'uncategorized') AS c, "
+            "COUNT(*) FROM products GROUP BY c ORDER BY COUNT(*) DESC, c"
+        )
+        by_category = {row[0]: row[1] for row in cur.fetchall()}
+        conn.close()
+    except Exception as exc:
+        logger.warning("/product-count: database read failed: %s", exc)
+        raise HTTPException(status_code=503, detail="product count unavailable")
+
+    return {
+        "curated_count": curated,
+        "categories": len(by_category),
+        "by_category": by_category,
+        "external_source": "Open Food Facts",
+        "external_coverage": "on-demand",
+        "total_coverage_note": (
+            f"{curated} products are curated in Swapify's database; any other "
+            "barcode is resolved live against Open Food Facts at scan time, so "
+            "total reachable products also include that external catalogue."
+        ),
+        "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+
 
 @app.get("/compare/{barcode1}/{barcode2}")
 def compare_products(barcode1: str, barcode2: str, user_id: Optional[int] = Depends(get_current_user_optional)):
@@ -2657,7 +3006,7 @@ def _call_openrouter_model(model: str, question: str, context: str) -> str:
                 "HTTP-Referer": "https://swapify.app",
                 "X-Title": "Swapify Nutritionist",
             },
-            timeout=25,
+            timeout=OPENROUTER_TIMEOUT_S,
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"OpenRouter request failed: {exc}")
@@ -2735,7 +3084,7 @@ def _call_gemini(question: str, context: str) -> str:
             params={"key": GEMINI_API_KEY},
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=25,
+            timeout=GEMINI_TIMEOUT_S,
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"Gemini request failed: {exc}")
@@ -2852,6 +3201,207 @@ def fallback_answer(question: str, product: Optional[dict]) -> str:
     return " ".join(parts)
 
 
+# ------------------------------------------------------------------------------
+# Fast-path for greetings / smalltalk (Task 1 — chat performance)
+# ------------------------------------------------------------------------------
+# A bare "hi" has no product to reason about and no question to answer, yet it used
+# to take the full LLM round-trip (and, when a free model was slow, the whole
+# provider-failover chain) — ~25s for a one-word greeting. These messages get a
+# instant, deterministic welcome instead of ever touching the network. The match
+# is deliberately conservative: it only fires when the *entire* message is a
+# greeting/thanks (optionally with a product-less "how are you"), so a real
+# question like "hi, is Maggi healthy?" still goes to the AI.
+GREETING_WORDS = {
+    "hi", "hii", "hiii", "hello", "helo", "hey", "heya", "heyy", "yo", "hola",
+    "namaste", "he", "sup", "greetings", "gm", "good morning", "good afternoon",
+    "good evening", "howdy", "hi there", "hello there", "hey there",
+}
+THANKS_WORDS = {
+    "thanks", "thank you", "thankyou", "thx", "ty", "thanku", "thank u",
+    "cool", "ok", "okay", "great", "nice", "awesome", "got it",
+}
+SMALLTALK_PATTERNS = (
+    "how are you", "how r u", "how are u", "what can you do", "who are you",
+    "what do you do", "help", "start",
+)
+
+GREETING_REPLY = (
+    "Hi! I'm Swapify's AI nutritionist. I can help you understand any packaged "
+    "food: scan or enter a barcode and ask me things like \"why did this score "
+    "so low?\", \"what's a healthier alternative?\", or \"what can I use instead "
+    "of palm oil?\". You can also ask for \"the top picks from all products\". "
+    "What would you like to check?"
+)
+
+
+def greeting_fast_reply(question: str, has_barcode: bool):
+    """Return an instant canned reply for a pure greeting/smalltalk message, else
+    None. Never fires when a product barcode is attached (that's a real product
+    question) or when the message carries anything beyond a short greeting."""
+    if has_barcode:
+        return None
+    text = (question or "").strip().lower()
+    # Strip trailing punctuation/emoji-ish characters so "hi!!!" still matches.
+    stripped = re.sub(r"[\s!.,?~]+$", "", text)
+    if not stripped:
+        return None
+    if stripped in GREETING_WORDS or stripped in THANKS_WORDS:
+        return GREETING_REPLY
+    # Very short smalltalk openers ("how are you", "what can you do", "help").
+    if len(stripped) <= 24 and any(pat in stripped for pat in SMALLTALK_PATTERNS):
+        return GREETING_REPLY
+    return None
+
+
+# ------------------------------------------------------------------------------
+# Structured "top picks" answers (Task 4 — functional AI chat)
+# ------------------------------------------------------------------------------
+# When a user asks "what are the top picks from all products" (or "best
+# chocolates", "healthiest chips"…) the chatbot should answer from the real
+# scored catalogue, not with a generic paragraph. We reuse the Home page's "7+
+# rule": a genuinely good, "Swapify Recommended" pick scores >= 7/10 (grade
+# A/B). Products clearing that bar are returned first and flagged
+# ``recommended: true``. Because this catalogue is packaged snacks (nothing may
+# reach 7), we never return an *empty* list for a valid question — we fall back
+# to the highest-scoring products available and flag them ``recommended: false``,
+# so the answer is always structured and useful rather than blank. The list is
+# returned to the client AND fed to the LLM as grounding so its prose cites the
+# actual products.
+TOP_PICKS_INTENT_PATTERNS = (
+    "top pick", "top picks", "top choice", "best pick", "best product",
+    "best products", "best option", "healthiest", "recommend", "recommendation",
+    "top rated", "best rated", "highest scoring", "highest score", "top product",
+    "what should i buy", "which product", "what to buy", "best food", "top food",
+    "show me the best", "what are the best", "good products",
+)
+
+# Question-category words that are too generic to be a real product filter — a
+# match here means "across all products", not that single fallback bucket.
+_GENERIC_PICK_CATEGORIES = {"other", "drink", "bar"}
+
+
+def is_top_picks_question(question: str) -> bool:
+    """True when the message is asking for the best/top/healthiest products."""
+    text = (question or "").lower()
+    return any(pat in text for pat in TOP_PICKS_INTENT_PATTERNS)
+
+
+def _pick_category_from_question(question: str):
+    """Infer an optional category filter from the question (e.g. "best
+    chocolates" -> "chocolate"). Returns None for an all-products query."""
+    cat = guess_category(question)
+    if cat in _GENERIC_PICK_CATEGORIES:
+        return None
+    return cat
+
+
+def _score_catalogue(category=None):
+    """Score every product (optionally within ``category``); healthiest first.
+
+    Returns a list of pick dicts, each carrying ``recommended`` = does it clear
+    the 7+ rule. Reuses the same generic (non-personalized) scoring the Home page
+    and product pages use, so a "top pick" here is identical to the score shown
+    everywhere else.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    if category:
+        cursor.execute("SELECT * FROM products WHERE lower(category) = ?", (category,))
+    else:
+        cursor.execute("SELECT * FROM products")
+    rows = cursor.fetchall()
+    conn.close()
+
+    scored = []
+    for row in rows:
+        p = dict(row)
+        score, grade, _, _ = calculate_health_score_v2(p, 1, None)
+        scored.append({
+            "barcode": p["barcode"],
+            "product_name": p["product_name"],
+            "brand": p.get("brand"),
+            "category": p.get("category"),
+            "score": score,
+            "grade": grade,
+            "recommended": score >= RECOMMENDED_MIN_SCORE,  # the "7+ rule"
+            "sugar_g_per_serving": p.get("sugar_g_per_serving"),
+            "protein_g_per_serving": p.get("protein_g_per_serving"),
+            "sodium_mg_per_serving": p.get("sodium_mg_per_serving"),
+            "fiber_g_per_serving": p.get("fiber_g_per_serving"),
+            "image_url": image_or_placeholder(p.get("image_url")),
+        })
+    scored.sort(key=lambda x: (-x["score"], (x["product_name"] or "").lower()))
+    return scored
+
+
+def find_top_picks(question: str, limit: int = 5):
+    """Return (picks, category) — the top products for the question.
+
+    Applies the Home page's 7+ rule: products scoring >= 7 are the recommended
+    picks. If none clear 7 (this catalogue is packaged snacks), we return the
+    highest-scoring products instead, each flagged ``recommended: false``, so the
+    answer is always a real, ranked list. ``category`` is the applied filter (or
+    None for all products); an unknown/empty category widens to the full
+    catalogue.
+    """
+    category = _pick_category_from_question(question)
+    scored = _score_catalogue(category)
+    if not scored and category is not None:  # unknown/empty category -> all
+        category = None
+        scored = _score_catalogue(None)
+
+    recommended = [p for p in scored if p["recommended"]]
+    picks = (recommended or scored)[:limit]
+    return picks, category
+
+
+def build_top_picks_context(picks, category) -> str:
+    """Render the picks into a grounding block so the LLM cites real products."""
+    scope = f"in the {category} category" if category else "across all products"
+    if not picks:
+        return f"TOP PICKS: no products are available {scope}."
+    any_recommended = any(p["recommended"] for p in picks)
+    if any_recommended:
+        header = (f"TOP PICKS (products scoring 7+/10, i.e. Swapify-Recommended, "
+                  f"{scope}; use these to answer):")
+    else:
+        header = (f"TOP PICKS ({scope}): none reach the 7+/10 recommended bar, so "
+                  "these are the highest-scoring options — say so honestly:")
+    lines = [header]
+    for p in picks:
+        lines.append(
+            f"- {p['product_name']} ({p.get('brand') or 'n/a'}): "
+            f"score {p['score']}/10 grade {p['grade']}"
+            f"{' [Recommended]' if p['recommended'] else ''}, "
+            f"sugar {p.get('sugar_g_per_serving')}g, "
+            f"protein {p.get('protein_g_per_serving')}g, "
+            f"sodium {p.get('sodium_mg_per_serving')}mg per serving"
+        )
+    return "\n".join(lines)
+
+
+def fallback_top_picks_answer(picks, category) -> str:
+    """Deterministic structured reply for a top-picks question (no LLM needed)."""
+    scope = f"{category} products" if category else "all products"
+    none_scope = f"the {category} products" if category else "the products"
+    if not picks:
+        return f"No products are currently available in {scope}."
+    any_recommended = any(p["recommended"] for p in picks)
+    if any_recommended:
+        header = f"Here are the top picks from {scope} (health score 7+/10):"
+    else:
+        header = (f"None of {none_scope} reach the 7+/10 recommended bar, but here "
+                  "are the highest-scoring options:")
+    lines = [header]
+    for i, p in enumerate(picks, 1):
+        tag = " ✅ Recommended" if p["recommended"] else ""
+        lines.append(
+            f"{i}. {p['product_name']} — {p['score']}/10 (grade {p['grade']})"
+            + (f", {p['brand']}" if p.get("brand") else "") + tag
+        )
+    return "\n".join(lines)
+
+
 @app.post("/chat")
 def chat(req: ChatRequest):
     """AI nutritionist chatbot. Accepts a free-text question and an optional
@@ -2865,6 +3415,20 @@ def chat(req: ChatRequest):
     if not req.question or not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
 
+    # --- Fast-path: pure greeting / smalltalk (Task 1) -----------------------
+    # Answer instantly, without touching any product data or the LLM, so a bare
+    # "hi" returns in milliseconds instead of waiting out the provider chain.
+    fast = greeting_fast_reply(req.question, bool(req.barcode))
+    if fast is not None:
+        return {
+            "response": fast,
+            "barcode": req.barcode,
+            "product_found": False,
+            "source": "fast-path",
+            "model": None,
+            "ai_enabled": AI_ENABLED,
+        }
+
     product = get_scored_product(req.barcode) if req.barcode else None
     context = build_product_context(product)
 
@@ -2874,6 +3438,16 @@ def chat(req: ChatRequest):
     sub_context = build_substitution_context(sub_targets)
     if sub_context:
         context = f"{context}\n\n{sub_context}"
+
+    # --- "Top picks" questions (Task 4) --------------------------------------
+    # Answer from the real scored catalogue using the Home page's 7+ rule, both as
+    # a structured list on the response and as grounding so the LLM cites the
+    # actual products instead of replying generically.
+    top_picks = None
+    top_picks_category = None
+    if is_top_picks_question(req.question):
+        top_picks, top_picks_category = find_top_picks(req.question, limit=5)
+        context = f"{context}\n\n{build_top_picks_context(top_picks, top_picks_category)}"
 
     used_ai = False
     provider = None
@@ -2888,7 +3462,9 @@ def chat(req: ChatRequest):
         # endpoint always responds, and surface *why* for the operator/client.
         fallback_reason = str(exc)
         logger.warning("/chat falling back to rule-based answer: %s", fallback_reason)
-        if sub_targets:
+        if top_picks is not None:
+            answer = fallback_top_picks_answer(top_picks, top_picks_category)
+        elif sub_targets:
             answer = fallback_substitution_answer(sub_targets, product)
         else:
             answer = fallback_answer(req.question, product)
@@ -2912,6 +3488,10 @@ def chat(req: ChatRequest):
             }
             for t in sub_targets
         ]
+    if top_picks is not None:
+        # Structured, machine-readable picks for the frontend to render as cards.
+        response["top_picks"] = top_picks
+        response["top_picks_category"] = top_picks_category
     if product is not None:
         response["product_name"] = product.get("product_name")
         response["score"] = product.get("score")
@@ -3197,8 +3777,11 @@ def get_popular_products_cached(limit=10):
     key = "popular_top_100"
     cached = _popular_cache.get(key)
     if cached is None:
+        _cache_stats["popular_misses"] += 1
         cached = get_popular_products(limit=100)
         _popular_cache[key] = cached
+    else:
+        _cache_stats["popular_hits"] += 1
     return cached[:limit]
 
 
@@ -4239,6 +4822,20 @@ def ensure_performance_and_image_schema():
             CREATE INDEX IF NOT EXISTS idx_products_name_brand   ON products(product_name, brand);
         ''')
 
+        # --- Migration 007: index the tables that actually GROW.
+        # The indexes above cover `products`, which is bounded (~100 rows from a CSV).
+        # `scan_history` gains a row on every scan, forever, and had no index at all:
+        # /history scanned the whole table and sorted it in a temp B-tree, and the
+        # popularity join behind /home-feed made SQLite rebuild an AUTOMATIC COVERING
+        # INDEX on it *per request*. At 200k rows that is 18.7ms -> 0.35ms for
+        # /history and 260ms -> 27ms for the popularity query.
+        cur.executescript('''
+            CREATE INDEX IF NOT EXISTS idx_scan_history_user_time ON scan_history(user_id, scanned_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_scan_history_barcode   ON scan_history(barcode);
+            CREATE INDEX IF NOT EXISTS idx_scan_history_device    ON scan_history(device_id);
+            CREATE INDEX IF NOT EXISTS idx_favorites_user         ON favorites(user_id);
+        ''')
+
         # --- Task 2C: crowdsourced image upload records
         cur.execute('''
             CREATE TABLE IF NOT EXISTS product_images (
@@ -4566,6 +5163,15 @@ def get_leaderboard(period: str = "weekly", limit: int = 10):
         )
     limit = max(1, min(limit, 100))
 
+    # Served from cache when warm. Read *after* validation so an invalid `period`
+    # still raises its 400 rather than being answered from (or written to) the cache.
+    cache_key = (period, limit)
+    cached = _leaderboard_cache.get(cache_key)
+    if cached is not None:
+        _cache_stats["leaderboard_hits"] += 1
+        return cached
+    _cache_stats["leaderboard_misses"] += 1
+
     where = "WHERE ua.user_id IS NOT NULL"
     params = []
     if period != "all-time":
@@ -4593,16 +5199,32 @@ def get_leaderboard(period: str = "weekly", limit: int = 10):
     rows = [dict(r) for r in cur.fetchall()]
 
     # Per-user action breakdown for the users on the board (for a richer card).
+    #
+    # Fetched for every user on the board in ONE grouped query rather than one query
+    # per user. The old loop was an N+1: at the default limit=10 it issued 10 extra
+    # round-trips to build the same numbers, which is why /leaderboard was ~10x
+    # slower than any other endpoint.
+    uids = [r["user_id"] for r in rows]
+    breakdowns = {uid: {} for uid in uids}
+    if uids:
+        placeholders = ", ".join("?" * len(uids))
+        bd_where = f"WHERE user_id IN ({placeholders})"
+        bd_params = list(uids)
+        if period != "all-time":
+            bd_where += " AND datetime(created_at) >= datetime(?)"
+            bd_params.append(_utc_since(PERIOD_DAYS[period]))
+        cur.execute(
+            "SELECT user_id, action_type, COUNT(*) AS n FROM user_activity "
+            f"{bd_where} GROUP BY user_id, action_type",
+            bd_params,
+        )
+        for r2 in cur.fetchall():
+            breakdowns[r2["user_id"]][r2["action_type"]] = r2["n"]
+
     leaderboard = []
     for i, r in enumerate(rows):
         uid = r["user_id"]
-        cur.execute(
-            "SELECT action_type, COUNT(*) AS n FROM user_activity "
-            f"WHERE user_id = ?{' AND datetime(created_at) >= datetime(?)' if period != 'all-time' else ''} "
-            "GROUP BY action_type",
-            ((uid, _utc_since(PERIOD_DAYS[period])) if period != "all-time" else (uid,)),
-        )
-        breakdown = {r2["action_type"]: r2["n"] for r2 in cur.fetchall()}
+        breakdown = breakdowns.get(uid, {})
         badges = get_user_badges(uid)
         leaderboard.append({
             "rank": i + 1,
@@ -4616,12 +5238,14 @@ def get_leaderboard(period: str = "weekly", limit: int = 10):
         })
     conn.close()
 
-    return {
+    payload = {
         "period": period,
         "count": len(leaderboard),
         "scoring": ACTIVITY_POINTS,
         "leaderboard": leaderboard,
     }
+    _leaderboard_cache[cache_key] = payload
+    return payload
 
 
 # ==============================================================================
@@ -5153,6 +5777,492 @@ async def ocr_scan_label(file: UploadFile = File(...)):
 
 
 # ==============================================================================
+# Real-world testing experiments — scan logging  (Task 3)
+# ==============================================================================
+# A dedicated, append-only log of scans performed during field testing: which
+# barcode was scanned, from what kind of device, and when. It is deliberately
+# separate from `scan_history` (product-lookup side effect, catalogue-only) and
+# from `user_activity` (in-app behaviour, requires a user): an experiment log must
+# accept scans from anonymous phones, record barcodes that aren't in the
+# catalogue, and never be perturbed by product-endpoint changes.
+#
+# Writes are open (a test device has no account); reads are admin-only, because
+# the log is a device-level record.
+
+# Device buckets. Anything unrecognised is stored as "unknown" rather than
+# rejected — a field experiment must never lose a data point to a typo.
+DEVICE_TYPES = ("mobile", "tablet", "desktop", "scanner", "unknown")
+
+# Admin credential for the log-retrieval endpoints. Mirrors how SECRET_KEY is
+# handled above: an env var with a dev-only fallback, so the endpoints are usable
+# out of the box locally but can be locked down in production.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "swapify-admin-dev").strip()
+# Optionally, registered users whose email is listed here are admins too, so an
+# ordinary JWT from /login can read the logs without passing a shared secret.
+ADMIN_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+}
+
+if ADMIN_TOKEN == "swapify-admin-dev":
+    logger.warning(
+        "ADMIN_TOKEN is unset — /experiment/logs is protected by the default dev "
+        "token. Set a strong ADMIN_TOKEN in the environment before deploying."
+    )
+
+
+class ExperimentScanLog(BaseModel):
+    barcode: str
+    device_type: Optional[str] = None
+    # Free-form: a plain string ("iPhone 14, iOS 17.4, Safari") or a JSON object
+    # ({"os": "iOS", "browser": "Safari"}). Stored as text either way.
+    device_info: Optional[object] = None
+    # Client-supplied scan time (ISO-8601). Defaults to server time when absent —
+    # a phone with a wrong clock shouldn't be able to skew the experiment window.
+    timestamp: Optional[str] = None
+    # Stable per-device identifier. Optional: when the client omits it, a
+    # fingerprint is derived from device_info + User-Agent so "unique devices"
+    # still means something.
+    device_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+def require_admin(
+    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+    user_id: Optional[int] = Depends(get_current_user_optional),
+):
+    """Admin gate for the log-retrieval endpoints.
+
+    Accepts either a shared secret in the ``X-Admin-Token`` header, or an ordinary
+    ``Authorization: Bearer`` JWT belonging to a user whose email is listed in
+    ``ADMIN_EMAILS``. Raises 403 otherwise.
+    """
+    if x_admin_token and _constant_time_eq(x_admin_token.strip(), ADMIN_TOKEN):
+        return {"admin": True, "via": "admin_token", "user_id": None}
+
+    if user_id is not None and ADMIN_EMAILS:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT email FROM users WHERE id = ?", (user_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row and (row["email"] or "").strip().lower() in ADMIN_EMAILS:
+            return {"admin": True, "via": "admin_email", "user_id": user_id}
+
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Admin access required. Send the shared secret as the 'X-Admin-Token' "
+            "header, or authenticate as a user listed in ADMIN_EMAILS."
+        ),
+    )
+
+
+def _constant_time_eq(a: str, b: str) -> bool:
+    """Compare two secrets without leaking their contents through timing."""
+    import hmac
+    return hmac.compare_digest(a, b)
+
+
+def _fingerprint_device(device_info_text: Optional[str], user_agent: Optional[str]) -> str:
+    """Derive a stable pseudo-ID for a device that didn't supply a ``device_id``.
+
+    Hashing (rather than storing the raw User-Agent as the key) keeps the log from
+    accumulating identifying strings while still letting identical devices collapse
+    into one entry in the unique-device count. Different phones with byte-identical
+    User-Agents do collide — acceptable for a field experiment, and the reason a
+    real client should send its own ``device_id``.
+    """
+    import hashlib
+    basis = f"{(device_info_text or '').strip()}|{(user_agent or '').strip()}"
+    if not basis.strip("|"):
+        return "anonymous"
+    return "fp_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:16]
+
+
+def _detect_device_type(user_agent: Optional[str]) -> str:
+    """Best-effort device bucket from a User-Agent string.
+
+    Only used when the client does not declare its own ``device_type``. Order
+    matters: an iPad's UA contains neither "mobile" nor "android", and many
+    Android tablets say "Android" *without* "Mobile" — so tablets are tested first.
+    """
+    ua = (user_agent or "").lower()
+    if not ua:
+        return "unknown"
+    if "ipad" in ua or "tablet" in ua or ("android" in ua and "mobile" not in ua):
+        return "tablet"
+    if "mobi" in ua or "iphone" in ua or "android" in ua or "ipod" in ua:
+        return "mobile"
+    if "windows" in ua or "macintosh" in ua or "x11" in ua or "linux" in ua:
+        return "desktop"
+    return "unknown"
+
+
+def _normalize_device_type(raw: Optional[str], user_agent: Optional[str]) -> str:
+    """Coerce a client-supplied device_type into DEVICE_TYPES, or auto-detect."""
+    value = (raw or "").strip().lower()
+    if not value:
+        return _detect_device_type(user_agent)
+    # Common synonyms clients send, folded into the canonical buckets.
+    aliases = {
+        "phone": "mobile", "android": "mobile", "ios": "mobile", "smartphone": "mobile",
+        "ipad": "tablet",
+        "laptop": "desktop", "pc": "desktop", "web": "desktop", "computer": "desktop",
+        "barcode_scanner": "scanner", "handheld": "scanner",
+    }
+    value = aliases.get(value, value)
+    return value if value in DEVICE_TYPES else "unknown"
+
+
+def _parse_client_timestamp(raw: Optional[str]) -> str:
+    """Validate a client ISO-8601 timestamp, falling back to server time.
+
+    Stored normalized to UTC so date filtering compares like with like regardless
+    of the phone's timezone.
+    """
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if not raw:
+        return now.isoformat()
+    try:
+        text = str(raw).strip().replace("Z", "+00:00")
+        parsed = datetime.datetime.fromisoformat(text)
+        if parsed.tzinfo is None:  # naive input: treat as UTC
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc).isoformat()
+    except (ValueError, TypeError):
+        logger.warning("experiment log: unparseable timestamp %r — using server time", raw)
+        return now.isoformat()
+
+
+def _experiment_log_row(row) -> dict:
+    """Shape a DB row into the JSON payload, re-inflating JSON device_info."""
+    item = dict(row)
+    info = item.get("device_info")
+    if info:
+        try:
+            item["device_info"] = json.loads(info)
+        except (ValueError, TypeError):
+            pass  # plain string — return it as-is
+    return item
+
+
+def ensure_experiment_schema():
+    """Create the experiment scan-log table. Idempotent, best-effort (Task 3)."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.executescript('''
+            CREATE TABLE IF NOT EXISTS experiment_scan_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                barcode     TEXT NOT NULL,
+                device_type TEXT NOT NULL DEFAULT 'unknown',
+                device_info TEXT,
+                device_id   TEXT,
+                user_id     INTEGER,
+                notes       TEXT,
+                user_agent  TEXT,
+                timestamp   TIMESTAMP NOT NULL,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_exp_logs_ts ON experiment_scan_logs(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_exp_logs_device ON experiment_scan_logs(device_type);
+            CREATE INDEX IF NOT EXISTS idx_exp_logs_barcode ON experiment_scan_logs(barcode);
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as exc:  # pragma: no cover - defensive bootstrap
+        logger.warning("ensure_experiment_schema failed: %s", exc)
+
+
+@app.post("/experiment/log-scan")
+def log_experiment_scan(
+    entry: ExperimentScanLog,
+    user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
+    user_id: Optional[int] = Depends(get_current_user_optional),
+):
+    """Record one scan from a real-world test device (Task 3A).
+
+    Open by design — field-test phones are not logged in. Authentication is
+    *optional*: when a Bearer token is present the scan is attributed to that user,
+    otherwise it is anonymous. ``device_type`` and ``device_id`` are auto-derived
+    from the User-Agent when the client omits them, so the simplest possible
+    client — `POST {"barcode": "..."}` — still produces a usable data point.
+    """
+    barcode = (entry.barcode or "").strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="barcode is required")
+
+    # Serialize a dict device_info to JSON; keep a plain string as-is.
+    if isinstance(entry.device_info, (dict, list)):
+        device_info_text = json.dumps(entry.device_info)
+    elif entry.device_info is None:
+        device_info_text = None
+    else:
+        device_info_text = str(entry.device_info)
+
+    device_type = _normalize_device_type(entry.device_type, user_agent)
+    device_id = (entry.device_id or "").strip() or _fingerprint_device(
+        device_info_text, user_agent
+    )
+    timestamp = _parse_client_timestamp(entry.timestamp)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO experiment_scan_logs "
+        "(barcode, device_type, device_info, device_id, user_id, notes, user_agent, timestamp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (barcode, device_type, device_info_text, device_id, user_id,
+         entry.notes, user_agent, timestamp),
+    )
+    log_id = cur.lastrowid
+    conn.commit()
+    cur.execute(
+        "SELECT id, barcode, device_type, device_info, device_id, user_id, notes, "
+        "timestamp, created_at FROM experiment_scan_logs WHERE id = ?",
+        (log_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    return {"message": "Scan logged", "log": _experiment_log_row(row)}
+
+
+def _experiment_filters(start_date, end_date, device_type, barcode):
+    """Build the shared WHERE clause for the log + analytics endpoints.
+
+    Dates are inclusive whole days: ``end_date=2026-07-13`` covers everything up to
+    23:59:59 on the 13th. Comparing on ``date(timestamp)`` (rather than a string
+    prefix) keeps the filter correct for the timezone-offset timestamps the phones
+    send.
+    """
+    clauses, params = [], []
+
+    if start_date:
+        _validate_date(start_date, "start_date")
+        clauses.append("date(timestamp) >= date(?)")
+        params.append(start_date)
+    if end_date:
+        _validate_date(end_date, "end_date")
+        clauses.append("date(timestamp) <= date(?)")
+        params.append(end_date)
+    if device_type:
+        normalized = _normalize_device_type(device_type, None)
+        clauses.append("device_type = ?")
+        params.append(normalized)
+    if barcode:
+        clauses.append("barcode = ?")
+        params.append(barcode.strip())
+
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+def _validate_date(value: str, field: str):
+    """Reject a malformed date up front instead of silently matching nothing."""
+    try:
+        datetime.datetime.strptime(value.strip(), "%Y-%m-%d")
+    except (ValueError, AttributeError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be in YYYY-MM-DD format (got {value!r})",
+        )
+
+
+def _experiment_analytics(cur, where: str, params: list) -> dict:
+    """Total scans, unique devices and unique barcodes over the filtered set (Task 3C)."""
+    cur.execute(
+        "SELECT COUNT(*) AS total_scans, "
+        "       COUNT(DISTINCT device_id) AS unique_devices, "
+        "       COUNT(DISTINCT barcode) AS unique_barcodes "
+        f"FROM experiment_scan_logs{where}",
+        params,
+    )
+    totals = dict(cur.fetchone())
+
+    cur.execute(
+        f"SELECT device_type, COUNT(*) AS n FROM experiment_scan_logs{where} "
+        "GROUP BY device_type ORDER BY n DESC",
+        params,
+    )
+    by_device_type = {r["device_type"]: r["n"] for r in cur.fetchall()}
+
+    cur.execute(
+        f"SELECT barcode, COUNT(*) AS n FROM experiment_scan_logs{where} "
+        "GROUP BY barcode ORDER BY n DESC, barcode ASC LIMIT 10",
+        params,
+    )
+    top_barcodes = [{"barcode": r["barcode"], "scans": r["n"]} for r in cur.fetchall()]
+
+    cur.execute(
+        f"SELECT date(timestamp) AS day, COUNT(*) AS n FROM experiment_scan_logs{where} "
+        "GROUP BY day ORDER BY day ASC",
+        params,
+    )
+    scans_per_day = [{"date": r["day"], "scans": r["n"]} for r in cur.fetchall()]
+
+    return {
+        "total_scans": totals["total_scans"] or 0,
+        "unique_devices": totals["unique_devices"] or 0,
+        "unique_barcodes": totals["unique_barcodes"] or 0,
+        "scans_by_device_type": by_device_type,
+        "top_barcodes": top_barcodes,
+        "scans_per_day": scans_per_day,
+    }
+
+
+@app.get("/experiment/logs")
+def get_experiment_logs(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    device_type: Optional[str] = None,
+    barcode: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    admin: dict = Depends(require_admin),
+):
+    """Retrieve the experiment scan log — **admin only** (Task 3B).
+
+    Filter by date range (``start_date`` / ``end_date``, inclusive ``YYYY-MM-DD``),
+    ``device_type`` and/or ``barcode``. Newest first, paginated via ``limit``
+    (1-500, default 100) and ``offset``.
+
+    The analytics block (Task 3C) is computed over the **filtered** set, not the
+    whole table, so "scans on mobile last week" reports its own totals.
+    """
+    limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    where, params = _experiment_filters(start_date, end_date, device_type, barcode)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, barcode, device_type, device_info, device_id, user_id, notes, "
+        f"timestamp, created_at FROM experiment_scan_logs{where} "
+        "ORDER BY datetime(timestamp) DESC, id DESC LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    )
+    logs = [_experiment_log_row(r) for r in cur.fetchall()]
+
+    cur.execute(f"SELECT COUNT(*) FROM experiment_scan_logs{where}", params)
+    matched = cur.fetchone()[0]
+
+    analytics = _experiment_analytics(cur, where, params)
+    conn.close()
+
+    return {
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "device_type": device_type,
+            "barcode": barcode,
+        },
+        "pagination": {
+            "limit": limit,
+            "offset": offset,
+            "returned": len(logs),
+            "matched": matched,
+            "has_more": offset + len(logs) < matched,
+        },
+        "analytics": analytics,
+        "logs": logs,
+    }
+
+
+@app.post("/admin/cache-clear")
+def admin_cache_clear(admin: dict = Depends(require_admin)):
+    """Drop every cache entry. **Admin-gated.**
+
+    Ops lever for when a product changes outside the app (a direct DB edit, a
+    ``sync_db.py`` run) and the hour-long TTL would otherwise serve stale data until
+    it expires. Also what ``perf_endpoints.py`` calls to force a genuinely cold cache
+    before measuring cold-vs-warm — without it, "cold" is a guess.
+    """
+    products = len(_product_cache)
+    popular = len(_popular_cache)
+    board = len(_leaderboard_cache)
+    invalidate_product_cache()
+    _leaderboard_cache.clear()
+    return {"message": "Caches cleared",
+            "cleared": {"product_cache": products, "popular_cache": popular,
+                        "leaderboard_cache": board}}
+
+
+@app.post("/debug/sentry-test")
+def sentry_test(kind: str = "exception", admin: dict = Depends(require_admin)):
+    """Deliberately raise (or message) to prove error tracking is wired up.
+
+    **Admin-gated.** It is a real, uncaught 500 by design — that is the point, it
+    exercises the exact path a genuine bug takes — so it must not be reachable by
+    anyone who wanders past.
+
+    ``kind=exception`` (default) raises; ``kind=message`` sends a non-error event.
+    Returns 503 rather than faking success when Sentry is off, so a green result
+    here always means an event genuinely left the process.
+    """
+    if not SENTRY_ENABLED:
+        raise HTTPException(
+            status_code=503,
+            detail="Sentry is not enabled (SENTRY_DSN unset) - nothing would be sent.",
+        )
+
+    if kind == "message":
+        obs_capture_message("Swapify test message from /debug/sentry-test",
+                            level="info", source="debug_endpoint")
+        return {"sent": "message", "environment": os.environ.get("SENTRY_ENVIRONMENT")}
+
+    raise RuntimeError(
+        "Swapify test exception from /debug/sentry-test - if you can read this in "
+        "Sentry, error tracking works."
+    )
+
+
+@app.get("/experiment/analytics")
+def get_experiment_analytics(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    device_type: Optional[str] = None,
+    barcode: Optional[str] = None,
+    admin: dict = Depends(require_admin),
+):
+    """Experiment analytics without the log rows — **admin only** (Task 3C).
+
+    Same filters as ``/experiment/logs``; returns just the counts (total scans,
+    unique devices, unique barcodes, plus per-device-type / per-day breakdowns) for
+    a dashboard that does not want to pull thousands of rows to render three numbers.
+    """
+    where, params = _experiment_filters(start_date, end_date, device_type, barcode)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    analytics = _experiment_analytics(cur, where, params)
+
+    cur.execute(
+        f"SELECT MIN(timestamp) AS first, MAX(timestamp) AS last "
+        f"FROM experiment_scan_logs{where}",
+        params,
+    )
+    span = dict(cur.fetchone())
+    conn.close()
+
+    return {
+        "filters": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "device_type": device_type,
+            "barcode": barcode,
+        },
+        "first_scan_at": span["first"],
+        "last_scan_at": span["last"],
+        **analytics,
+    }
+
+
+# ==============================================================================
 # Database-first bootstrap  (Task 1 — deployment readiness)
 # ==============================================================================
 # The app reads product data only from the database at request time. The CSV
@@ -5161,12 +6271,10 @@ async def ocr_scan_label(file: UploadFile = File(...)):
 # host with no swapify.db comes up with the schema created and the catalogue
 # loaded, with zero manual steps. On an already-populated database this is a no-op.
 
-# The 12 nutrient/identity columns the products table needs, kept in sync with
-# create_db.py and sync_db.py (the single CSV schema).
-_CSV_CATEGORY_KEYWORDS = (
-    "bar", "yogurt", "chips", "milkshake", "cereals", "museli", "noodles",
-    "chocolate", "drink", "biscuits", "cookie", "mixture", "pie",
-)
+# Category is derived from the product name/brand via the shared taxonomy in
+# category_taxonomy.py (Task 2) — the single source of truth used by app.py,
+# sync_db.py and import_data.py alike, so "better alternatives" never mix
+# categories (e.g. noodles offered as an alternative to a chutney).
 
 
 def _csv_num(value):
@@ -5181,15 +6289,6 @@ def _csv_num(value):
         return 0.0
 
 
-def _csv_category(name):
-    """Best-effort category from a product name (mirrors import_data.py)."""
-    name = (name or "").lower()
-    for cat in _CSV_CATEGORY_KEYWORDS:
-        if cat in name:
-            return cat
-    return "other"
-
-
 def _seed_products_from_csv(cursor):
     """Insert every CSV row into an empty products table. Returns the row count."""
     import csv
@@ -5201,29 +6300,19 @@ def _seed_products_from_csv(cursor):
         for row in reader:
             if not row or len(row) < 11:
                 continue
-            try:
-                serial_no = int((row[0] or "0").strip())
-            except ValueError:
-                serial_no = 0
-            barcode = row[1].strip()
+            barcode = normalize_barcode(row[1])
+            if not barcode:
+                continue
             product_name = row[2].strip()
             brand = row[3].strip()
 
-            # Keep the Lay's sample aligned with the documented test barcode.
-            if serial_no == 2:
-                barcode = "8901491101837"
-                product_name = "Lay's Classic Salted"
-                brand = "Lay's"
-                serving, sugar, sat_fat = 28.0, 0.3, 1.8
-                sodium, protein, fiber, calories = 370.0, 2.0, 1.0, 150.0
-            else:
-                serving = _csv_num(row[4])
-                sugar = _csv_num(row[5])
-                sat_fat = _csv_num(row[6])
-                sodium = _csv_num(row[7])
-                protein = _csv_num(row[8])
-                fiber = _csv_num(row[9])
-                calories = _csv_num(row[10])
+            serving = _csv_num(row[4])
+            sugar = _csv_num(row[5])
+            sat_fat = _csv_num(row[6])
+            sodium = _csv_num(row[7])
+            protein = _csv_num(row[8])
+            fiber = _csv_num(row[9])
+            calories = _csv_num(row[10])
 
             cursor.execute(
                 "INSERT OR IGNORE INTO products (barcode, product_name, brand, "
@@ -5231,8 +6320,8 @@ def _seed_products_from_csv(cursor):
                 "saturated_fat_g_per_serving, sodium_mg_per_serving, "
                 "protein_g_per_serving, fiber_g_per_serving, "
                 "calories_kcal_per_serving) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (barcode, product_name, brand, _csv_category(product_name), serving,
-                 sugar, sat_fat, sodium, protein, fiber, calories),
+                (barcode, product_name, brand, guess_category(product_name, brand),
+                 serving, sugar, sat_fat, sodium, protein, fiber, calories),
             )
             inserted += cursor.rowcount
     return inserted
@@ -5285,6 +6374,8 @@ ensure_feature_schema()
 ensure_products_seeded()
 # Task 1A (indexes) + Task 2 (image_url column / product_images table).
 ensure_performance_and_image_schema()
+# Task 3 — the real-world experiment scan log.
+ensure_experiment_schema()
 
 
 if __name__ == "__main__":
