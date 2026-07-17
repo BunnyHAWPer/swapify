@@ -1,21 +1,21 @@
 Serial number,Barcode,Product name,Brand,Serving size (g),Sugar per serving (g),Saturated fat per serving (g),Sodium per serving (mg),Protein per serving (g),Fiber per serving (g),Calories per serving (kcal)
-1,8908013479122,The whole truth food protein bar,The whole truth ,52 g,0 g,4.9 g,13.8 mg,13 g,4.4 g,258 kcal
-2,8906143890053,The whole truth food protein bar,The whole truth ,35 g,1.2 g,3.4 g,24. 5 mg,9 g,2.5 g,228 kcal
+1,8908013479122,The whole truth food protein bar,The whole truth,52 g,0 g,4.9 g,13.8 mg,13 g,4.4 g,258 kcal
+2,8906143890053,The whole truth food protein bar,The whole truth,35 g,1.2 g,3.4 g,24. 5 mg,9 g,2.5 g,228 kcal
 3,8904335602385,Yoga bar protein bar,Yoga bar,50 g,21.5 g,1.2 g,160 mg,10 g,5.2 g,200 kcal
 4,8906081120090,Happilo nut mixtures,Happilo,28 g,4 g,1.5 g,NULL,5 g,2.5 g,185 kcal
 5,8906067021182,MuscleBlaze chocolate whey protein,MuscleBlaze,35 g,0 g,1 g,100 mg,25 g,0 g,120 kcal
 6,8906059635038,Epigamia blueberry greek yogurt,Epigamia,85 g,6.8 g,0.85 g,40 mg,6 g,0 g,88 kcal
-7,946459636639,Epigamia turbo protein milkshake cookie and cream,Epigamia,250 ml ,3.2 g,0 g,NULL,25 g,0 g,141 kcal
+7,946459636639,Epigamia turbo protein milkshake cookie and cream,Epigamia,250 ml,3.2 g,0 g,NULL,25 g,0 g,141 kcal
 8,8908006217465,"Slurrp farm ragi, almond and banana Cereals",Slurrp Farm,30 g,0 g,0 g,1.5 mg,2.7 g,2 g,105 kcal
 9,8908002984590,Soulfull Ragabites choco,Tata Soulfull,100 g,22.6 g,0.8 g,212 mg,10.8 g,9.2 g,392 kcal
 10,8908002984972,Soulfull millet museli,Tata Soulfull,100 g,14. 8 g,1.6 g,185 mg,8.8 g,8.7 g,400 kcal
-11,8901058005783,Maggi noodles,Maggi,75 g,1.5 g ,6.8 g,750 mg,6.2 g,2.5 g,288 kcal
-12,8901491503174,Lay's salted chips,Lay's,28 g,1 g ,2.6 g,134 mg,2 g,0.4 g,156 kcal
+11,8901058005783,Maggi noodles,Maggi,75 g,1.5 g,6.8 g,750 mg,6.2 g,2.5 g,288 kcal
+12,8901491503174,Lay's salted chips,Lay's,28 g,1 g,2.6 g,134 mg,2 g,0.4 g,156 kcal
 13,0000 901626026,Red Bull,Red Bull,258 g,11 g,NULL,41 mg,0 g,NULL,45 kcal
 14,8901719113345,Parle G,Parle,15 g,3.8 g,1 g,44 mg,1 g,0.2 g,68 kcal
 15,5060166693015,Monster,Monster Energy,500 g,55 g,0 g,380 mg,0 g,0 g,237 kcal
 15,5449000053879,Diet Coke,the Coca cola company,330 g,0 g,0 g,40 mg,0 g,0 g,1 kcal
-16,7622210622211,Five star chocolate ,Five star,21.5 g,11.3 g,3.2 g,43 mg,0 g,0.2 g,116 kcal
+16,7622210622211,Five star chocolate,Five star,21.5 g,11.3 g,3.2 g,43 mg,0 g,0.2 g,116 kcal
 17,8904063220424,Takatak chips,Takatak,28 g,2 g,1 g,260 mg,2 g,1 g,160 kcal
 18,8801062168279,Lotte chocopie,Lotte,25 g,9 g,3 g,55 mg,1 g,0 g,108 kcal
 19,5000159461122,Snickers,Snickers,45 g,26 g,5 g,96 mg,4 g,1.1 g,217 kcal
@@ -30,7 +30,7 @@ Serial number,Barcode,Product name,Brand,Serving size (g),Sugar per serving (g),
 28,8901499006936,Chocos cereal,Kellogs,30 g,9 g,0.4 g,3 mg,2.7 g,1.5 g,112 kcal
 29,8901063093089,Good day cashew biscuit,Britannia,20 g,4.8 g,2 g,65 mg,1.2 g,0.2 g,97 kcal
 30,8902579100025,Frooti,Parle Agro,200 g,31.2 g,0 g,52 mg,0 g,0 g,126 kcal
-31,8901030814944,Horlics Classic Malt,Horlics,27 g,13.2 g,0.5 g,62 mg,4.7,0.6 g,102 kcal
+31,8901030814944,Horlics Classic Malt,Horlics,27 g,13.2 g,0.5 g,62 mg,4.7 g,0.6 g,102 kcal
 32,8906127540016,Farmley Datebites,Farmley,20 g,6.7 g,1.2 g,5 mg,3.3 g,1.8 g,99 kcal
 33,8901764130222,PediaSure Vanilla,Pediasure,47 g,9.6 g,1.6 g,150 mg,6.5 g,0 g,220 kcal
 34,8901063019073,Britannia Jim Jam,Britannia,35 g,11 g,3.5 g,75 mg,2 g,0.5 g,170 kcal
@@ -69,8 +69,8 @@ Serial number,Barcode,Product name,Brand,Serving size (g),Sugar per serving (g),
 67,890105890053,Real apple juice,B natural,200 g,22 g,0 g,10 mg,0.3 g,0.5 g,100 kcal
 68,8901058851018,Mazza Tetra Pack,Mazza,200 g,24 g,0 g,15 mg,0 g,0 g,110 kcal
 69,8901058851025,Mazza Bottle,Mazza,250 g,30 g,0 g,19 mg,0 g,0 g,138 kcal
-70,8901058000532,Coka cola ,Coca cola,200 g,21 g,0 g,10 mg,0 g,0 g,84 kcal
-71,8901058000549,Coka cola ,Coca cola,500 g,52.5 g,0 g,25 mg,0 g,0 g,210 kcal
+70,8901058000532,Coka cola,Coca cola,200 g,21 g,0 g,10 mg,0 g,0 g,84 kcal
+71,8901058000549,Coka cola,Coca cola,500 g,52.5 g,0 g,25 mg,0 g,0 g,210 kcal
 72,8901058001317,Sprite,Sprite,200 g,15 g,0 g,20 mg,0 g,0 g,60 kcal
 73,8901058001324,Sprite,Sprite,500 g,37.5 g,0 g,50 mg,0 g,0 g,150 kcal
 74,8901058001430,Fanta,Fanta,200 g,21 g,0 g,10 mg,0 g,0 g,86 kcal
@@ -87,7 +87,7 @@ Serial number,Barcode,Product name,Brand,Serving size (g),Sugar per serving (g),
 85,8906068720018,Max chocolate protein bar,Max protein bar,67 g,9 g,2.5 g,150 mg,20 g,5 g,240 kcal
 86,8901058560018,Nestle chocolate bar,Nestle,34 g,19 g,6.5 g,30 mg,2.5 g,0.5 g,180 kcal
 87,8901058560025,Milkybar chocolate,Nestle,27 g,16.5 g,5.5 g,45 mg,2 g,0 g,145 kcal
-88,8901058560032,Fuse chocolate bar,Nestle,45 g,24 g,6 g,65 mg,4.5 g,0.8 g,220 kcal
+88,8901058560032,539 kcal,Cadbury,45 g,24 g,6 g,65 mg,4.5 g,0.8 g,220 kcal
 89,8901058714018,Nescafe latte,Nescafe,180 g,9 g,1.8 g,105 mg,4.5 g,0 g,110 kcal
 90,8901058714025,Nescafe Intense cafe,Nescafe,180 g,6 g,1.2 g,90 mg,4 g,0 g,80 kcal
 91,8906123100011,The whole truth peanut butter protein bar,The whole truth,52 g,5 g,3 g,80 mg,12 g,3 g,209 kcal
@@ -98,5 +98,155 @@ Serial number,Barcode,Product name,Brand,Serving size (g),Sugar per serving (g),
 96,8901058232018,Saffola masala oats,Saffola,40 g,2.5 g,0.5 g,380 mg,4.5 g,3.5 g,158 kcal
 97,8906097760028,True elements nuts protein bar,True Elements,40 g,6 g,2 g,50 mg,6 g,2.5 g,175 kcal
 98,8906097760035,True elements antioxidant mix,True Elements,30 g,8 g,1 g,10 mg,3.5 g,2 g,140 kcal
-99,8906097760042,True elements overnight oats,True Elements,50 g,4 g, 0.5 g,80 mg,6.5 g,5 g,185 kcal
+99,8906097760042,True elements overnight oats,True Elements,50 g,4 g,0.5 g,80 mg,6.5 g,5 g,185 kcal
 100,8901088101018,MTR upma mix,MTR,80 g,2 g,0.5 g,620 mg,6 g,2 g,290 kcal
+101,8901725100049,B naturals mango juice,B natural,200 g,10.8 g,NULL,NULL,0.1 g,0.89 g,59 kcal
+102,8901058854091,Maggi Nutri-licious Veg Atta Noodles,Maggi,73 g,4 g,5 g,880 mg,7 g,4 g,310 kcal
+103,8901725105198,B naturals pomegranate juice,B natural,200 g,13 g,NULL,5 mg,0 g,NULL,54 kcal
+104,8901725100216,B naturals orange juice,B natural,200 g,11.44 g,NULL,11.4 mg,0 g,0.71 g,47 kcal
+105,8908001705196,Paper Boat Jal jeera,Paper boat,200 g,12 g,0 g,NULL,0 g,0 g,50 kcal
+106,8908001705448,Paper Boat Aamras,Paper boat,200 g,12.6 g,0 g,NULL,0 g,0 g,50 kcal
+107,8908001705127,Paper Boat Kala khatta,Paper boat,200 g,12 g,0 g,NULL,0 g,0 g,48 kcal
+108,8908019882032,Paper Boat Kokam,Paper boat,200 g,10 g,0 g,NULL,0 g,0 g,40 kcal
+109,8908001705042,Paper Boat Aam Panna,Paper boat,200 g,13 g,0 g,NULL,0 g,0 g,52 kcal
+110,8906080600784,Paper Boat Anar,Paper boat,200 g,13 g,0 g,NULL,0 g,0 g,53 kcal
+111,8908001705806,Paper Boat Chilli Guvava,Paper boat,200 g,11.8 g,0 g,NULL,0 g,0 g,47 kcal
+112,8908001705745,Paper Boat Thandai,Paper boat,200 g,28 g,NULL,30 mg,1.5 g,1 g,140 kcal
+113,8906080600647,Paper Boat Santra,Paper boat,200 g,12 g,0 g,NULL,0 g,0 g,48 kcal
+114,8904063230256,Haldiram's Ready to eat Paneer Makhini,Haldiram,100 g,5 g,6.33 g,386 mg,5 g,1 g,172 kcal
+115,8904063216236,Haldiram's Ready to eat Dal Makhini,Haldiram,100 g,0 g,4.53 g,160 mg,2.65 g,2.11 g,155 kcal
+116,8904063281562,Haldirams Ready to Eat Punjabi Choley,Haldiram,100 g,0 g,6 g,367 mg,4 g,2 g,184 kcal
+117,8904004400000,Haldiram's Pav bhaji,Haldiram,100 g,0 g,7 g,406 mg,2 g,2 g,163 kcal
+118,8901096001007,MTR Ready to eat Tomato rice,MTR,100 g,1 g,1.5 g,450 mg,2 g,1 g,130 kcal
+119,8901042955957,MTR ready to eat pongal,MTR,100 g,1 g,1 g,300 mg,3 g,1 g,90 kcal
+120,8901042956213,MTR ready to eat rajama,MTR,100 g,1 g,2 g,480 mg,5 g,3 g,120 kcal
+121,8901042959191,MTR ready to eat paneer tikka masala,MTR,100 g,2 g,3 g,438 mg,7.5 g,1 g,180 kcal
+122,8901042957425,MTR ready to eat pav bhaji,MTR,150 g,2 g,3 g,472 mg,3 g,2 g,144 kcal
+123,8906059636318,Epigamia Sugar free strawberry greek yogurt,Epigamia,85 g,5.7 g,1.1 g,48 mg,5.7 g,NULL,61 kcal
+124,8906059636349,Epigamia Sugar free alphanso mango greek yogurt,Epigamia,85 g,7 g,4.5 g,42 mg,5.3 g,NULL,63 kcal
+125,8906059636325,Epigamia mixed berries sugar free greek yogurt,Epigamia,85 g,1.6 g,1 g,46 mg,5.4 g,NULL,68 kcal
+126,8908024977235,SuperYOu protein multigrain sour and cream chips,SuperYou,40 g,0.9 g,0.9 g,382 mg,10 g,4.6 g,167 kcal
+127,8906090570831,Too Yumm Veg Stix,Too Yumm,30 g,1 g,1.2 g,290 mg,2 g,1 g,144 kcal
+128,80884,Noice Banana Chips,Noice,20 g,3 g,8.7 g,2 mg,0.7 g,2.3 g,156 kcal
+129,675337,Noice Peri peri miong dal chips,Noice,30 g,1 g,1.5 g,260 mg,3 g,2 g,140 kcal
+130,8901491100205,Red Rock Deli Chips,Red Rock Deli,45 g,1 g,3.5 g,240 mg,3 g,1.5 g,220 kcal
+131,8906160650661,Mr Makana Peri peri,Mr Makhana,25 g,0.1g,1 g,240 mg,4.2 g,1 g,234 kcal
+132,8906160650685,Mr Makhana Pudina,Mr Makhana,25 g,0.1 g,0.5 g,180 mg,1.8 g,1 g,129kcal
+133,8906160650647,Mr Makhana Himalayan Salt,Mr Makhana,25 g,0.1 g,0.5 g,200 mg,1.8 g,1 g,125 kcal
+134,420730,Noice sweet and salty biscuits,Noice,70 g,14 g,5 g,150 mg,4 g,1.5 g,340 kcal
+135,8909081013072,Sunfeast farmlite sugar free choco chip cookie,Sunfeast,25 g,0.3 g,1.3 g,60 mg,2.5 g,1 g,114 kcal
+136,8901063325920,Britannia Toast,Britannia,25 g,6 g,2 g,90 mg,2.5 g,1 g,108 kcal
+137,7622202308659,Lotus Biscoff biscuit,Lotus Biscoff,25 g,11 g,2.5 g,80 mg,1 g,0.3 g,115 kcal
+138,7622202836572,Oreo Golden sandwhich cookie,Oreo,34 g,12 g,2 g,120 mg,1 g,0 g,170 kcal
+139,8906074829566,Karachi bakery fruit atta biscuit,Karachi bakery,40 g,14 g,10 g,180 mg,6 g,1.5 g,453 kcal
+140,8906033746262,Digestive Cream Biscuit,McVitie's style,25 g,9 g,4 g,90 mg,1 g,1 g,125 kcal
+141,8901719135354,Parle Monaco Cheeselings,Parle,25 g,0.6 g,4.2 g,275 mg,2.8 g,1 g,140 kcal
+142,8909081005428,Sunfeast dark fantasy chocolate milkshake,Sunfeast,150 g,17 g,3 g,90 mg,5 g,0 g,164 kcal
+143,8901262152211,Amul kool kesar,Amul,180 g,20 g,2 g,110 mg,5 g,0 g,160 kcal
+144,8901071732413,Hershey's chocolate milkshake,Hershey's,180 g,19 g,2.5 g,120 mg,5 g,0 g,164 kcal
+145,8901071211284,Hershey's strawberry milkshake,Hershey's,180 g,19 g,2.5 g,110 mg,5 g,0 g,160 kcal
+146,8901063146921,Britannia Vanilla milk,Britannia,180 g,22 g,3.5 g,120 mg,6 g,0 g,212 kcal
+147,8901071732468,Hershey's Vanila milkshake,Hershey's,180 g,21 g,3 g,NULL,3.6 g,0 g,156 kcal
+148,8901499010513,Kellog's fruit nut and seed museli,Kellog's,100 g,21 g,1 g,140 mg,8 g,5 g,385 kcal
+149,8908006217892,Slurrp farm millet pancake,Slurrp Farm,40 g,10 g,0.4 g,94 mg,2.8 g,2.8 g,154 kcal
+150,8906131682660,Slurrp farm millet noodles,Slurrp Farm,30 g,0.7 g,0 g,439 mg,3 g,4 g,98 kcal
+151,8906090573689,Too Yumm bikaneri bhujia,Too Yumm,12 g,0.2 g,1.2 g,110 mg,1.2 g,NULL,70 kcal
+152,8904063231789,Haldiram's Navrattan mixture,Haldiram,100 g,2.7 g,7.2 g,798.5 mg,20.3 g,3.5 g,518.7 kcal
+153,8906161390955,Let's Try Kerela garlic mixture,Let's Try,10 g,1 g,1 g,65 mg,1.2 g,NULL,58 kcal
+154,8906090574198,Too Yumm Bhujia,Too Yumm,12 g,0 g,1.3 g,130 mg,1.4 g,NULL,72 kcal
+155,407479,Noice Agra dal moth namkeen,Noice,30 g,0 g,10 g,349 mg,7 g,NULL,393 kcal
+156,863342,Noice aaloo ke lacche namkeen,Noice,25 g,0 g,13.03 g,616 mg,6 g,NULL,596 kcal
+157,8906090573658,Too Yumm Mong dal,Too Yumm,12 g,2 g,1 g,50 mg,2.6 g,NULL,56 kcal
+158,8906161390719,Let's Try roasted channa,Let's Try,100 g,3.4 g,0.5 g,50 mg,22.5 g,12 g,375 kcal
+159,8906161391297,Let's Try butter murukku,Let's Try,10 g,0.88 g,1.65 g,8 mg,1 g,0.39 g,57 kcal
+160,8904063252517,Haldiram's lite chiwda,Haldiram,100 g,4 g,12.5 g,580 mg,6 g,NULL,516 kcal
+161,8906143040540,Yu whole wheat noodles,Yu,100 g,0 g,0 g,2.3 mg,10.8 g,9 g,351 cal
+162,8909081012372,Yipee pan asian noodoles,Yipee,25 g,0.8 g,5.7 g,410 mg,2.2 g,NULL,109 kcal
+163,8906143041370,Yu korean ramen noodles,Yu,100 g,9.2 g,7 g,837 mg,11.5 g,10.3 g,314 kcal
+164,890104000708,Nissin Geki Korean ramen - carbonara,Nissin Gekki,100 g,8 g,7.36 g,1740 mg,8 g,NULL,461 kcal
+165,8909081009020,Yipee Tom Yum noodles,Yipee,25 g,0.8 g,2.4 g,1450 mg,2.3 g,NULL,112 kcal
+166,8906013032194,Wai Wai masala noodles,Wai Wai,65 g,1 g,7 g,907 mg,6 g,1 g,313 kcal
+167,8909106058828,Knorr ramen,Knorr,98 g,5.6 g,5.6 g,1225 mg,8.5 g,NULL,395 kcal
+168,8994963003753,Indomine chicken noodles,Indomine,100 g,3 g,9 g,1807 mg,11 g,NULL,455 kcal
+169,74603003287,Samyang Kimchi ramen,Samyang,120 g,4 g,7 g,2050 mg,11 g,2 g,510 kcal
+170,8994963004095,Indomine vegetable flavor,Indomine,100 g,3 g,8 g,1677 mg,11 g,NULL,444 kcal
+171,8909106034952,Kwality walls magnum brownie ice cream stick,Kwality walls,61 g,15.5 g,8.1 g,47 mg,3.2 g,1.4 g,210 kcal
+172,8909106034921,Kwality walls magnum almond ice cream stick,Kwality walls,62 g,16.6 g,8.4 g,44 mg,3.3 g,0.7 g,219 kcal
+173,8909106034938,Kwality walls magnum chocolate truffle ice cream stick,Kwality walls,63 g,16.4 g,8.1 g,45 mg,3 g,1.5 g,203 kcal
+174,8909106045101,Kwality walls feast cadbury crackle frozeen dessert bar,Kwality walls,58 g,20.5 g,11.3 g,35 mg,2.3 g,0.9 g,236 kcal
+175,8721274500233,Magnum caramel ice cream pop,Kwality walls,59 g,19.2 g,6.8 g,41 mg,2.5 g,0.4 g,197 kcal
+176,8906172545016,Hocco aamchi mango ice cream,Hocco,120 g,24.6 g,13.3 g,39.6 mg,3 g,NULL,292 kcal
+177,8901262176477,Amul mava malai kulfi ice cream,Amul,50 g,12 g,78 g,30 mg,2.3 g,NULL,162 kcal
+178,8901262173490,Amul vanilla magic ice cream,Amul,100 g,16 g,8.5 g,NULL,3.7 g,NULL,219 kcal
+179,8901262172493,Amul chocochips ice cream tub,Amul,100 g,24.5 g,8.4 g,46 mg,4.4 g,NULL,246 kcal
+180,8901262172448,Amul choco brownie ice cream tub,Amul,100 g,22.3 g,7.6 g,46 mg,4.4 g,NULL,232 kcal
+181,8906080603518,Paper boat zero sugar sparkling coffee dark roast,Paper boat,100 g,0 g,0 g,23 mg,0 g,0 g,0 kcal
+182,8901764112270,Coca cola zero,Coca cola,200 g,0 g,0 g,7.5 mg,0 g,0 g,0 kcal
+183,8850389100691,Mogu mogu strawberry fruit drink,Mogu mogu,320 g,32 g,0 g,157 mg,0 g,1 g,134 kcal
+184,8850389101391,Mogu mogu grape fruit drink,Mogu mogu,320 g,32 g,0 g,122 mg,0 g,1 g,136 kcal
+185,8850389100677,Mogu mogu orange fruit drink,Mogu mogu,320 g,32 g,0 g,230 mg,0 g,1 g,132 kcal
+186,8850389100684,Mogu mogu lychee fruit drink,Mogu mogu,320 g,32 g,0 g,107 mg,0 g ,1 g,150 kcal
+187,8901764175015,Maaza mango drink,Maaza,100 g,13.5 g,0 g,NULL,0 g,0 g,60 kcal
+188,8902080002375,Getorade blue bolt zero sugar,Getorade,360 g,0 g,0 g,47 mg,0 g,0 g,1 kcal
+189,8902080000722,Slice mango drink,Slice,100 g,15.5 g,0 g,12 mg,0 g,0 g,64 kcal
+190,8902579002046,Appy fizz apple juice,Appy,100 g,14 g,0 g,21.2 mg,0 g,NULL,56 kcal
+191,8904063226402,Haldiram's classic salted chips,Haldiram,100 g,1 g,15.8 g,600 mg,7 g,NULL,546 kcal
+192,8904063226501,Haldiram's Sizzling Siracha chips,Haldiram,100 g,1 g,14.1 g,747.8 mg,1 g,NULL,523 kcal
+193,8904063226419,Haldiram's Sour cream N onion chips,Haldiram,100 g,2.5 g,15.8 g,650 mg,7.3 g,NULL,546 kcal
+194,8901491001809,Lay's sizzling hot spicy chips,Lay's,100 g,1.6 g,15 g,567 mg,6.6 g,NULL,540 kcal
+195,8901491101820,Lay's spanish tomato chips,Lay's,100 g,5.6 g,14.3 g,659 mg,6.4 g,NULL,525 kcal
+196,8901491003810,Lay's Wafer chip salted,Lay's,100 g,1.3 g,15 g,681 mg,6.5 g,NULL,539 kcal
+197,8901491003803,Lay's wafer chips red chilli flavor,Lay's,100 g,1.6 g,15 g,475 mg,7 g,NULL,543 kcal
+198,8901491001120,Lay's american style cream and onion chips,Lay's,100 g,3.4 g,14.9 g,643 mg,6.7 g,NULL,537 kcal
+199,8901491002561,Doritos Dinamita fiery lime and chilli,Doritos,100 g,2.2 g,11 g,756 mg,6.8 g,NULL,513 kcal
+200,8901491990097,Doritos sweet chilli flavour,Doritos,100 g,6.5 g,8.7 g,641 mg,6.6 g,NULL,499 kcal
+201,7622202307140,Cadbury shots chocolate,Cadbury,100 g,73.4 g,18 g,10 mg,1.6 g,NULL,475 kcal
+202,8901058005080,Munch max choco coated crunchy wafer bar,Nestle,19.2 g,7.3 g,4.6 g,17 mg,1.1 g,NULL,82 kcal
+203,7622202847653,Cadbury dairy milk milkins chocolate bar,Cadbury,100 g,54.7 g,17.5 g,124.2 mg,8.7 g,NULL,540 kcal
+204,8901058005905,Kitkat premium delights dark,Nestle,15 g,6.7 g,3.3 g,3.6 mg,0.5 g,3.8 g,59 kcal
+205,8901058852165,Kitkat premium delights ,Nestle,16.6 g,7 g,3.9 g,13.7 mg,1 g,NULL,77 kcal
+206,8901058024937,Kitkat pops choco coated crispy cereal balls,Nestle,16 g,6 g,3.7 g,30 mg,1.1 g,NULL,71 kcal
+207,8901058023305,Kitkat premium delights salted caramel,Nestle,24.9 g,9.9 g,4.8 g,27.1 mg,0.9 g,NULL,101 kcal
+208,8901071705806,Hershey's bar cookies and creme,Hershey's,100 g,48 g,16 g,136 mg,5.5 g,NULL,522 kcal
+209,8901071705684,Hershey's dark chocolate bar,Hershey's,100 g,52.3 g,18 g,14.5 mg,5 g,NULL,535 kcal
+210,8901071705622,Hershey's bar dark n rich coffee flavor,Hershey's,100 g,48.8 g,17 g,35.3 mg,5 g,NULL,507 kcal
+211,8000500066027,Kinder bueno crispy creamy bar,Kinder,100 g,41.2 g,17.3 g,107 mg,8.6 g,NULL,572 kcal
+212,5000159563154,Twix cookie caramel chocolate bar,Twix,100 g,48.1 g,13.7 g,158 mg,4.6 g,NULL,493 kcal
+213,80768258,Kinder joy,Kinder,100 g,51 g,32 g,125 mg,8.2 g,NULL,550 kcal
+214,8000500418482,Kinder Schoko Bons crispy,Kinder,5.6 g,2.8 g,0.8 g,7 mg,0.4 g,NULL,29 kcal
+215,80824107,Kinder Creamy,Kinder,100 g,48.8 g,14.2 g,134 mg,8.4 g,NULL,539 kcal
+216,8901071705998,Hershey's exotic dark raspberry goji,Hershey's,100 g,66 g,7 g,70 mg,1.8 g,NULL,441 kcal
+217,8901071705950,Hershey's exotic dark blueberry and acai chocolate,Hershey's,100 g,66 g,7 g,70 mg,1.8 g,NULL,441 kcal
+218,7622202336058,Cadbury perk mini treats chocolate coated wafers,Cadbury,100 g,45.1 g,20 g,103 mg,4.7 g,NULL,513 kcal
+219,8901058020281,Munch max brownie ,Nestle,37.5 g,7.5 g,4.4 g,13.6 mg,0.9 g,NULL,83 kcal
+220,8000500009673,Ferrero rocher,Ferrero,100 g,39.4 g,14.1 g,60 mg,8.2 g,NULL,603 kcal
+221,8000500411469,Ferrero rocher moments,Ferrero,100 g,45.5 g,11.6 g,70 mg,7.9 g,NULL,526 kcal
+222,80052487,Confetteria Raffaello coconut and white almond,Confetteria,100 g,33.6 g,29.5 g,105 mg,7.4 g,NULL,627 kcal
+223,8901071706421,Hershey's choco tube ,Hershey's,100 g,52 g,17 g,150 mg,5 g,NULL,483 kcal
+224,8902433003707,Galaxy smooth milk chocolate bar,Galaxy,100 g,56.3 g,20.3 g,43 mg,6.4 g,NULL,553 kcal
+225,7622202335457,Cadbury nutties chocolate mini treats,Cadbury,100 g,61.5 g,13.9 g,117 mg,5 g,NULL,511 kcal
+226,8901071704489,Hershey's kisses special dark n almonds,Hershey's,100 g,40 g,19 g,45 mg,7.5 g,NULL,570 kcal
+227,7622202334450,Cadbury 5 star oreo chocolate bar,Cadbury,100 g,51 g,21.6 g,225 mg,4.4 g,NULL,516 kcal
+228,8901058009002,Milkybar choo strawberry flavour treats,Nestle,100 g,52 g,13.6 g,93.1 mg,5 g,NULL,436 kcal
+229,8901262070539,Amul fruit nut 55% dark chocolate,Amul,100 g,38.3 g,16.2 g,33 mg,7.2 g,NULL,499 kcal
+230,7622202326141,Cadbury dairy milk silk hazelnut chocolate bar,Cadbury,100 g,46.6 g,19.2 g,104 mg,8.7 g,NULL,566 kcal
+231,7622202335518,Cadbury dairy milk licabels chocolate with oreo chunks,Cadbury,100 g,39.6 g,15.5 g,222 mg,7 g,NULL,490 kcal
+232,8901262070546,Amul choco minis chocolate,Amul,100 g,51 g,27.1 g,NULL,5.5 g,NULL,545 kcal
+233,8901058028034,Milkybar mosha caramel nougat bar,Nestle,20.2 g,10 g,2.8 g,17.5 mg,0.8 g,NULL,87 kcal
+234,8901071701938,Hershey's kisses milk chocolate,Hershey's,100 g,54 g,18 g,100 mg,8 g,NULL,534 kcal
+235,8901071701952,Hershey's kisses cookies n creme chocolate,Hershey's,100 g,54.4 g,17.5 g,200 mg,6.6 g,NULL,534 kcal
+236,6221134030204,Bounty chocolate filled chocolate bar,Bounty,100 g,48.1 g,21.2 g,103 mg,3.8 g,NULL,487 kcal
+237,8901058020021,Munch max nuts double choco coated bar,Nestle,18.7 g,6.8 g,4.3 g,35.4 mg,1.5 g,NULL,85 kcal
+238,7622202324925,Cadbury dairy milk bites almond chocolate pack,Cadbury,100 g,42.6 g,17 g,120 mg,NULL,NULL,551 kcal
+239,8909081010552,Sunfeast dark fanatsy swiss roll,Sunfeast,100 g,40 g,9 g,122.4 mg,4.9 g,NULL,405 kcal
+240,7622202818783,Cadbury chocobakes choc layered cake,Cadbury,100 g,40.3 g,14.1 g,203 mg,3.8 g,NULL,466 kcal
+241,8901063368668,Britannia gobbles bar cake fruity fun,Britannia,100 g ,30.2 g,17.3 g,252.6 mg,5.7 g,NULL,415 kcal
+242,7622202329173,Cadbury brownie,Cadbury,100 g,37 g,11 g,207 mg,5 g,NULL,438 kcal
+243,8908009059628,The health factory mini cakes rich vanilla,The health factory,35 g,6 g,1.81 g,171.15 mg,2.14 g,2.3 g,152 kcal
+244,8906076131513,The baker's dozen banana walnut cake zero maida,The baker's dozen,100 g,22 g,2 g,60 mg,9 g,3 g,448 kcal
+245,8901063365964,Britannia gobbles bar choco fills,Britannia,100 g,27.7 g,10.1 g,80 mg,6.2 g,NULL,418 kcal
+246,8906076131728,The baker's dozen chocochip muffins eggless,The baker's dozen,100 g,31 g,2 g,110 mg,7 g,3 g,340 kcal
+247,8906005618177,Winkies sliced marble cake,Winkies,100 g,27.5 g,NULL,NULL,7.62 g,NULL,408 kcal
+248,8908009419682,Bauli spyroll cake,Bauli,100 g,32.13 g,6.38 g,523 mg,6.85 g,NULL,351 kcal
+249,8908009419002,Bauli moonfills crossiant chocolate creme,Bauli,100 g,21.8 g,11 g,213.3 mg,6.9 g,NULL,398 kcal
+250,8901063032446,Britannia treat crossiant cocoa creme,Britannia,100 g,22.3 g,13.8 g,151 mg,6.4 g,NULL,459 kcal
