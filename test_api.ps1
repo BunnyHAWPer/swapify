@@ -302,8 +302,9 @@ $Password = "Passw0rd!"
 # real barcodes present in swapify.db
 $BcUnhealthy = "8901491101837"   # Lay's Classic Salted
 $BcHealthy   = "8908013479122"   # The Whole Truth protein bar
-$BcBar       = "8901262176224"   # Chocobar (category 'bar' -> has alternatives)
+$BcBar       = "8906127540016"   # Farmley Datebites (protein_bar -> has same-cat alternatives)
 $BcBar2      = "8904335602385"   # Yoga bar protein bar
+$BcSauce     = "8901595862962"   # Ching's Schezwan Chutney (sauce -> no cross-cat noodles!)
 $BcOff       = "3017620422003"   # Nutella -> NOT in DB, tests Open Food Facts fallback
 
 $chatSource = "unknown"
@@ -312,6 +313,9 @@ try {
     # -------------------------------------------------------------------------
     Write-Section 0 "HEALTH CHECK  (GET /health)"
     Invoke-Api GET "/health"
+
+    Write-Section "0b" "PRODUCT COUNT  (GET /product-count)  ->  live curated count + coverage (Task 3)"
+    Invoke-Api GET "/product-count"
 
     Write-Section 1 "REGISTER USER  (POST /register)  ->  writes users table"
     $regBody = @{ email = $Email; username = $Username; password = $Password } | ConvertTo-Json -Compress
@@ -350,6 +354,12 @@ try {
 
     Write-Section 8 "BETTER ALTERNATIVES  (GET /similar/{barcode})  [personalized]"
     Invoke-Api GET "/similar/$BcBar" -Auth
+    Write-Host "   All alternatives above must share the SAME category as the scanned product (Task 2)." -ForegroundColor DarkGray
+
+    Write-Section "8b" "BETTER ALTERNATIVES - category match (Task 2)  (GET /similar/{sauce})  ->  NO noodles"
+    Write-Host "   Schezwan Chutney (category 'sauce') must NOT return Maggi (noodles). No same-" -ForegroundColor DarkGray
+    Write-Host "   category peer -> the correct answer is an empty list, never a cross-category grab-bag." -ForegroundColor DarkGray
+    Invoke-Api GET "/similar/$BcSauce"
 
     Write-Section 9 "SET PREFERENCES  (POST /preferences)  [auth]  ->  writes user_preferences"
     $prefBody = @{ preferences = @{ high_protein = $true; low_sugar = $true; vegan = $false } } | ConvertTo-Json -Compress
@@ -417,6 +427,21 @@ try {
     Write-Section 27 "AI NUTRITIONIST - ingredient substitution  (POST /chat)  -> substitutions[]"
     $chat3 = @{ question = "What can I use instead of sugar in baking?" } | ConvertTo-Json -Compress
     Invoke-Api POST "/chat" $chat3
+
+    Write-Section "27a" "AI CHAT - greeting fast-path (Task 1)  (POST /chat 'hi')  ->  source 'fast-path', instant"
+    Write-Host "   A bare greeting must NOT hit the LLM (no ~25s wait). Expect source=fast-path and" -ForegroundColor DarkGray
+    Write-Host "   a sub-second response." -ForegroundColor DarkGray
+    Invoke-Api POST "/chat" (@{ question = "hi" } | ConvertTo-Json -Compress)
+    try { $fp = ($script:LastBody | ConvertFrom-Json).source } catch { $fp = "unknown" }
+    Write-Host "fast-path source = $fp  (expected: fast-path)" -ForegroundColor Blue
+
+    Write-Section "27b" "AI CHAT - structured top picks (Task 4)  (POST /chat)  ->  top_picks[] via 7+ rule"
+    Write-Host "   Must return a structured top_picks[] array (score/grade/recommended/category) built" -ForegroundColor DarkGray
+    Write-Host "   from the real scored catalogue - not a generic paragraph." -ForegroundColor DarkGray
+    Invoke-Api POST "/chat" (@{ question = "what are the top picks from all products" } | ConvertTo-Json -Compress)
+
+    Write-Section "27c" "AI CHAT - top picks by category (Task 4)  (POST /chat 'best chocolates')"
+    Invoke-Api POST "/chat" (@{ question = "what are the best chocolates" } | ConvertTo-Json -Compress)
 
     # =========================================================================
     #  TASK 1 - CROWDSOURCED PRODUCT RATINGS
