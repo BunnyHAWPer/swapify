@@ -276,13 +276,17 @@ PASSWORD="Passw0rd!"
 # real barcodes present in swapify.db
 BC_UNHEALTHY="8901491101837"   # Lay's Classic Salted
 BC_HEALTHY="8908013479122"     # The Whole Truth protein bar
-BC_BAR="8901262176224"         # Chocobar (category 'bar' -> has alternatives)
+BC_BAR="8906127540016"         # Farmley Datebites (protein_bar -> has same-cat alternatives)
 BC_BAR2="8904335602385"        # Yoga bar protein bar
+BC_SAUCE="8901595862962"       # Ching's Schezwan Chutney (sauce -> no cross-cat noodles!)
 BC_OFF="3017620422003"         # Nutella -> NOT in DB, tests Open Food Facts fallback
 
 # =============================================================================
 section 0 "HEALTH CHECK  (GET /health)"
 request GET "/health" "" noauth
+
+section "0b" "PRODUCT COUNT  (GET /product-count)  ->  live curated count + coverage (Task 3)"
+request GET "/product-count" "" noauth
 
 section 1 "REGISTER USER  (POST /register)  ->  writes users table"
 request POST "/register" "{\"email\":\"$EMAIL\",\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" noauth
@@ -319,6 +323,12 @@ request GET "/v2/score/$BC_HEALTHY" "" auth
 
 section 8 "BETTER ALTERNATIVES  (GET /similar/{barcode})  [personalized]"
 request GET "/similar/$BC_BAR" "" auth
+echo "${DIM}All alternatives above must share the SAME category as the scanned product (Task 2).${RESET}"
+
+section "8b" "BETTER ALTERNATIVES — category match (Task 2)  (GET /similar/{sauce})  ->  NO noodles"
+echo "${DIM}Schezwan Chutney (category 'sauce') must NOT return Maggi (noodles). It has no${RESET}"
+echo "${DIM}same-category peer, so the correct answer is an empty list — never a grab-bag.${RESET}"
+request GET "/similar/$BC_SAUCE" "" noauth
 
 section 9 "SET PREFERENCES  (POST /preferences)  [auth]  ->  writes user_preferences"
 request POST "/preferences" '{"preferences":{"high_protein":true,"low_sugar":true,"vegan":false}}' auth
@@ -378,6 +388,20 @@ request POST "/chat" "{\"question\":\"Should I eat this often?\",\"barcode\":\"$
 
 section 27 "AI NUTRITIONIST — ingredient substitution  (POST /chat)  -> substitutions[]"
 request POST "/chat" '{"question":"What can I use instead of sugar in baking?"}' noauth
+
+section "27a" "AI CHAT — greeting fast-path (Task 1)  (POST /chat 'hi')  ->  source 'fast-path', instant"
+echo "${DIM}A bare greeting must NOT hit the LLM (no ~25s wait). Expect source=fast-path and a${RESET}"
+echo "${DIM}sub-second response — watch the HTTP timing.${RESET}"
+request POST "/chat" '{"question":"hi"}' noauth
+echo "${BLUE}fast-path source = $(printf '%s' "$LAST_BODY" | json_get source)  (expected: fast-path)${RESET}"
+
+section "27b" "AI CHAT — structured top picks (Task 4)  (POST /chat)  ->  top_picks[] via 7+ rule"
+echo "${DIM}Must return a structured top_picks[] array (score/grade/recommended/category) built${RESET}"
+echo "${DIM}from the real scored catalogue — not a generic paragraph.${RESET}"
+request POST "/chat" '{"question":"what are the top picks from all products"}' noauth
+
+section "27c" "AI CHAT — top picks by category (Task 4)  (POST /chat 'best chocolates')"
+request POST "/chat" '{"question":"what are the best chocolates"}' noauth
 
 # =============================================================================
 #  TASK 1 — CROWDSOURCED PRODUCT RATINGS
