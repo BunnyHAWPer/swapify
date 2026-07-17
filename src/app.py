@@ -254,16 +254,27 @@ def _format_uptime(seconds: float) -> str:
 
 recent_scans = []
 
+# Front-end origins that are always allowed, even if ``CORS_ORIGINS`` is not set —
+# so the deployed web app works out of the box. Extra origins can still be added
+# via the ``CORS_ORIGINS`` env var (they are merged with these).
+DEFAULT_ALLOWED_ORIGINS = [
+    "https://swapify-three.vercel.app",   # production web frontend (Vercel)
+]
+
 # CORS origins are configurable for deployment (Task 1): set ``CORS_ORIGINS`` to a
 # comma-separated list of allowed front-end origins in production; defaults to "*"
 # for local development. When specific origins are listed, credentials are allowed;
 # with the "*" wildcard, credentials must be disabled (browsers reject "*" + creds).
+# The built-in ``DEFAULT_ALLOWED_ORIGINS`` are always merged into a non-wildcard
+# list, so the production frontend is allowed whether or not the env var is set.
 _cors_env = os.environ.get("CORS_ORIGINS", "*").strip()
-if _cors_env in ("", "*"):
+if _cors_env == "*":
     ALLOWED_ORIGINS = ["*"]
     _allow_credentials = False
 else:
-    ALLOWED_ORIGINS = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    _env_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+    # Merge defaults + env origins, de-duplicated and order-preserving.
+    ALLOWED_ORIGINS = list(dict.fromkeys(DEFAULT_ALLOWED_ORIGINS + _env_origins))
     _allow_credentials = True
 
 # Mobile clients (Task 1C). A phone *browser* hitting the API sends a normal
