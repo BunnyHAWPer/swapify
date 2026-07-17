@@ -14,6 +14,11 @@ python-multipart==0.0.20
 # Windows (uvicorn's own runner is used there); harmless to install regardless.
 gunicorn==23.0.0
 
+# --- Error tracking (Sentry) --------------------------------------------------
+# Active only when SENTRY_DSN is set; the app runs normally without it (and even
+# without this package installed — the import in observability.py is guarded).
+sentry-sdk[fastapi]==2.20.0
+
 # --- OCR Label Scanner POC (Task 6) ------------------------------------------
 # Python side of the OCR stack. The Tesseract *engine* is a separate native
 # install (see DEPLOYMENT.md / ocr_label_scanner.py). If these are absent the app
