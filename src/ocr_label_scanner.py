@@ -223,13 +223,65 @@ def parse_nutrition(text: str) -> Dict[str, Optional[float]]:
     return nutrition
 
 
+def guess_product_name(text: str) -> Optional[str]:
+    """Best-effort guess at the product's name from OCR'd packaging text.
+
+    There's no reliable way to tell "this is the brand/product name" from
+    plain OCR text alone — real name detection needs layout/font-size info
+    (the name is usually the biggest text on the pack) that Tesseract's
+    plain-text output doesn't preserve. This is a plain heuristic instead:
+    the product name is almost always near the top of the photo and is
+    short, mostly-alphabetic, and isn't one of the standard label panels
+    (ingredients, nutrition, allergen warnings, etc.) — so scan the first
+    handful of OCR'd lines, discard anything that looks like one of those
+    panels or is too short/long/numeric to plausibly be a name, and return
+    the longest survivor (a longer line is more likely to be a full product
+    name like "Maggi 2-Minute Noodles" than a stray logo fragment).
+
+    Good enough to seed a text search the user can correct via the search
+    suggestions that come back — not meant to be exact.
+    """
+    if not text:
+        return None
+
+    skip_markers = (
+        "ingredient", "nutrition", "nutritional", "allergen", "contains",
+        "manufactured", "best before", "storage", "net weight", "net wt",
+        "mrp", "fssai", "marketed", "packed", "customer care", "energy",
+        "per serving", "serving size", "www.", "http", "barcode",
+    )
+
+    candidates = []
+    lines = [l.strip(" .,:;*-•·|_") for l in text.splitlines()]
+    for line in lines[:10]:  # the name is almost always near the top
+        if not line:
+            continue
+        lower = line.lower()
+        if any(marker in lower for marker in skip_markers):
+            continue
+        letters = sum(1 for c in line if c.isalpha())
+        digits = sum(1 for c in line if c.isdigit())
+        if letters < 3 or digits > letters:
+            continue  # too short, or looks like a code/number rather than a name
+        if len(line) > 60:
+            continue  # too long to plausibly be just the product name
+        candidates.append(line)
+
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
 def scan_label(data: bytes, lang: str = "eng") -> Dict:
     """Full POC pipeline: image bytes → OCR text → ingredients + nutrition.
 
     Returns a dict with the raw text, the parsed ingredient list, a single
-    ``ingredients_text`` string (comma-joined, ready for the scoring engine) and
-    the parsed nutrition facts. Scoring itself is done by the caller (the app
-    endpoint) so this module stays decoupled from the scoring code.
+    ``ingredients_text`` string (comma-joined, ready for the scoring engine),
+    the parsed nutrition facts, and a best-effort ``guessed_name`` (see
+    ``guess_product_name``) so a label photo can also be used to search by
+    product name, not just to score its nutrition. Scoring itself is done by
+    the caller (the app endpoint) so this module stays decoupled from the
+    scoring code.
     """
     raw_text = extract_text_from_image(data, lang=lang)
     ingredients = parse_ingredients(raw_text)
@@ -239,6 +291,7 @@ def scan_label(data: bytes, lang: str = "eng") -> Dict:
         "ingredients": ingredients,
         "ingredients_text": ", ".join(ingredients),
         "nutrition": nutrition,
+        "guessed_name": guess_product_name(raw_text),
     }
 
 
