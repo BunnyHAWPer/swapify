@@ -8,7 +8,6 @@ from pydantic import BaseModel
 from typing import Optional, List
 import sqlite3
 import os
-import math
 import re
 import requests
 import bcrypt
@@ -45,6 +44,7 @@ try:
 except Exception:  # pragma: no cover - dependency fallback
     class TTLCache(dict):
         """Minimal TTLCache stand-in: entries expire ``ttl`` seconds after write."""
+
         def __init__(self, maxsize=128, ttl=3600):
             super().__init__()
             self.maxsize = maxsize
@@ -81,32 +81,65 @@ except Exception:  # pragma: no cover - dependency fallback
 
 logger = logging.getLogger("swapify.chat")
 
+
 class MissingReport(BaseModel):
     barcode: str
     product_name: Optional[str] = None
     comment: Optional[str] = None
+
 
 class UserRegister(BaseModel):
     email: str
     password: str
     username: str
 
+
 class UserLogin(BaseModel):
     email: str
     password: str
 
+
 class UserPreferences(BaseModel):
     preferences: dict
 
+
 class FavoriteAdd(BaseModel):
     barcode: str
+    # Denormalized fallback display data, supplied by the client. Populated
+    # only when the barcode isn't in our own `products` table (the bundled
+    # CSV database or Open Food Facts) — see the note on POST /favorites for
+    # why this exists.
+    product_name: Optional[str] = None
+    brand: Optional[str] = None
+    health_score: Optional[float] = None
+    grade: Optional[str] = None
+
+
+class MySwapAdd(BaseModel):
+    original_barcode: str
+    original_name: Optional[str] = None
+    alt_barcode: str
+    alt_name: Optional[str] = None
+    alt_brand: Optional[str] = None
+    alt_score: Optional[float] = None
+    alt_grade: Optional[str] = None
+    note: Optional[str] = ""
+
+
+class MySwapNoteUpdate(BaseModel):
+    original_barcode: str
+    alt_barcode: str
+    note: str = ""
+
 
 class ChatRequest(BaseModel):
     question: str
     barcode: Optional[str] = None
 
+
 class CompareMultipleRequest(BaseModel):
     barcodes: List[str]
+
 
 class ProductRating(BaseModel):
     barcode: str
@@ -114,30 +147,37 @@ class ProductRating(BaseModel):
     quality_rating: int
     value_rating: int
 
+
 class ActivityLog(BaseModel):
     action_type: str
     user_id: Optional[int] = None
     barcode: Optional[str] = None
     metadata: Optional[dict] = None
 
+
 class ShoppingListCreate(BaseModel):
     items: List[str]
     name: Optional[str] = None
 
+
 class ShoppingListReplace(BaseModel):
     old_barcode: str
     new_barcode: str
+
 
 class ReviewCreate(BaseModel):
     barcode: str
     rating: int
     review_text: str
 
+
 class ReviewVote(BaseModel):
     vote: str  # "up" or "down"
 
+
 class ReviewReply(BaseModel):
     reply_text: str
+
 
 # JWT signing key. Overridable via the environment for deployment (set a strong,
 # random SECRET_KEY in production); falls back to the original constant so local
@@ -145,9 +185,9 @@ class ReviewReply(BaseModel):
 SECRET_KEY = os.environ.get("SECRET_KEY", "supersecretkey")
 ALGORITHM = "HS256"
 
-
 try:
     from dotenv import load_dotenv  # type: ignore
+
     load_dotenv()
 except Exception:
     pass
@@ -180,13 +220,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # stacks into ~25s+ for a message as trivial as "hi". A 12s ceiling still gives a
 # healthy model ample time to answer but fails over to the next model/provider far
 # sooner when one is slow. Overridable via the environment for tuning per deploy.
-# 4.5s per provider call. `requests` applies this per socket read rather than as a
-# wall-clock deadline, so a slow-dribbling response can overshoot slightly; 4.5s
-# keeps even that case inside the 7s target the client asked for. A free-tier
-# model that cannot answer in 4.5s is one the user is waiting on for no benefit —
-# the deterministic fallback below is grounded in our own data and returns at once.
-OPENROUTER_TIMEOUT_S = float(os.environ.get("OPENROUTER_TIMEOUT", "4.5"))
-GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT", "4.5"))
+OPENROUTER_TIMEOUT_S = float(os.environ.get("OPENROUTER_TIMEOUT", "8"))
+GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT", "8"))
 
 # Whole-endpoint budget for /chat (Task: chat latency). Per-call timeouts alone
 # don't bound the total: two OpenRouter models x two attempts each, plus Gemini
@@ -195,9 +230,7 @@ GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT", "4.5"))
 # and a retry or a further provider is only attempted when enough budget remains
 # to be worth it — so /chat degrades to the deterministic answer at a predictable
 # ceiling instead of making the user wait indefinitely.
-# Target: a reply inside 5-7s. Product questions now bypass the LLM entirely
-# (answered from the database), so this budget only bounds the open-ended asks.
-CHAT_BUDGET_S = float(os.environ.get("CHAT_BUDGET", "6.5"))
+CHAT_BUDGET_S = float(os.environ.get("CHAT_BUDGET", "12"))
 # Don't start another provider call unless at least this much budget is left.
 CHAT_MIN_CALL_S = 2.5
 
@@ -219,7 +252,6 @@ GEMINI_URL = (
 
 AI_ENABLED = bool(OPENROUTER_API_KEY or GEMINI_API_KEY)
 
-
 if AI_ENABLED:
     providers = []
     if OPENROUTER_API_KEY:
@@ -237,6 +269,7 @@ else:
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
+
 def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
@@ -247,6 +280,7 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid token")
 
+
 def get_current_user_optional(token: Optional[str] = Depends(OAuth2PasswordBearer(tokenUrl="login", auto_error=False))):
     if not token:
         return None
@@ -255,6 +289,7 @@ def get_current_user_optional(token: Optional[str] = Depends(OAuth2PasswordBeare
         return payload.get("user_id")
     except Exception:
         return None
+
 
 app = FastAPI()
 
@@ -288,7 +323,7 @@ recent_scans = []
 # so the deployed web app works out of the box. Extra origins can still be added
 # via the ``CORS_ORIGINS`` env var (they are merged with these).
 DEFAULT_ALLOWED_ORIGINS = [
-    "https://swapify-three.vercel.app",   # production web frontend (Vercel)
+    "https://swapify-three.vercel.app",  # production web frontend (Vercel)
 ]
 
 # CORS origins are configurable for deployment (Task 1): set ``CORS_ORIGINS`` to a
@@ -542,7 +577,6 @@ CSV_SEED_PATH = os.environ.get("SWAPIFY_CSV_PATH") or os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "products.csv"
 )
 
-
 # A live deployment runs several gunicorn workers against this one SQLite file, so
 # every connection opts into WAL (readers never block the writer) and waits out a
 # concurrent writer instead of failing instantly with "database is locked".
@@ -565,6 +599,7 @@ def get_db_connection():
     conn.execute(f"PRAGMA busy_timeout={int(SQLITE_BUSY_TIMEOUT_S * 1000)}")
     return conn
 
+
 @app.post("/register")
 def register(user: UserRegister):
     conn = get_db_connection()
@@ -573,7 +608,7 @@ def register(user: UserRegister):
     if cursor.fetchone():
         conn.close()
         raise HTTPException(status_code=400, detail="Username or email already registered")
-        
+
     password_hash = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     cursor.execute(
         "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
@@ -583,6 +618,7 @@ def register(user: UserRegister):
     conn.close()
     return {"message": "User registered successfully"}
 
+
 @app.post("/login")
 def login(user: UserLogin):
     conn = get_db_connection()
@@ -590,22 +626,23 @@ def login(user: UserLogin):
     cursor.execute("SELECT * FROM users WHERE email = ?", (user.email,))
     row = cursor.fetchone()
     conn.close()
-    
+
     if not row:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-        
+
     user_db = dict(row)
     if not bcrypt.checkpw(user.password.encode('utf-8'), user_db['password_hash'].encode('utf-8')):
         raise HTTPException(status_code=401, detail="Invalid email or password")
-        
+
     payload = {
         "user_id": user_db['id'],
         "username": user_db['username'],
         "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
     }
     token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-    
+
     return {"access_token": token, "token_type": "bearer"}
+
 
 @app.get("/profile")
 def profile(user_id: int = Depends(get_current_user)):
@@ -613,10 +650,123 @@ def profile(user_id: int = Depends(get_current_user)):
     cursor = conn.cursor()
     cursor.execute("SELECT id, username, email, created_at FROM users WHERE id = ?", (user_id,))
     row = cursor.fetchone()
-    conn.close()
     if not row:
+        conn.close()
         raise HTTPException(status_code=404, detail="User not found")
-    return dict(row)
+
+    # True cross-device lifetime scan count for this account. The frontend's
+    # "All-Time Scans" stat previously came only from a per-browser
+    # localStorage counter, which under/over-counted for anyone who scanned
+    # from more than one device or browser — this is the authoritative
+    # number it now reconciles against.
+    cursor.execute("SELECT COUNT(*) AS cnt FROM scan_history WHERE user_id = ?", (user_id,))
+    total_scans = cursor.fetchone()["cnt"]
+
+    # Cross-device day streak. The frontend used to compute this purely from
+    # each browser's own localStorage scan history, so the exact same account
+    # could show a different streak in every browser (each one only "knew
+    # about" the scans made in it). This mirrors that day-by-day logic
+    # (today may be missing without breaking the streak — someone just
+    # hasn't scanned yet today — but any other missing day ends it) against
+    # every scan on the account, regardless of which device made it.
+    cursor.execute(
+        "SELECT DISTINCT date(scanned_at) AS d FROM scan_history WHERE user_id = ?",
+        (user_id,)
+    )
+    scan_dates = {r["d"] for r in cursor.fetchall()}
+    conn.close()
+
+    streak = 0
+    cur_date = datetime.datetime.utcnow().date()
+    for i in range(365):
+        if cur_date.isoformat() in scan_dates:
+            streak += 1
+            cur_date -= datetime.timedelta(days=1)
+        else:
+            if i == 0:
+                cur_date -= datetime.timedelta(days=1)
+                continue
+            break
+
+    result = dict(row)
+    result["total_scans"] = total_scans
+    result["streak"] = streak
+    return result
+
+
+# Mirrors BADGE_DEFS in script.js: same ids and targets. Computed from every
+# scan on the account (scan_history), not just the current browser's
+# localStorage — that mismatch was Bug 4 (an account could show "2 badges
+# earned" in one browser and only 1 in another, including Profile, since
+# Profile read the same local-only data).
+_BADGE_TARGETS = {
+    "health_champion": 100,
+    "sugar_detective": 10,
+    "protein_hunter": 10,
+    "scanner_pro": 7,
+    "community_contributor": 20,
+    "clean_eater": 50,
+}
+_SUGAR_DETECTIVE_PATTERN = re.compile(r"(cola|candy|chocolate|cookie|biscuit)", re.IGNORECASE)
+
+
+@app.get("/badges")
+def get_badges(user_id: int = Depends(get_current_user)):
+    """Cross-device Achievements/badge progress for the authenticated user."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT barcode, product_name, health_score, scanned_at FROM scan_history WHERE user_id = ?",
+        (user_id,)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+
+    total_scans = len(rows)
+    distinct_barcodes = len({r["barcode"] for r in rows if r.get("barcode")})
+    sugar_detective_count = sum(
+        1 for r in rows
+        if r.get("health_score") is not None and r["health_score"] >= 5
+        and r.get("product_name") and _SUGAR_DETECTIVE_PATTERN.search(r["product_name"])
+    )
+    score_ge_7_count = sum(
+        1 for r in rows if r.get("health_score") is not None and r["health_score"] >= 7
+    )
+
+    # Same day-streak logic as /profile.
+    scan_dates = {r["scanned_at"][:10] for r in rows if r.get("scanned_at")}
+    streak = 0
+    cur_date = datetime.datetime.utcnow().date()
+    for i in range(365):
+        if cur_date.isoformat() in scan_dates:
+            streak += 1
+            cur_date -= datetime.timedelta(days=1)
+        else:
+            if i == 0:
+                cur_date -= datetime.timedelta(days=1)
+                continue
+            break
+
+    metrics = {
+        "health_champion": total_scans,
+        "sugar_detective": sugar_detective_count,
+        "protein_hunter": score_ge_7_count,
+        "scanner_pro": streak,
+        "community_contributor": distinct_barcodes,
+        "clean_eater": score_ge_7_count,
+    }
+
+    badges = {}
+    for badge_id, target in _BADGE_TARGETS.items():
+        val = metrics[badge_id]
+        badges[badge_id] = {
+            "progress": min(val, target),
+            "target": target,
+            "earned": val >= target,
+            "pct": round(100 * min(val, target) / target, 1) if target else 0.0,
+        }
+    return {"badges": badges}
+
 
 def fetch_off_product(barcode: str):
     """Fetch and normalise a product from Open Food Facts.
@@ -653,33 +803,10 @@ def fetch_off_product(barcode: str):
                     continue
         return None
 
-    # Basis discipline: we declare serving_size_g = 100 below, so every nutrient
-    # here must be the per-100g figure. Reading '<n>_serving' first (the previous
-    # behaviour) mixed a real per-serving number into a row labelled as 100g —
-    # and per-100g scoring then divides by 100, silently under-reporting a 30g
-    # pack by ~3x. Prefer _100g; fall back to _serving only when OFF also tells us
-    # the serving size, so the value can be converted honestly.
-    try:
-        off_serving_g = float(
-            re.search(r"[\d.]+", str(p.get("serving_size") or "")).group()
-        )
-    except (AttributeError, ValueError):
-        off_serving_g = None
-
-    def _per_100g(base: str):
-        """Per-100g value for `base`, converting a per-serving figure if needed."""
-        val = _num(f"{base}_100g")
-        if val is not None:
-            return val
-        serving_val = _num(f"{base}_serving")
-        if serving_val is not None and off_serving_g:
-            return serving_val * 100.0 / off_serving_g
-        return None
-
     # OFF stores sodium in grams; fall back to salt/2.5 when sodium is absent.
-    sodium_val = _per_100g('sodium')
+    sodium_val = _num('sodium_serving', 'sodium_100g')
     if sodium_val is None:
-        salt_val = _per_100g('salt')
+        salt_val = _num('salt_serving', 'salt_100g')
         sodium_val = (salt_val / 2.5) if salt_val is not None else None
     sodium_mg = sodium_val * 1000 if sodium_val is not None else None
 
@@ -689,10 +816,10 @@ def fetch_off_product(barcode: str):
     # OFF stores ingredients under several keys; fall back across them
     # and finally reconstruct from the structured ingredients list.
     off_ingredients = (
-        p.get('ingredients_text')
-        or p.get('ingredients_text_en')
-        or p.get('ingredients_text_with_allergens')
-        or ""
+            p.get('ingredients_text')
+            or p.get('ingredients_text_en')
+            or p.get('ingredients_text_with_allergens')
+            or ""
     )
     if not off_ingredients and isinstance(p.get('ingredients'), list):
         off_ingredients = ", ".join(
@@ -707,21 +834,19 @@ def fetch_off_product(barcode: str):
         # for a share card. None of the local DB rows carry an image, so this is
         # only populated for products resolved from Open Food Facts.
         "image_url": (
-            p.get('image_front_url')
-            or p.get('image_url')
-            or p.get('image_front_small_url')
-            or None
+                p.get('image_front_url')
+                or p.get('image_url')
+                or p.get('image_front_small_url')
+                or None
         ),
         "category": category,
-        # Every nutrient above/below is per 100g, so the declared serving must be
-        # 100g for the two to agree. See _per_100g.
         "serving_size_g": 100.0,
-        "sugar_g_per_serving": _per_100g('sugars'),
-        "saturated_fat_g_per_serving": _per_100g('saturated-fat'),
+        "sugar_g_per_serving": _num('sugars_serving', 'sugars_100g'),
+        "saturated_fat_g_per_serving": _num('saturated-fat_serving', 'saturated-fat_100g'),
         "sodium_mg_per_serving": sodium_mg,
-        "protein_g_per_serving": _per_100g('proteins'),
-        "fiber_g_per_serving": _per_100g('fiber'),
-        "calories_kcal_per_serving": _per_100g('energy-kcal'),
+        "protein_g_per_serving": _num('proteins_serving', 'proteins_100g'),
+        "fiber_g_per_serving": _num('fiber_serving', 'fiber_100g'),
+        "calories_kcal_per_serving": _num('energy-kcal_serving', 'energy-kcal_100g'),
         "ingredients_text": off_ingredients,
     }
 
@@ -761,28 +886,7 @@ def get_scored_product(barcode: str, preferences: dict = None):
     p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
     p_dict['preferences_applied'] = breakdown.get('preferences_applied', {})
     p_dict['source'] = source
-    attach_data_quality(p_dict, breakdown)
     return p_dict
-
-
-def attach_data_quality(p_dict: dict, breakdown: dict) -> None:
-    """Promote the scorer's data-completeness signals onto the product payload.
-
-    A client rendering a scan needs to distinguish "0g sugar" from "sugar was
-    never disclosed" without digging into ``breakdown``. Without this the two are
-    indistinguishable in the UI, which is how an unscored product came to look
-    like an average one.
-    """
-    p_dict['undisclosed_nutrients'] = breakdown.get('undisclosed_nutrients', [])
-    p_dict['data_complete'] = breakdown.get('data_complete', True)
-    p_dict['score_confidence'] = breakdown.get('score_confidence', 'high')
-    p_dict['insufficient_data'] = breakdown.get('insufficient_data', False)
-    if p_dict['insufficient_data']:
-        p_dict['data_notice'] = (
-            "This product's label data is missing, so it cannot be scored "
-            "reliably. Scan the barcode again or report it so we can add the "
-            "nutrition panel."
-        )
 
 
 def generic_scored_product(barcode: str):
@@ -823,7 +927,6 @@ def generic_scored_product(barcode: str):
     p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
     p_dict['preferences_applied'] = {}
     p_dict['source'] = source
-    attach_data_quality(p_dict, breakdown)
     badge = evaluate_recommended_badge(p_dict, breakdown, None)
     p_dict['is_recommended'] = badge['is_recommended']
     p_dict['recommended_badge'] = badge
@@ -971,7 +1074,8 @@ def validate_barcode_endpoint(barcode: str):
 
 
 @app.get("/product/{barcode}")
-def get_product(barcode: str, device_id: Optional[str] = None, user_id: Optional[int] = Depends(get_current_user_optional)):
+def get_product(barcode: str, device_id: Optional[str] = None,
+                user_id: Optional[int] = Depends(get_current_user_optional)):
     # Validate the barcode up front so we can attach a helpful correction hint to
     # the response (especially on a 404) without blocking the lookup itself.
     validation = validate_barcode(barcode)
@@ -993,9 +1097,17 @@ def get_product(barcode: str, device_id: Optional[str] = None, user_id: Optional
             barcode = row["barcode"]
 
     if row and (device_id or user_id):
+        # Generic (unpersonalized) score, purely so badge metrics have a
+        # stable, comparable basis across users — the personalized score used
+        # for the response itself is computed separately below.
+        try:
+            _badge_score, _, _, _ = calculate_health_score_v2(dict(row), 1, None)
+        except Exception:
+            _badge_score = None
         cursor.execute(
-            "INSERT INTO scan_history (device_id, user_id, barcode) VALUES (?, ?, ?)",
-            (device_id, user_id, barcode)
+            "INSERT INTO scan_history (device_id, user_id, barcode, product_name, health_score) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (device_id, user_id, barcode, row["product_name"], _badge_score)
         )
         conn.commit()
         # Best-effort activity log for logged-in scans (see /activity).
@@ -1087,6 +1199,7 @@ def get_product(barcode: str, device_id: Optional[str] = None, user_id: Optional
         content["barcode_validation"] = validation
     return JSONResponse(status_code=404, content=content)
 
+
 def calculate_health_score(product: dict):
     score = 5.0
     sugar = product.get('sugar_g_per_serving') or 0
@@ -1099,25 +1212,25 @@ def calculate_health_score(product: dict):
         score -= 5
     elif sugar > 10:
         score -= 3
-        
+
     if sat_fat > 8:
         score -= 3
     elif sat_fat > 4:
         score -= 2
-        
+
     if sodium > 800:
         score -= 2
     elif sodium > 400:
         score -= 2
-        
+
     if protein > 8:
         score += 1
-        
+
     if fiber > 5:
         score += 1
-        
+
     score = max(1.0, min(10.0, score))
-    
+
     if score >= 9:
         grade = "A"
     elif score >= 7:
@@ -1128,8 +1241,9 @@ def calculate_health_score(product: dict):
         grade = "D"
     else:
         grade = "F"
-        
+
     return score, grade
+
 
 # ==============================================================================
 # Scoring rules — implements ScoringLogic_Swapify.md (Chandrika's spec)
@@ -1144,11 +1258,6 @@ def calculate_health_score(product: dict):
 # Indian RDA reference used for the sodium %RDA bands in spec section 3.7.
 SODIUM_RDA_MG = 2000.0
 
-# Nutrients whose penalty thresholds are judged on concentration (per 100g)
-# rather than on portion size. Sodium is deliberately absent: spec 3.7 defines it
-# as a share of the daily value *per serving*. See calculate_health_score_v2.
-PER_100G_PENALTY_NUTRIENTS = frozenset({"sugar", "saturated_fat"})
-
 SCORING_RULES = {
     "base_score": 5.0,  # spec 2.1 — neutral midpoint, not 10
 
@@ -1162,15 +1271,15 @@ SCORING_RULES = {
         {
             "nutrient": "sugar",
             "thresholds": [
-                { "min": 10, "points": -2 },
-                { "min": 5, "max": 10, "points": -1 }
+                {"min": 10, "points": -2},
+                {"min": 5, "max": 10, "points": -1}
             ]
         },
         {
             "nutrient": "sodium",
             "thresholds": [
-                { "min": 0.30 * SODIUM_RDA_MG, "points": -1.0 },
-                { "min": 0.15 * SODIUM_RDA_MG, "max": 0.30 * SODIUM_RDA_MG, "points": -0.6 }
+                {"min": 0.30 * SODIUM_RDA_MG, "points": -1.0},
+                {"min": 0.15 * SODIUM_RDA_MG, "max": 0.30 * SODIUM_RDA_MG, "points": -0.6}
             ]
         },
         {
@@ -1179,10 +1288,10 @@ SCORING_RULES = {
             # 15g scored -1 — so a fattier product could out-score a leaner one.
             "nutrient": "saturated_fat",
             "thresholds": [
-                { "min": 20, "points": -2.0 },
-                { "min": 10, "max": 20, "points": -1.5 },
-                { "min": 6, "max": 10, "points": -1.0 },
-                { "min": 3, "max": 6, "points": -0.5 }
+                {"min": 20, "points": -2.0},
+                {"min": 10, "max": 20, "points": -1.5},
+                {"min": 6, "max": 10, "points": -1.0},
+                {"min": 3, "max": 6, "points": -0.5}
             ]
         },
     ],
@@ -1190,186 +1299,193 @@ SCORING_RULES = {
     # --- Section 3: negative ingredients (deductions) -------------------------
     "ingredients": [
         # 3.1 Oils & Fats
-        { "name": "partially hydrogenated oil / vanaspati", "penalty": -1.2, "category": "Oils & Fats", "risk": "Severe",
-          "match": ["partially hydrogenated", "hydrogenated vegetable oil", "hydrogenated fat", "vanaspati"] },
-        { "name": "repeatedly reused frying oil", "penalty": -1.0, "category": "Oils & Fats", "risk": "Severe",
-          "match": ["reused frying oil", "repeatedly fried oil"] },
-        { "name": "interesterified fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "Medium",
-          "match": ["interesterified"] },
-        { "name": "fractionated fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "Medium",
-          "match": ["fractionated fat", "fractionated vegetable fat"] },
-        { "name": "refined palm oil / palmolein", "penalty": -0.6, "category": "Oils & Fats", "risk": "Medium",
-          "match": ["palm oil", "palmolein", "palm fat", "palm kernel"] },
-        { "name": "cottonseed oil", "penalty": -0.3, "category": "Oils & Fats", "risk": "Low",
-          "match": ["cottonseed oil"] },
+        {"name": "partially hydrogenated oil / vanaspati", "penalty": -1.2, "category": "Oils & Fats", "risk": "Severe",
+         "match": ["partially hydrogenated", "hydrogenated vegetable oil", "hydrogenated fat", "vanaspati"]},
+        {"name": "repeatedly reused frying oil", "penalty": -1.0, "category": "Oils & Fats", "risk": "Severe",
+         "match": ["reused frying oil", "repeatedly fried oil"]},
+        {"name": "interesterified fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "Medium",
+         "match": ["interesterified"]},
+        {"name": "fractionated fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "Medium",
+         "match": ["fractionated fat", "fractionated vegetable fat"]},
+        {"name": "refined palm oil / palmolein", "penalty": -0.6, "category": "Oils & Fats", "risk": "Medium",
+         "match": ["palm oil", "palmolein", "palm fat", "palm kernel"]},
+        {"name": "cottonseed oil", "penalty": -0.3, "category": "Oils & Fats", "risk": "Low",
+         "match": ["cottonseed oil"]},
 
         # 3.2 Sugars & Sweeteners
-        { "name": "high fructose corn syrup", "penalty": -1.0, "category": "Sugars & Sweeteners", "risk": "Severe",
-          "match": ["high fructose corn syrup", "hfcs", "corn syrup solids", "fructose syrup"] },
-        { "name": "refined sugar", "penalty": -0.8, "category": "Sugars & Sweeteners", "risk": "High",
-          "match": ["refined sugar", "white sugar", "sucrose", "sugar"] },
-        { "name": "corn syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
-          "match": ["corn syrup", "glucose syrup", "liquid glucose"] },
-        { "name": "invert sugar syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
-          "match": ["invert sugar syrup", "invert syrup", "invert sugar"] },
-        { "name": "aspartame", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
-          "match": ["aspartame", "e951", "ins 951"] },
-        { "name": "acesulfame-k", "penalty": -0.4, "category": "Sugars & Sweeteners", "risk": "Low",
-          "match": ["acesulfame", "e950", "ins 950"] },
-        { "name": "maltodextrin", "penalty": -0.4, "category": "Sugars & Sweeteners", "risk": "Low",
-          "match": ["maltodextrin"] },
-        { "name": "sucralose", "penalty": -0.3, "category": "Sugars & Sweeteners", "risk": "Low",
-          "match": ["sucralose", "e955", "ins 955"] },
+        {"name": "high fructose corn syrup", "penalty": -1.0, "category": "Sugars & Sweeteners", "risk": "Severe",
+         "match": ["high fructose corn syrup", "hfcs", "corn syrup solids", "fructose syrup"]},
+        {"name": "refined sugar", "penalty": -0.8, "category": "Sugars & Sweeteners", "risk": "High",
+         "match": ["refined sugar", "white sugar", "sucrose", "sugar"]},
+        {"name": "corn syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
+         "match": ["corn syrup", "glucose syrup", "liquid glucose"]},
+        {"name": "invert sugar syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
+         "match": ["invert sugar syrup", "invert syrup", "invert sugar"]},
+        {"name": "aspartame", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
+         "match": ["aspartame", "e951", "ins 951"]},
+        {"name": "acesulfame-k", "penalty": -0.4, "category": "Sugars & Sweeteners", "risk": "Low",
+         "match": ["acesulfame", "e950", "ins 950"]},
+        {"name": "maltodextrin", "penalty": -0.4, "category": "Sugars & Sweeteners", "risk": "Low",
+         "match": ["maltodextrin"]},
+        {"name": "sucralose", "penalty": -0.3, "category": "Sugars & Sweeteners", "risk": "Low",
+         "match": ["sucralose", "e955", "ins 955"]},
 
         # 3.3 Preservatives
-        { "name": "sodium nitrite / nitrate", "penalty": -1.2, "category": "Preservatives", "risk": "Severe",
-          "match": ["sodium nitrite", "sodium nitrate", "potassium nitrite", "potassium nitrate", "e250", "e251", "ins 250", "ins 251"] },
-        { "name": "bha (e320)", "penalty": -1.0, "category": "Preservatives", "risk": "Severe",
-          "match": ["butylated hydroxyanisole", "bha", "e320", "ins 320"] },
-        { "name": "tbhq", "penalty": -0.8, "category": "Preservatives", "risk": "Severe",
-          "match": ["tertiary butylhydroquinone", "tbhq", "e319", "ins 319"] },
-        { "name": "sulphur dioxide / sulphites", "penalty": -0.6, "category": "Preservatives", "risk": "Medium",
-          "match": ["sulphur dioxide", "sulfur dioxide", "sulphite", "sulfite", "e220", "e223", "e224", "ins 220", "ins 223"] },
-        { "name": "sodium benzoate (e211)", "penalty": -0.6, "category": "Preservatives", "risk": "Medium",
-          "match": ["sodium benzoate", "benzoate", "e211", "ins 211"] },
-        { "name": "bht (e321)", "penalty": -0.5, "category": "Preservatives", "risk": "Medium",
-          "match": ["butylated hydroxytoluene", "bht", "e321", "ins 321"] },
-        { "name": "potassium sorbate", "penalty": -0.2, "category": "Preservatives", "risk": "Low",
-          "match": ["potassium sorbate", "sorbate", "e202", "ins 202"] },
+        {"name": "sodium nitrite / nitrate", "penalty": -1.2, "category": "Preservatives", "risk": "Severe",
+         "match": ["sodium nitrite", "sodium nitrate", "potassium nitrite", "potassium nitrate", "e250", "e251",
+                   "ins 250", "ins 251"]},
+        {"name": "bha (e320)", "penalty": -1.0, "category": "Preservatives", "risk": "Severe",
+         "match": ["butylated hydroxyanisole", "bha", "e320", "ins 320"]},
+        {"name": "tbhq", "penalty": -0.8, "category": "Preservatives", "risk": "Severe",
+         "match": ["tertiary butylhydroquinone", "tbhq", "e319", "ins 319"]},
+        {"name": "sulphur dioxide / sulphites", "penalty": -0.6, "category": "Preservatives", "risk": "Medium",
+         "match": ["sulphur dioxide", "sulfur dioxide", "sulphite", "sulfite", "e220", "e223", "e224", "ins 220",
+                   "ins 223"]},
+        {"name": "sodium benzoate (e211)", "penalty": -0.6, "category": "Preservatives", "risk": "Medium",
+         "match": ["sodium benzoate", "benzoate", "e211", "ins 211"]},
+        {"name": "bht (e321)", "penalty": -0.5, "category": "Preservatives", "risk": "Medium",
+         "match": ["butylated hydroxytoluene", "bht", "e321", "ins 321"]},
+        {"name": "potassium sorbate", "penalty": -0.2, "category": "Preservatives", "risk": "Low",
+         "match": ["potassium sorbate", "sorbate", "e202", "ins 202"]},
 
         # 3.4 Artificial Colors
-        { "name": "tartrazine (e102)", "penalty": -0.7, "category": "Artificial Colors", "risk": "High",
-          "match": ["tartrazine", "yellow 5", "e102", "ins 102"] },
-        { "name": "sunset yellow (e110)", "penalty": -0.7, "category": "Artificial Colors", "risk": "High",
-          "match": ["sunset yellow", "e110", "ins 110"] },
-        { "name": "carmoisine (e122)", "penalty": -0.6, "category": "Artificial Colors", "risk": "Medium",
-          "match": ["carmoisine", "e122", "ins 122"] },
-        { "name": "allura red (e129)", "penalty": -0.6, "category": "Artificial Colors", "risk": "Medium",
-          "match": ["allura red", "red 40", "e129", "ins 129"] },
-        { "name": "erythrosine (e127)", "penalty": -0.5, "category": "Artificial Colors", "risk": "Medium",
-          "match": ["erythrosine", "e127", "ins 127"] },
-        { "name": "caramel colour iv (ammonia-sulphite)", "penalty": -0.5, "category": "Artificial Colors", "risk": "Medium",
-          "match": ["caramel colour iv", "caramel color iv", "ammonia sulphite caramel", "150d", "e150d", "ins 150d"] },
+        {"name": "tartrazine (e102)", "penalty": -0.7, "category": "Artificial Colors", "risk": "High",
+         "match": ["tartrazine", "yellow 5", "e102", "ins 102"]},
+        {"name": "sunset yellow (e110)", "penalty": -0.7, "category": "Artificial Colors", "risk": "High",
+         "match": ["sunset yellow", "e110", "ins 110"]},
+        {"name": "carmoisine (e122)", "penalty": -0.6, "category": "Artificial Colors", "risk": "Medium",
+         "match": ["carmoisine", "e122", "ins 122"]},
+        {"name": "allura red (e129)", "penalty": -0.6, "category": "Artificial Colors", "risk": "Medium",
+         "match": ["allura red", "red 40", "e129", "ins 129"]},
+        {"name": "erythrosine (e127)", "penalty": -0.5, "category": "Artificial Colors", "risk": "Medium",
+         "match": ["erythrosine", "e127", "ins 127"]},
+        {"name": "caramel colour iv (ammonia-sulphite)", "penalty": -0.5, "category": "Artificial Colors",
+         "risk": "Medium",
+         "match": ["caramel colour iv", "caramel color iv", "ammonia sulphite caramel", "150d", "e150d", "ins 150d"]},
 
         # 3.5 Flavor Enhancers
-        { "name": "msg (e621)", "penalty": -0.5, "category": "Flavor Enhancers", "risk": "Medium",
-          "match": ["monosodium glutamate", "yeast extract", "msg", "e621", "ins 621"] },
-        { "name": "disodium inosinate / guanylate", "penalty": -0.3, "category": "Flavor Enhancers", "risk": "Low",
-          "match": ["disodium inosinate", "disodium guanylate", "e631", "e627", "ins 631", "ins 627"] },
-        { "name": "unspecified artificial flavouring", "penalty": -0.3, "category": "Flavor Enhancers", "risk": "Low",
-          "match": ["artificial flavouring", "artificial flavoring", "artificial flavour", "artificial flavor"] },
+        {"name": "msg (e621)", "penalty": -0.5, "category": "Flavor Enhancers", "risk": "Medium",
+         "match": ["monosodium glutamate", "yeast extract", "msg", "e621", "ins 621"]},
+        {"name": "disodium inosinate / guanylate", "penalty": -0.3, "category": "Flavor Enhancers", "risk": "Low",
+         "match": ["disodium inosinate", "disodium guanylate", "e631", "e627", "ins 631", "ins 627"]},
+        {"name": "unspecified artificial flavouring", "penalty": -0.3, "category": "Flavor Enhancers", "risk": "Low",
+         "match": ["artificial flavouring", "artificial flavoring", "artificial flavour", "artificial flavor"]},
 
         # 3.6 Emulsifiers & Stabilizers
-        { "name": "polysorbate 80", "penalty": -0.5, "category": "Emulsifiers & Stabilizers", "risk": "Medium",
-          "match": ["polysorbate", "e433", "e435", "ins 433"] },
-        { "name": "carboxymethyl cellulose (cmc)", "penalty": -0.5, "category": "Emulsifiers & Stabilizers", "risk": "Medium",
-          "match": ["carboxymethyl cellulose", "cmc", "e466", "ins 466"] },
-        { "name": "sodium stearoyl lactylate", "penalty": -0.2, "category": "Emulsifiers & Stabilizers", "risk": "Low",
-          "match": ["sodium stearoyl lactylate", "e481", "ins 481"] },
+        {"name": "polysorbate 80", "penalty": -0.5, "category": "Emulsifiers & Stabilizers", "risk": "Medium",
+         "match": ["polysorbate", "e433", "e435", "ins 433"]},
+        {"name": "carboxymethyl cellulose (cmc)", "penalty": -0.5, "category": "Emulsifiers & Stabilizers",
+         "risk": "Medium",
+         "match": ["carboxymethyl cellulose", "cmc", "e466", "ins 466"]},
+        {"name": "sodium stearoyl lactylate", "penalty": -0.2, "category": "Emulsifiers & Stabilizers", "risk": "Low",
+         "match": ["sodium stearoyl lactylate", "e481", "ins 481"]},
 
         # 3.7 Sodium & salt-related (the %RDA bands live in "rules" above)
-        { "name": "disodium phosphate", "penalty": -0.3, "category": "Sodium", "risk": "Low",
-          "match": ["disodium phosphate", "e339", "ins 339"] },
+        {"name": "disodium phosphate", "penalty": -0.3, "category": "Sodium", "risk": "Low",
+         "match": ["disodium phosphate", "e339", "ins 339"]},
 
         # 3.8 Refined Carbohydrates
-        { "name": "maida (refined wheat flour)", "penalty": -0.5, "category": "Refined Carbohydrates", "risk": "Medium",
-          "match": ["refined wheat flour", "refined flour", "maida"] },
-        { "name": "modified starch", "penalty": -0.3, "category": "Refined Carbohydrates", "risk": "Low",
-          "match": ["modified starch", "modified corn starch", "modified maize starch", "e1422", "ins 1422"] },
+        {"name": "maida (refined wheat flour)", "penalty": -0.5, "category": "Refined Carbohydrates", "risk": "Medium",
+         "match": ["refined wheat flour", "refined flour", "maida"]},
+        {"name": "modified starch", "penalty": -0.3, "category": "Refined Carbohydrates", "risk": "Low",
+         "match": ["modified starch", "modified corn starch", "modified maize starch", "e1422", "ins 1422"]},
 
         # 3.9 Caffeine & Stimulants
-        { "name": "caffeine", "penalty": -0.6, "category": "Caffeine & Stimulants", "risk": "Medium",
-          "match": ["caffeine"] },
-        { "name": "taurine", "penalty": -0.6, "category": "Caffeine & Stimulants", "risk": "Medium",
-          "match": ["taurine"] },
+        {"name": "caffeine", "penalty": -0.6, "category": "Caffeine & Stimulants", "risk": "Medium",
+         "match": ["caffeine"]},
+        {"name": "taurine", "penalty": -0.6, "category": "Caffeine & Stimulants", "risk": "Medium",
+         "match": ["taurine"]},
 
         # 3.10 Other Additives of Concern
-        { "name": "potassium bromate", "penalty": -1.2, "category": "Other Additives", "risk": "Severe",
-          "match": ["potassium bromate", "e924", "ins 924"] },
-        { "name": "titanium dioxide (e171)", "penalty": -0.7, "category": "Other Additives", "risk": "Medium",
-          "match": ["titanium dioxide", "e171", "ins 171"] },
-        { "name": "propylene glycol", "penalty": -0.3, "category": "Other Additives", "risk": "Low",
-          "match": ["propylene glycol", "e1520", "ins 1520"] },
-        { "name": "undisclosed natural flavours", "penalty": -0.2, "category": "Other Additives", "risk": "Low",
-          "match": ["nature identical", "natural flavour", "natural flavor"] },
+        {"name": "potassium bromate", "penalty": -1.2, "category": "Other Additives", "risk": "Severe",
+         "match": ["potassium bromate", "e924", "ins 924"]},
+        {"name": "titanium dioxide (e171)", "penalty": -0.7, "category": "Other Additives", "risk": "Medium",
+         "match": ["titanium dioxide", "e171", "ins 171"]},
+        {"name": "propylene glycol", "penalty": -0.3, "category": "Other Additives", "risk": "Low",
+         "match": ["propylene glycol", "e1520", "ins 1520"]},
+        {"name": "undisclosed natural flavours", "penalty": -0.2, "category": "Other Additives", "risk": "Low",
+         "match": ["nature identical", "natural flavour", "natural flavor"]},
 
         # --- Section 4: positive ingredients (additions) ----------------------
         # 4.1 Protein Quality
-        { "name": "whey protein", "penalty": 0.8, "category": "Protein Quality",
-          "match": ["whey protein isolate", "whey protein", "whey"] },
-        { "name": "pea / soy protein isolate", "penalty": 0.7, "category": "Protein Quality",
-          "match": ["soy protein isolate", "soya protein isolate", "pea protein", "soy protein", "soya protein"] },
-        { "name": "milk solids / paneer / curd", "penalty": 0.5, "category": "Protein Quality",
-          "match": ["milk solids", "milk protein", "skimmed milk", "skim milk", "paneer", "curd", "yoghurt", "yogurt"] },
-        { "name": "lentil / chickpea / besan flour", "penalty": 0.5, "category": "Protein Quality",
-          "match": ["chickpea flour", "gram flour", "lentil flour", "besan", "lentil", "chana dal"] },
-        { "name": "nuts & seeds", "penalty": 0.4, "category": "Protein Quality",
-          "match": ["almond", "peanut", "cashew", "pistachio", "walnut", "chia", "flaxseed", "flax seed", "sesame", "sunflower seed"] },
-        { "name": "egg / egg powder", "penalty": 0.4, "category": "Protein Quality",
-          "match": ["egg powder", "egg white", "egg solids", "egg"] },
+        {"name": "whey protein", "penalty": 0.8, "category": "Protein Quality",
+         "match": ["whey protein isolate", "whey protein", "whey"]},
+        {"name": "pea / soy protein isolate", "penalty": 0.7, "category": "Protein Quality",
+         "match": ["soy protein isolate", "soya protein isolate", "pea protein", "soy protein", "soya protein"]},
+        {"name": "milk solids / paneer / curd", "penalty": 0.5, "category": "Protein Quality",
+         "match": ["milk solids", "milk protein", "skimmed milk", "skim milk", "paneer", "curd", "yoghurt", "yogurt"]},
+        {"name": "lentil / chickpea / besan flour", "penalty": 0.5, "category": "Protein Quality",
+         "match": ["chickpea flour", "gram flour", "lentil flour", "besan", "lentil", "chana dal"]},
+        {"name": "nuts & seeds", "penalty": 0.4, "category": "Protein Quality",
+         "match": ["almond", "peanut", "cashew", "pistachio", "walnut", "chia", "flaxseed", "flax seed", "sesame",
+                   "sunflower seed"]},
+        {"name": "egg / egg powder", "penalty": 0.4, "category": "Protein Quality",
+         "match": ["egg powder", "egg white", "egg solids", "egg"]},
 
         # 4.2 Fiber
-        { "name": "whole grain base", "penalty": 0.7, "category": "Fiber",
-          "match": ["whole wheat flour", "whole wheat", "whole grain", "wholegrain", "whole oat", "atta", "oats", "oatmeal", "jowar", "bajra", "ragi", "millet", "quinoa", "brown rice"] },
-        { "name": "oat / wheat bran", "penalty": 0.6, "category": "Fiber",
-          "match": ["oat bran", "wheat bran", "rice bran"] },
-        { "name": "psyllium husk (isabgol)", "penalty": 0.4, "category": "Fiber",
-          "match": ["psyllium", "isabgol"] },
-        { "name": "inulin / chicory root fiber", "penalty": 0.4, "category": "Fiber",
-          "match": ["chicory root fiber", "chicory root fibre", "inulin", "chicory"] },
+        {"name": "whole grain base", "penalty": 0.7, "category": "Fiber",
+         "match": ["whole wheat flour", "whole wheat", "whole grain", "wholegrain", "whole oat", "atta", "oats",
+                   "oatmeal", "jowar", "bajra", "ragi", "millet", "quinoa", "brown rice"]},
+        {"name": "oat / wheat bran", "penalty": 0.6, "category": "Fiber",
+         "match": ["oat bran", "wheat bran", "rice bran"]},
+        {"name": "psyllium husk (isabgol)", "penalty": 0.4, "category": "Fiber",
+         "match": ["psyllium", "isabgol"]},
+        {"name": "inulin / chicory root fiber", "penalty": 0.4, "category": "Fiber",
+         "match": ["chicory root fiber", "chicory root fibre", "inulin", "chicory"]},
 
         # 4.3 Healthy Fats & Oils
-        { "name": "cold-pressed / virgin oil", "penalty": 0.5, "category": "Healthy Fats & Oils",
-          "match": ["extra virgin olive oil", "virgin coconut oil", "cold pressed", "cold-pressed", "extra virgin", "virgin olive oil"] },
-        { "name": "olive / rice bran oil", "penalty": 0.4, "category": "Healthy Fats & Oils",
-          "match": ["olive oil", "rice bran oil"] },
-        { "name": "omega-3 source", "penalty": 0.4, "category": "Healthy Fats & Oils",
-          "match": ["flaxseed oil", "fish oil", "walnut oil", "omega-3", "omega 3"] },
+        {"name": "cold-pressed / virgin oil", "penalty": 0.5, "category": "Healthy Fats & Oils",
+         "match": ["extra virgin olive oil", "virgin coconut oil", "cold pressed", "cold-pressed", "extra virgin",
+                   "virgin olive oil"]},
+        {"name": "olive / rice bran oil", "penalty": 0.4, "category": "Healthy Fats & Oils",
+         "match": ["olive oil", "rice bran oil"]},
+        {"name": "omega-3 source", "penalty": 0.4, "category": "Healthy Fats & Oils",
+         "match": ["flaxseed oil", "fish oil", "walnut oil", "omega-3", "omega 3"]},
 
         # 4.4 Natural Sweeteners & Low-Sugar Design
-        { "name": "no added sugar", "penalty": 0.7, "category": "Natural Sweeteners",
-          "match": ["no added sugar", "sugar free", "sugarfree", "unsweetened"] },
-        { "name": "jaggery / date paste / honey", "penalty": 0.4, "category": "Natural Sweeteners",
-          "match": ["jaggery", "date paste", "date syrup", "dates", "honey", "gur"] },
-        { "name": "stevia", "penalty": 0.3, "category": "Natural Sweeteners",
-          "match": ["steviol glycoside", "stevia"] },
-        { "name": "monk fruit extract", "penalty": 0.3, "category": "Natural Sweeteners",
-          "match": ["monk fruit", "luo han guo"] },
+        {"name": "no added sugar", "penalty": 0.7, "category": "Natural Sweeteners",
+         "match": ["no added sugar", "sugar free", "sugarfree", "unsweetened"]},
+        {"name": "jaggery / date paste / honey", "penalty": 0.4, "category": "Natural Sweeteners",
+         "match": ["jaggery", "date paste", "date syrup", "dates", "honey", "gur"]},
+        {"name": "stevia", "penalty": 0.3, "category": "Natural Sweeteners",
+         "match": ["steviol glycoside", "stevia"]},
+        {"name": "monk fruit extract", "penalty": 0.3, "category": "Natural Sweeteners",
+         "match": ["monk fruit", "luo han guo"]},
 
         # 4.5 Natural Preservation & Clean Label
-        { "name": "tocopherols (natural antioxidant)", "penalty": 0.3, "category": "Natural Preservation",
-          "match": ["mixed tocopherols", "tocopherol", "vitamin e"] },
-        { "name": "rosemary extract", "penalty": 0.3, "category": "Natural Preservation",
-          "match": ["rosemary extract", "rosemary"] },
+        {"name": "tocopherols (natural antioxidant)", "penalty": 0.3, "category": "Natural Preservation",
+         "match": ["mixed tocopherols", "tocopherol", "vitamin e"]},
+        {"name": "rosemary extract", "penalty": 0.3, "category": "Natural Preservation",
+         "match": ["rosemary extract", "rosemary"]},
 
         # 4.6 Micronutrients & Fortification
-        { "name": "iron + folic acid fortification", "penalty": 0.4, "category": "Micronutrients",
-          "match": ["folic acid", "ferrous fumarate", "ferrous sulphate", "iron"] },
-        { "name": "vitamin d fortification", "penalty": 0.4, "category": "Micronutrients",
-          "match": ["vitamin d3", "vitamin d2", "vitamin d", "cholecalciferol"] },
-        { "name": "vitamin b12 fortification", "penalty": 0.3, "category": "Micronutrients",
-          "match": ["vitamin b12", "cyanocobalamin", "cobalamin"] },
-        { "name": "calcium fortification", "penalty": 0.2, "category": "Micronutrients",
-          "match": ["calcium carbonate", "calcium"] },
-        { "name": "zinc fortification", "penalty": 0.2, "category": "Micronutrients",
-          "match": ["zinc sulphate", "zinc"] },
+        {"name": "iron + folic acid fortification", "penalty": 0.4, "category": "Micronutrients",
+         "match": ["folic acid", "ferrous fumarate", "ferrous sulphate", "iron"]},
+        {"name": "vitamin d fortification", "penalty": 0.4, "category": "Micronutrients",
+         "match": ["vitamin d3", "vitamin d2", "vitamin d", "cholecalciferol"]},
+        {"name": "vitamin b12 fortification", "penalty": 0.3, "category": "Micronutrients",
+         "match": ["vitamin b12", "cyanocobalamin", "cobalamin"]},
+        {"name": "calcium fortification", "penalty": 0.2, "category": "Micronutrients",
+         "match": ["calcium carbonate", "calcium"]},
+        {"name": "zinc fortification", "penalty": 0.2, "category": "Micronutrients",
+         "match": ["zinc sulphate", "zinc"]},
 
         # 4.7 Probiotics & Gut Health
-        { "name": "named probiotic strain", "penalty": 0.5, "category": "Probiotics",
-          "match": ["lactobacillus", "bifidobacterium", "l. acidophilus", "s. thermophilus"] },
-        { "name": "live active cultures", "penalty": 0.4, "category": "Probiotics",
-          "match": ["live active cultures", "active cultures", "live cultures", "probiotic"] },
-        { "name": "prebiotic fiber", "penalty": 0.2, "category": "Probiotics",
-          "match": ["prebiotic"] },
+        {"name": "named probiotic strain", "penalty": 0.5, "category": "Probiotics",
+         "match": ["lactobacillus", "bifidobacterium", "l. acidophilus", "s. thermophilus"]},
+        {"name": "live active cultures", "penalty": 0.4, "category": "Probiotics",
+         "match": ["live active cultures", "active cultures", "live cultures", "probiotic"]},
+        {"name": "prebiotic fiber", "penalty": 0.2, "category": "Probiotics",
+         "match": ["prebiotic"]},
     ],
 
-    "position_multiplier": {   # spec 2.3
+    "position_multiplier": {  # spec 2.3
         "top_3": 1.5,
         "middle": 1.0,
         "trace": 0.5
     },
 
-    "category_caps": {         # spec 2.4 — maximum total deduction per category
+    "category_caps": {  # spec 2.4 — maximum total deduction per category
         "Oils & Fats": 2.5,
         "Sugars & Sweeteners": 2.5,
         "Preservatives": 2.0,
@@ -1382,7 +1498,7 @@ SCORING_RULES = {
         "Other Additives": 1.5
     },
 
-    "addition_caps": {         # spec 2.4 — maximum total addition per category
+    "addition_caps": {  # spec 2.4 — maximum total addition per category
         "Protein Quality": 2.0,
         "Fiber": 1.5,
         "Healthy Fats & Oils": 1.0,
@@ -1393,7 +1509,7 @@ SCORING_RULES = {
         "Whole-Food": 1.0
     },
 
-    "transparency_multiplier": {   # spec 5
+    "transparency_multiplier": {  # spec 5
         "disclosed": 1.05,
         "vague": 0.95,
         "default": 1.0
@@ -1423,7 +1539,6 @@ def _compile_ingredient_matchers(rules):
 
 
 INGREDIENT_MATCHERS = _compile_ingredient_matchers(SCORING_RULES["ingredients"])
-
 
 # Catch-all label terms that hide what is actually in the product. They drive the
 # spec 5 transparency penalty, and they also disqualify a product from the
@@ -1517,15 +1632,15 @@ def resolve_ingredient_risk(name: str, fallback: str = "Low") -> str:
 VALID_PREFERENCES = (
     "low_sugar",
     "low_sodium",
-    "low_fat",        # saturated fat
+    "low_fat",  # saturated fat
     "high_protein",
     "high_fiber",
     "vegan",
 )
 
 # How strongly a preference re-weights the relevant penalty / bonus.
-PREFERENCE_EMPHASIS = 1.75        # avoided nutrients/categories penalised harder
-PREFERENCE_BONUS_EMPHASIS = 2.5   # sought-after nutrients rewarded more
+PREFERENCE_EMPHASIS = 1.75  # avoided nutrients/categories penalised harder
+PREFERENCE_BONUS_EMPHASIS = 2.5  # sought-after nutrients rewarded more
 
 # Ingredient keywords that make a product NOT vegan. Used to drop non-vegan
 # alternatives for users with the `vegan` preference (only when an ingredient
@@ -1680,14 +1795,14 @@ def calculate_health_score_v2(product: dict, version: int = 1,
 
     base_score = scoring_rules_dict["base_score"]
     score = base_score
-    
+
     breakdown = {
         "base_score": base_score,
         "deductions": [],
         "nutrition_penalties": [],
         "additions": []
     }
-    
+
     cat_deductions = {}
     cat_additions = {}
 
@@ -1700,70 +1815,27 @@ def calculate_health_score_v2(product: dict, version: int = 1,
     # 1. Apply nutrient penalties & bonuses, re-weighted by user preferences.
     pen_mult = weights["nutrient_penalty_mult"]
     bonus_mult = weights["nutrient_bonus_mult"]
-
-    # Serving size is the divisor for per-100g normalisation below, so parse it
-    # once and treat a missing/zero/absurd value as "cannot normalise".
-    try:
-        serving_g = float(product.get("serving_size_g") or 0)
-    except (TypeError, ValueError):
-        serving_g = 0.0
-    can_normalise = serving_g > 0
-
-    # Nutrients we could not score, so the caller can say "not disclosed" rather
-    # than let a missing value read as a clean result.
-    undisclosed = []
-
     for rule in scoring_rules_dict["rules"]:
         nutrient = rule["nutrient"]
         val = product.get(f"{nutrient}_g_per_serving")
         if val is None and nutrient == "sodium":
             val = product.get("sodium_mg_per_serving")
         if val is None:
-            # The label never disclosed it. Scoring it as 0 would hand the product
-            # a clean sheet it did not earn, so it is skipped and reported.
-            undisclosed.append(nutrient)
             continue
-
-        # --- per-100g normalisation (spec: density, not portion) ---------------
-        # Sugar and saturated fat are judged on concentration, so a 30g pack and a
-        # 100g pack of the same food must score identically. Comparing the raw
-        # per-serving grams (the previous behaviour) meant a manufacturer could
-        # improve its score just by declaring a smaller serving.
-        #
-        # Sodium deliberately stays per-serving: spec 3.7 defines it as a share of
-        # the 2000mg daily value *per serving*, which is a genuine portion-based
-        # measure, not a density one.
-        basis = "per_serving"
-        scored_val = val
-        if nutrient in PER_100G_PENALTY_NUTRIENTS:
-            if not can_normalise:
-                # No serving size means no defensible density figure. Scoring the
-                # raw grams here would silently compare a per-100g threshold
-                # against a per-serving number.
-                undisclosed.append(nutrient)
-                continue
-            scored_val = val * 100.0 / serving_g
-            basis = "per_100g"
 
         for threshold in rule["thresholds"]:
             t_min = threshold["min"]
             t_max = threshold.get("max", float("inf"))
             points = threshold["points"]
 
-            if t_min <= scored_val < t_max:
+            if t_min <= val < t_max:
                 if points < 0:
                     pts = round(points * pen_mult.get(nutrient, 1.0), 2)
                     cat = nutr_cat_map.get(nutrient, nutrient)
                     cat_deductions[cat] = cat_deductions.get(cat, 0) + abs(pts)
                     breakdown["nutrition_penalties"].append({
                         "nutrient": nutrient,
-                        # `value` stays the figure the threshold was applied to, so
-                        # the breakdown the user sees explains the points awarded.
-                        # The raw label figure is kept alongside it.
-                        "value": round(scored_val, 2),
-                        "basis": basis,
-                        "value_per_serving": val,
-                        "serving_size_g": serving_g if can_normalise else None,
+                        "value": val,
                         "points": float(pts)
                     })
                 else:
@@ -1773,8 +1845,6 @@ def calculate_health_score_v2(product: dict, version: int = 1,
                     breakdown["additions"].append({
                         "category": cat,
                         "nutrient": nutrient,
-                        "value": round(scored_val, 2),
-                        "basis": basis,
                         "points": float(pts)
                     })
                 break
@@ -1790,15 +1860,15 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         ("sugar", "sugar_g_per_serving", 5.0, "lt", 0.5, "Natural Sweeteners",
          "<5g sugar per 100g"),
     ]
-    # serving_g / can_normalise are parsed once at the top of this function.
-    if can_normalise:
+    try:
+        serving_g = float(product.get("serving_size_g") or 0)
+    except (TypeError, ValueError):
+        serving_g = 0.0
+
+    if serving_g > 0:
         for nutrient, field, threshold, op, points, cat, label in per_100g_bonuses:
             raw = product.get(field)
             if raw is None:
-                # Undisclosed. Must not qualify for a bonus — a blank sugar cell
-                # previously read as 0g and earned the "<5g per 100g" award.
-                if nutrient not in undisclosed:
-                    undisclosed.append(nutrient)
                 continue
             try:
                 per_100g = float(raw) * 100.0 / serving_g
@@ -1813,10 +1883,6 @@ def calculate_health_score_v2(product: dict, version: int = 1,
                 "category": cat,
                 "nutrient": nutrient,
                 "attribute": label,
-                # Same keys as the penalty entries above, so a client reads one
-                # shape for every line in the breakdown.
-                "value": round(per_100g, 2),
-                "basis": "per_100g",
                 "value_per_100g": round(per_100g, 1),
                 "points": float(pts),
             })
@@ -1835,7 +1901,7 @@ def calculate_health_score_v2(product: dict, version: int = 1,
             multiplier = scoring_rules_dict["position_multiplier"]["top_3"]
         elif idx >= 8:
             multiplier = scoring_rules_dict["position_multiplier"]["trace"]
-            
+
         # Longest-keyword-first match, so the most specific rule wins.
         rule = match_ingredient_rule(ing_text)
         if rule is not None:
@@ -1909,7 +1975,7 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         }
         if not (flagged_cats & additive_cats) and not _has_vague_terms(ingredients_text):
             cat_additions["Natural Preservation"] = (
-                cat_additions.get("Natural Preservation", 0) + 0.6
+                    cat_additions.get("Natural Preservation", 0) + 0.6
             )
             breakdown["additions"].append({
                 "category": "Natural Preservation",
@@ -1966,7 +2032,6 @@ def calculate_health_score_v2(product: dict, version: int = 1,
 
     score = base_score - ingredient_penalties_total + nutrient_bonuses_total
 
-
     # 4. Apply transparency multiplier
     #    - Vague catch-all terms ("flavouring", "permitted emulsifier", ...) -> 0.95
     #    - Full disclosure of additives (named INS/E numbers, no vague terms) -> 1.05
@@ -1986,11 +2051,11 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         trans_mult = scoring_rules_dict["transparency_multiplier"]["disclosed"]
 
     score *= trans_mult
-    
+
     # 5. Clamp
     final_score = max(1.0, min(10.0, score))
     final_score = round(final_score, 1)
-    
+
     breakdown["subtotal"] = round(base_score - ingredient_penalties_total + nutrient_bonuses_total, 2)
     breakdown["transparency_multiplier"] = trans_mult
     breakdown["final_score"] = final_score
@@ -2000,35 +2065,6 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         k: v for k, v in (preferences or {}).items() if v
     }
 
-    # Which nutrients the label never disclosed, so the client can render "not
-    # disclosed" instead of letting an absent value look like a clean result.
-    # `scoring_basis` documents which side of the per-100g / per-serving split
-    # each nutrient was judged on.
-    breakdown["undisclosed_nutrients"] = sorted(set(undisclosed))
-    breakdown["data_complete"] = not undisclosed
-    breakdown["scoring_basis"] = {
-        "sugar": "per_100g",
-        "saturated_fat": "per_100g",
-        "sodium": "per_serving",
-        "protein": "per_100g",
-        "fiber": "per_100g",
-    }
-
-    # How much of the score is actually evidence-based. Sugar, saturated fat and
-    # sodium are what drive the penalties; with none of them disclosed the result
-    # is just the untouched 5.0 base, which would otherwise be presented as a
-    # confident "C" — indistinguishable from a genuinely average product that we
-    # did measure. Callers must be able to tell those two cases apart.
-    driving = ("sugar", "saturated_fat", "sodium")
-    missing_driving = [n for n in driving if n in undisclosed]
-    if not missing_driving:
-        breakdown["score_confidence"] = "high"
-    elif len(missing_driving) < len(driving):
-        breakdown["score_confidence"] = "partial"
-    else:
-        breakdown["score_confidence"] = "insufficient"
-    breakdown["insufficient_data"] = breakdown["score_confidence"] == "insufficient"
-    
     if final_score >= 9:
         grade = "A"
     elif final_score >= 7:
@@ -2039,11 +2075,6 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         grade = "D"
     else:
         grade = "F"
-
-    # With nothing disclosed there is no evidence for a letter grade. Emitting "C"
-    # here would assert the product is average when we simply have no data on it.
-    if breakdown["insufficient_data"]:
-        grade = "?"
 
     return final_score, grade, version, breakdown
 
@@ -2059,9 +2090,11 @@ def get_score(barcode: str, user_id: Optional[int] = Depends(get_current_user_op
     if row:
         preferences = load_user_preferences(user_id)
         score, grade, rule_version, breakdown = calculate_health_score_v2(dict(row), 1, preferences)
-        return {"score": score, "grade": grade, "breakdown": breakdown, "ingredient_flags": breakdown.get("ingredient_flags", [])}
+        return {"score": score, "grade": grade, "breakdown": breakdown,
+                "ingredient_flags": breakdown.get("ingredient_flags", [])}
 
     return JSONResponse(status_code=404, content={"error": "Product not found"})
+
 
 @app.get("/v2/score/{barcode}")
 def get_score_v2(barcode: str, user_id: Optional[int] = Depends(get_current_user_optional)):
@@ -2074,9 +2107,11 @@ def get_score_v2(barcode: str, user_id: Optional[int] = Depends(get_current_user
     if row:
         preferences = load_user_preferences(user_id)
         score, grade, rule_version, breakdown = calculate_health_score_v2(dict(row), 1, preferences)
-        return {"score": score, "grade": grade, "rule_version": rule_version, "breakdown": breakdown, "ingredient_flags": breakdown.get("ingredient_flags", [])}
+        return {"score": score, "grade": grade, "rule_version": rule_version, "breakdown": breakdown,
+                "ingredient_flags": breakdown.get("ingredient_flags", [])}
 
     return JSONResponse(status_code=404, content={"error": "Product not found"})
+
 
 def _alternative_sort_key(item, preferences):
     """Build a sort key that orders alternatives by the user's preferences.
@@ -2173,9 +2208,9 @@ def find_better_alternatives(barcode: str, preferences: dict = None):
 
 @app.get("/similar/{barcode}")
 def get_similar_products(
-    barcode: str,
-    user_id: Optional[int] = None,
-    token_user_id: Optional[int] = Depends(get_current_user_optional),
+        barcode: str,
+        user_id: Optional[int] = None,
+        token_user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Better Alternatives. Personalized to the user's dietary preferences when
     the request is authenticated, or when an explicit ``?user_id=`` is supplied.
@@ -2284,7 +2319,7 @@ def evaluate_recommended_badge(product, breakdown=None, preferences=None):
         "health_score_above_7": bool(score is not None and score > RECOMMENDED_MIN_SCORE),
         "no_high_risk_ingredients": len(high_risk) == 0,
         "no_artificial_colors": not artificial,
-        "no_preservatives": not preservatives,   # optional — informational only
+        "no_preservatives": not preservatives,  # optional — informational only
     }
     # Preservative-free is optional per the spec, so it does not gate the badge.
     required = ("health_score_above_7", "no_high_risk_ingredients", "no_artificial_colors")
@@ -2326,20 +2361,74 @@ def get_product_badge(barcode: str, user_id: Optional[int] = Depends(get_current
     }
 
 
+class ScanHistoryLogRequest(BaseModel):
+    barcode: str
+    # Where the product data came from on the client — "csv" (bundled
+    # Swapify database) or "off" (Open Food Facts). Purely informational;
+    # doesn't affect what gets stored.
+    source: Optional[str] = None
+    device_id: Optional[str] = None
+    # Denormalized snapshot from the client, since these scans have no row in
+    # our own `products` table to look this up from server-side. Needed so
+    # badge metrics (Sugar Detective's name pattern, the score-based badges)
+    # can be computed from scan_history alone, the same for every scan
+    # regardless of which source resolved the product (Bug 4).
+    product_name: Optional[str] = None
+    health_score: Optional[float] = None
+
+
+@app.post("/scan-history")
+def log_scan_history(
+        entry: ScanHistoryLogRequest,
+        user_id: Optional[int] = Depends(get_current_user_optional),
+):
+    """Record a scan whose product data came from the bundled CSV database or
+    Open Food Facts, called directly by the browser (see fetchProduct() in
+    script.js) — both bypass GET /product/{barcode} entirely, so neither ever
+    reached scan_history before. That's why Weekly/Monthly/All-Time scan
+    totals could sit still even while a user kept actively scanning: only
+    scans matched against our own `products` table were ever counted.
+    GET /product/{barcode} already logs its own matches, so this endpoint is
+    only called by the frontend for the other two sources, to avoid double-
+    counting the same scan.
+
+    Requires a logged-in user — there's nothing to attribute an anonymous
+    scan to server-side, and anonymous/local-only usage already keeps its
+    own count entirely in the browser, same as before.
+    """
+    barcode = (entry.barcode or "").strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="barcode is required")
+    if not isinstance(user_id, int):
+        return {"logged": False}
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO scan_history (device_id, user_id, barcode, product_name, health_score) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (entry.device_id, user_id, barcode, entry.product_name, entry.health_score)
+    )
+    conn.commit()
+    log_activity(user_id, "scan", barcode, {"source": entry.source} if entry.source else None)
+    conn.close()
+    return {"logged": True}
+
+
 @app.get("/history")
 def get_history(user_id: int = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     cursor.execute('''
-        SELECT h.scanned_at, p.* 
+        SELECT h.scanned_at, h.barcode AS h_barcode, p.* 
         FROM scan_history h 
-        JOIN products p ON h.barcode = p.barcode 
+        LEFT JOIN products p ON h.barcode = p.barcode 
         WHERE h.user_id = ? 
         ORDER BY h.scanned_at DESC 
         LIMIT 5
     ''', (user_id,))
-    
+
     rows = cursor.fetchall()
     conn.close()
 
@@ -2347,9 +2436,24 @@ def get_history(user_id: int = Depends(get_current_user)):
     results = []
     for row in rows:
         p_dict = dict(row)
+        barcode = p_dict.get("barcode") or p_dict.get("h_barcode")
+        if p_dict.get("barcode") is None:
+            # Scanned, but the product isn't in our own `products` table
+            # (came from the bundled CSV database or Open Food Facts) — show
+            # it with the barcode alone rather than dropping it from history.
+            results.append({
+                "barcode": barcode,
+                "product_name": "Unknown Product",
+                "brand": None,
+                "health_score": None,
+                "grade": None,
+                "image_url": None,
+                "scanned_at": p_dict["scanned_at"]
+            })
+            continue
         score, grade, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
         results.append({
-            "barcode": p_dict["barcode"],
+            "barcode": barcode,
             "product_name": p_dict["product_name"],
             "brand": p_dict["brand"],
             "health_score": score,
@@ -2358,6 +2462,7 @@ def get_history(user_id: int = Depends(get_current_user)):
             "scanned_at": p_dict["scanned_at"]
         })
     return results
+
 
 @app.post("/report-missing")
 def report_missing(report: MissingReport, user_id: int = Depends(get_current_user)):
@@ -2404,9 +2509,9 @@ def _detect_image_ext(content_type, data):
 
 @app.post("/product/image")
 async def upload_product_image(
-    barcode: str = Form(...),
-    file: UploadFile = File(...),
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        barcode: str = Form(...),
+        file: UploadFile = File(...),
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Crowdsourced product image upload (Task 2C).
 
@@ -2478,6 +2583,7 @@ async def upload_product_image(
         "content_type": file.content_type,
     }
 
+
 @app.get("/preferences")
 def get_preferences(user_id: int = Depends(get_current_user)):
     """Return the authenticated user's dietary preferences. Every recognised
@@ -2507,28 +2613,32 @@ def update_preferences(prefs: dict, user_id: int = Depends(get_current_user)):
     preferences = {key: cleaned.get(key, False) for key in VALID_PREFERENCES}
     return {"status": "preferences updated", "preferences": preferences}
 
+
 @app.post("/favorites")
 def add_favorite(fav: FavoriteAdd, user_id: int = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE barcode = ?", (fav.barcode,))
-    if not cursor.fetchone():
-        conn.close()
-        raise HTTPException(status_code=404, detail="Product not found")
-        
+
     cursor.execute("SELECT id FROM favorites WHERE user_id = ? AND barcode = ?", (user_id, fav.barcode))
     if cursor.fetchone():
         conn.close()
         return {"message": "Already in favorites"}
 
+    # Products from the bundled CSV database or Open Food Facts aren't in our
+    # own `products` table, so this used to 404 for most real-world favorites
+    # instead of saving them. Store the client's denormalized snapshot as a
+    # fallback for exactly that case; a `products` match (when one exists)
+    # still takes priority for display, same as everywhere else.
     cursor.execute(
-        "INSERT INTO favorites (user_id, barcode) VALUES (?, ?)",
-        (user_id, fav.barcode)
+        "INSERT INTO favorites (user_id, barcode, product_name, brand, health_score, grade) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, fav.barcode, fav.product_name, fav.brand, fav.health_score, fav.grade)
     )
     conn.commit()
     conn.close()
     log_activity(user_id, "favorite", fav.barcode)
     return {"message": "Added to favorites"}
+
 
 @app.delete("/favorites/{barcode}")
 def remove_favorite(barcode: str, user_id: int = Depends(get_current_user)):
@@ -2542,14 +2652,20 @@ def remove_favorite(barcode: str, user_id: int = Depends(get_current_user)):
     conn.close()
     return {"message": "Removed from favorites"}
 
+
 @app.get("/favorites")
 def get_favorites(user_id: int = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
+    # LEFT JOIN, not JOIN — a favorited barcode may have no row in our own
+    # `products` table at all (see POST /favorites above). Falls back to the
+    # denormalized snapshot stored at favorite-time in that case, instead of
+    # silently dropping the favorite from the list.
     cursor.execute('''
-        SELECT f.added_at, p.* 
+        SELECT f.added_at, f.barcode AS f_barcode, f.product_name AS f_product_name,
+               f.brand AS f_brand, f.health_score AS f_health_score, f.grade AS f_grade, p.*
         FROM favorites f 
-        JOIN products p ON f.barcode = p.barcode 
+        LEFT JOIN products p ON f.barcode = p.barcode 
         WHERE f.user_id = ?
         ORDER BY f.added_at DESC
     ''', (user_id,))
@@ -2560,70 +2676,172 @@ def get_favorites(user_id: int = Depends(get_current_user)):
     results = []
     for row in rows:
         p_dict = dict(row)
-        score, grade, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
-        results.append({
-            "barcode": p_dict.get("barcode"),
-            "product_name": p_dict.get("product_name"),
-            "brand": p_dict.get("brand"),
-            "health_score": score,
-            "grade": grade,
-            "added_at": p_dict.get("added_at")
-        })
+        if p_dict.get("barcode") is not None:
+            score, grade, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
+            results.append({
+                "barcode": p_dict.get("barcode"),
+                "product_name": p_dict.get("product_name"),
+                "brand": p_dict.get("brand"),
+                "health_score": score,
+                "grade": grade,
+                "added_at": p_dict.get("added_at")
+            })
+        else:
+            # No `products` match — use the snapshot taken when it was favorited.
+            results.append({
+                "barcode": p_dict.get("f_barcode"),
+                "product_name": p_dict.get("f_product_name") or "Unknown Product",
+                "brand": p_dict.get("f_brand"),
+                "health_score": p_dict.get("f_health_score"),
+                "grade": p_dict.get("f_grade"),
+                "added_at": p_dict.get("added_at")
+            })
     return results
+
+
+# ── My Swaps (Bug 2) ──
+# This feature was pure localStorage — a swap saved in one browser was
+# invisible in any other. Wired up the same way Favorites already are: an
+# explicit denormalized snapshot per row (the alt product may not be in our
+# own `products` table either), a unique (user, original, alt) constraint so
+# re-saving the same pair is a no-op, and a dedicated endpoint for editing a
+# swap's note without re-sending the whole row.
+@app.post("/my-swaps")
+def add_my_swap(swap: MySwapAdd, user_id: int = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id FROM my_swaps WHERE user_id = ? AND original_barcode = ? AND alt_barcode = ?",
+        (user_id, swap.original_barcode, swap.alt_barcode)
+    )
+    if cursor.fetchone():
+        conn.close()
+        return {"message": "Already saved"}
+
+    cursor.execute(
+        "INSERT INTO my_swaps (user_id, original_barcode, original_name, alt_barcode, "
+        "alt_name, alt_brand, alt_score, alt_grade, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (user_id, swap.original_barcode, swap.original_name, swap.alt_barcode,
+         swap.alt_name, swap.alt_brand, swap.alt_score, swap.alt_grade, swap.note or "")
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Swap saved"}
+
+
+@app.delete("/my-swaps/{original_barcode}/{alt_barcode}")
+def remove_my_swap(original_barcode: str, alt_barcode: str, user_id: int = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM my_swaps WHERE user_id = ? AND original_barcode = ? AND alt_barcode = ?",
+        (user_id, original_barcode, alt_barcode)
+    )
+    conn.commit()
+    conn.close()
+    return {"message": "Swap removed"}
+
+
+@app.post("/my-swaps/note")
+def update_my_swap_note(body: MySwapNoteUpdate, user_id: int = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE my_swaps SET note = ? WHERE user_id = ? AND original_barcode = ? AND alt_barcode = ?",
+        (body.note or "", user_id, body.original_barcode, body.alt_barcode)
+    )
+    conn.commit()
+    updated = cursor.rowcount > 0
+    conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Swap not found")
+    return {"message": "Note updated"}
+
+
+@app.get("/my-swaps")
+def get_my_swaps(user_id: int = Depends(get_current_user)):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT original_barcode, original_name, alt_barcode, alt_name, alt_brand, "
+        "alt_score, alt_grade, note, added_at FROM my_swaps WHERE user_id = ? "
+        "ORDER BY added_at DESC",
+        (user_id,)
+    )
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
 
 @app.get("/weekly-summary")
 def get_weekly_summary(user_id: int = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
-    
+
     seven_days_ago = datetime.datetime.utcnow() - datetime.timedelta(days=7)
-    
+
+    # LEFT JOIN, not JOIN: a scanned barcode may belong to a product that only
+    # lives in the bundled CSV database or Open Food Facts and was never
+    # written to our own `products` table — in that case p.* comes back
+    # all-NULL here. The previous INNER JOIN silently dropped those rows from
+    # the result set entirely, which is why "Total Scans" could stay flat
+    # even while the user kept scanning things. Every scan_history row now
+    # counts toward total_scans regardless; only the score-based aggregates
+    # (which need product nutrition data to compute) are drawn from the
+    # subset that has a matching product row.
     cursor.execute('''
         SELECT h.scanned_at, p.* 
         FROM scan_history h 
-        JOIN products p ON h.barcode = p.barcode 
+        LEFT JOIN products p ON h.barcode = p.barcode 
         WHERE h.user_id = ? AND h.scanned_at >= ?
         ORDER BY h.scanned_at ASC
     ''', (user_id, seven_days_ago.strftime('%Y-%m-%d %H:%M:%S')))
-    
+
     rows = cursor.fetchall()
     conn.close()
-    
+
     preferences = load_user_preferences(user_id)
     total_scans = len(rows)
     total_score = 0
+    scored_count = 0
     daily_trends_dict = {}
 
     for row in rows:
         p_dict = dict(row)
+        if p_dict.get('barcode') is None:
+            # No matching product row — still a real, counted scan, just
+            # without nutrition data to score.
+            continue
         score, _, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
         total_score += score
-        
+        scored_count += 1
+
         date_str = p_dict['scanned_at'][:10]
         if date_str not in daily_trends_dict:
             daily_trends_dict[date_str] = []
         daily_trends_dict[date_str].append(score)
-        
-    avg_score = (total_score / total_scans) if total_scans > 0 else 0
-    
+
+    avg_score = (total_score / scored_count) if scored_count > 0 else 0
+
     daily_trends = []
     for date_str, sorted_scores in sorted(daily_trends_dict.items()):
         daily_trends.append({
             "date": date_str,
             "average_score": round(sum(sorted_scores) / len(sorted_scores), 2)
         })
-        
+
     return {
         "total_scans": total_scans,
         "average_score": round(avg_score, 2),
         "daily_trends": daily_trends
     }
 
+
 @app.get("/monthly-report")
 def get_monthly_report(
-    user_id: Optional[int] = None,
-    month: Optional[str] = None,
-    token_user_id: Optional[int] = Depends(get_current_user_optional),
+        user_id: Optional[int] = None,
+        month: Optional[str] = None,
+        token_user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Monthly health report built from a user's scan history.
 
@@ -2654,10 +2872,14 @@ def get_monthly_report(
 
     conn = get_db_connection()
     cursor = conn.cursor()
+    # LEFT JOIN, not JOIN — see the identical comment in /weekly-summary.
+    # A scan of a product that only lives in the bundled CSV database or
+    # Open Food Facts has no row in our own `products` table, and an INNER
+    # JOIN was silently excluding those scans from total_scans entirely.
     cursor.execute('''
         SELECT h.scanned_at, p.*
         FROM scan_history h
-        JOIN products p ON h.barcode = p.barcode
+        LEFT JOIN products p ON h.barcode = p.barcode
         WHERE h.user_id = ? AND substr(h.scanned_at, 1, 7) = ?
         ORDER BY h.scanned_at ASC
     ''', (effective_user_id, month))
@@ -2679,11 +2901,17 @@ def get_monthly_report(
 
     preferences = load_user_preferences(effective_user_id)
 
+    total_scans = len(rows)
     scored = []
     category_counts = {}
     daily = {}
     for row in rows:
         p_dict = dict(row)
+        if p_dict.get('barcode') is None:
+            # Real scan, but no matching product row to score — still counts
+            # toward total_scans (handled via len(rows) above), just isn't
+            # part of the score-based aggregates below.
+            continue
         score, grade, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
         scored.append({
             "barcode": p_dict["barcode"],
@@ -2701,18 +2929,19 @@ def get_monthly_report(
         day = p_dict["scanned_at"][:10]
         daily.setdefault(day, []).append(score)
 
-    total_scans = len(scored)
-    average_score = round(sum(s["score"] for s in scored) / total_scans, 2)
-    best = max(scored, key=lambda s: s["score"])
-    worst = min(scored, key=lambda s: s["score"])
+    scored_count = len(scored)
+    average_score = round(sum(s["score"] for s in scored) / scored_count, 2) if scored_count > 0 else 0
+    best = max(scored, key=lambda s: s["score"]) if scored else None
+    worst = min(scored, key=lambda s: s["score"]) if scored else None
 
-    # Score trend: average of the first half of the month's scans vs the second
-    # half (chronological). A >= 0.5 swing counts as improving / declining.
-    trend = "stable"
-    if total_scans >= 2:
-        mid = total_scans // 2
+    # Score trend: average of the first half of the month's scored scans vs
+    # the second half (chronological). A >= 0.5 swing counts as
+    # improving / declining.
+    trend = "stable" if scored_count > 0 else "no_data"
+    if scored_count >= 2:
+        mid = scored_count // 2
         first_avg = sum(s["score"] for s in scored[:mid]) / mid
-        second_avg = sum(s["score"] for s in scored[mid:]) / (total_scans - mid)
+        second_avg = sum(s["score"] for s in scored[mid:]) / (scored_count - mid)
         diff = second_avg - first_avg
         if diff >= 0.5:
             trend = "improving"
@@ -2730,6 +2959,8 @@ def get_monthly_report(
     ]
 
     def _summary(s):
+        if s is None:
+            return None
         return {
             "barcode": s["barcode"],
             "product_name": s["product_name"],
@@ -2750,9 +2981,11 @@ def get_monthly_report(
         "daily_trends": daily_trends,
     }
 
+
 @app.get("/recent")
 def get_recent():
     return {"recent": recent_scans}
+
 
 @app.get("/health")
 def health_check():
@@ -2882,6 +3115,7 @@ def compare_products(barcode1: str, barcode2: str, user_id: Optional[int] = Depe
         "product2": dict(row2) if row2 else None
     }
 
+
 @app.post("/compare-multiple")
 def compare_multiple(req: CompareMultipleRequest, user_id: Optional[int] = Depends(get_current_user_optional)):
     """Compare multiple products (3-4 recommended) side-by-side.
@@ -2947,6 +3181,7 @@ def compare_multiple(req: CompareMultipleRequest, user_id: Optional[int] = Depen
         "not_found": not_found,
     }
 
+
 @app.get("/offline-products")
 def get_offline_products():
     conn = get_db_connection()
@@ -2954,7 +3189,7 @@ def get_offline_products():
     cursor.execute("SELECT * FROM products")
     rows = cursor.fetchall()
     conn.close()
-    
+
     results = []
     for row in rows:
         p_dict = dict(row)
@@ -2975,6 +3210,7 @@ def get_offline_products():
             "grade": grade
         })
     return results
+
 
 @app.get("/search/autocomplete")
 def search_autocomplete(q: str, limit: int = 8):
@@ -3040,16 +3276,16 @@ SEARCH_MAX_LIMIT = 500
 
 @app.get("/search")
 def search_products(
-    q: Optional[str] = "",
-    brand: Optional[str] = None,
-    category: Optional[str] = None,
-    min_score: Optional[float] = None,
-    max_score: Optional[float] = None,
-    grade: Optional[str] = None,
-    sort: str = "score_desc",
-    limit: int = 50,
-    offset: int = 0,
-    meta: bool = False,
+        q: Optional[str] = "",
+        brand: Optional[str] = None,
+        category: Optional[str] = None,
+        min_score: Optional[float] = None,
+        max_score: Optional[float] = None,
+        grade: Optional[str] = None,
+        sort: str = "score_desc",
+        limit: int = 50,
+        offset: int = 0,
+        meta: bool = False,
 ):
     """Search the product catalogue by name/brand text, with optional filtering.
 
@@ -3082,7 +3318,7 @@ def search_products(
     if q_clean.isdigit() and len(q_clean) >= 8:
         validation = validate_barcode(q_clean)
         lookup = validation["suggestion"] if (
-            not validation["valid"] and validation["suggestion"]
+                not validation["valid"] and validation["suggestion"]
         ) else q_clean
         cursor.execute(f"SELECT {SEARCH_COLUMNS} FROM products WHERE barcode = ?", (lookup,))
         rows = cursor.fetchall()
@@ -3170,6 +3406,7 @@ def search_products(
         }
     return page
 
+
 # ==============================================================================
 # AI Nutritionist Chatbot (/chat)
 # ==============================================================================
@@ -3226,7 +3463,6 @@ NUTRITIONIST_SYSTEM_PROMPT = (
     "asked."
 )
 
-
 # Plain-language summary of how the Swapify health score is computed. Passed to
 # the LLM so it can accurately explain the "why" behind any product's score
 # instead of guessing at the methodology.
@@ -3234,16 +3470,11 @@ SCORING_METHODOLOGY = (
     "SCORING METHODOLOGY (how Swapify computes the 1-10 health score):\n"
     "- Every product starts at a neutral base of 5.0 — a 10 has to be earned, it "
     "is not the default.\n"
-    "- Nutrient penalties. Sugar and saturated fat are judged PER 100g, so pack "
-    "size never changes the score: sugar >=10g/100g -2 (>=5g/100g -1); saturated "
-    "fat on a sliding scale -0.5 (3-6g/100g) to -2.0 (>=20g/100g). Sodium is "
-    "judged PER SERVING as a share of the 2000mg daily value: >30% (>600mg) -1.0, "
-    "15-30% (300-600mg) -0.6.\n"
+    "- Nutrient penalties (per serving): sugar >=10g -2 (>=5g -1); sodium >30% of "
+    "the 2000mg daily value (>600mg) -1.0, 15-30% (300-600mg) -0.6; saturated fat "
+    "on a sliding scale -0.5 (3-6g) to -2.0 (>=20g).\n"
     "- Nutrient bonuses (per 100g): protein >=10g +0.6; fiber >=5g +0.5; sugar "
     "<5g +0.5.\n"
-    "- A nutrient the label never disclosed is scored as UNKNOWN, not as zero: it "
-    "earns no penalty and no bonus, and is listed under undisclosed_nutrients. "
-    "Never tell the user an undisclosed nutrient is 0.\n"
     "- Ingredient deductions: flagged ingredients subtract points — e.g. "
     "partially hydrogenated oil/vanaspati -1.2, potassium bromate -1.2, sodium "
     "nitrite -1.2, BHA -1.0, high-fructose corn syrup -1.0, TBHQ -0.8, refined "
@@ -3270,7 +3501,6 @@ SCORING_METHODOLOGY = (
     "file, so their score comes from nutrition data alone. If a product has no "
     "ingredients listed, say so rather than inventing ingredient reasons."
 )
-
 
 # ==============================================================================
 # Ingredient Substitution Suggestions
@@ -3881,7 +4111,6 @@ GREETING_REPLY = (
     "What would you like to check?"
 )
 
-
 # ------------------------------------------------------------------------------
 # Fast-path for questions about Swapify itself
 # ------------------------------------------------------------------------------
@@ -3967,213 +4196,6 @@ def greeting_fast_reply(question: str, has_barcode: bool):
     if len(stripped) <= 24 and any(pat in stripped for pat in SMALLTALK_PATTERNS):
         return GREETING_REPLY
     return None
-
-
-# ------------------------------------------------------------------------------
-# Resolving a product the user *named* rather than scanned
-# ------------------------------------------------------------------------------
-# The chatbot only ever received product data when the client attached a barcode.
-# So "tell me about Frooti" arrived with no context at all and the LLM answered
-# from memory — inventing a nutrition panel for a product sitting in our own
-# database. Matching the name against the catalogue fixes the common case; when
-# nothing matches we say "scan the barcode" instead of guessing.
-
-# Words too common across the catalogue (or in English) to identify a product on
-# their own — "milk" must not resolve to the first milk product in the table.
-_PRODUCT_STOPWORDS = frozenset({
-    "a", "an", "the", "is", "it", "of", "in", "on", "for", "and", "or", "to",
-    "with", "this", "that", "what", "whats", "why", "how", "can", "do", "does",
-    "i", "me", "my", "you", "about", "tell", "give", "show", "have", "has",
-    "healthy", "health", "good", "bad", "score", "nutrition", "nutritional",
-    "ingredients", "ingredient", "value", "values", "info", "information",
-    "much", "many", "there", "are", "was", "should", "eat", "drink", "buy",
-    "product", "products", "food", "sugar", "salt", "fat", "protein", "fiber",
-    "calories", "sodium", "please", "know", "want", "like", "any", "some",
-    "g", "mg", "kcal", "per", "serving", "100g",
-})
-
-_PRODUCT_INDEX_CACHE = {"built_at": 0.0, "entries": None, "idf": None}
-_PRODUCT_INDEX_TTL_S = 300.0
-
-
-def _tokenize_name(text: str):
-    return [t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t]
-
-
-def _build_product_index():
-    """Build (and cache) a token index over product names for name resolution.
-
-    Tokens are weighted by inverse document frequency, so a distinctive brand
-    word ("frooti", "amul") carries the match while a token shared by dozens of
-    rows ("chocolate", "juice") cannot resolve a product on its own.
-    """
-    now = time.time()
-    cached = _PRODUCT_INDEX_CACHE
-    if cached["entries"] is not None and now - cached["built_at"] < _PRODUCT_INDEX_TTL_S:
-        return cached["entries"], cached["idf"]
-
-    conn = get_db_connection()
-    try:
-        rows = conn.execute(
-            "SELECT barcode, product_name, brand FROM products"
-        ).fetchall()
-    finally:
-        conn.close()
-
-    entries = []
-    doc_freq = {}
-    for row in rows:
-        tokens = set(_tokenize_name(row["product_name"])) | set(_tokenize_name(row["brand"]))
-        tokens = {t for t in tokens if t not in _PRODUCT_STOPWORDS and len(t) > 2}
-        if not tokens:
-            continue
-        entries.append({
-            "barcode": row["barcode"],
-            "product_name": row["product_name"],
-            "brand": row["brand"],
-            "tokens": tokens,
-        })
-        for t in tokens:
-            doc_freq[t] = doc_freq.get(t, 0) + 1
-
-    total = max(len(entries), 1)
-    idf = {t: math.log(total / df) for t, df in doc_freq.items()}
-
-    cached.update({"built_at": now, "entries": entries, "idf": idf})
-    return entries, idf
-
-
-def find_product_in_question(question: str):
-    """Return the catalogue product the question names, or None.
-
-    Requires a genuinely distinctive token to match, so a generic question like
-    "is chocolate healthy?" resolves to nothing rather than to an arbitrary
-    chocolate bar.
-    """
-    q_tokens = set(_tokenize_name(question))
-    if not q_tokens:
-        return None
-    entries, idf = _build_product_index()
-    if not entries:
-        return None
-
-    # A token this rare in the catalogue identifies a specific product line.
-    distinctive = math.log(max(len(entries), 2) / 8.0)
-
-    best, best_score = None, 0.0
-    for entry in entries:
-        overlap = entry["tokens"] & q_tokens
-        if not overlap:
-            continue
-        if not any(idf.get(t, 0.0) >= distinctive for t in overlap):
-            # Only generic words matched ("milk", "chips") — not an identification.
-            continue
-        # Reward matching more of the product's name, so "amul chaas" beats "amul".
-        score = sum(idf.get(t, 0.0) for t in overlap) + 0.25 * len(overlap)
-        if score > best_score:
-            best, best_score = entry, score
-
-    return best["barcode"] if best else None
-
-
-# A question that is *about a product* — if we cannot identify which one, the
-# right answer is "scan it", never a guess from the model's memory.
-PRODUCT_QUESTION_PATTERNS = (
-    "is it healthy", "is this healthy", "how healthy", "nutrition", "nutritional",
-    "ingredients", "how much sugar", "how much salt", "how much sodium",
-    "calories", "what score", "score of", "rating of", "tell me about",
-    "what about", "is it good", "is it safe", "should i eat", "should i drink",
-)
-
-SCAN_PROMPT_REPLY = (
-    "I don't have that product in the Swapify database yet, so I can't give you "
-    "its real numbers — and I won't guess at them.\n\n"
-    "Scan the product's barcode with the Swapify scanner and I'll show you its "
-    "full nutrition panel, health score and flagged ingredients. If the scan "
-    "comes back empty, tap \"Report missing product\" and we'll add it."
-)
-
-
-# Questions answerable from stored figures alone. Deliberately excludes "why did
-# it score that", "is there a healthier option" and other reasoning/advice asks —
-# those genuinely need the model, and it has the breakdown to ground them.
-PRODUCT_FACT_PATTERNS = (
-    "nutrition", "nutritional", "ingredients", "ingredient",
-    "how much sugar", "how much salt", "how much sodium", "how much fat",
-    "how much protein", "how much fiber", "how many calories", "calorie",
-    "sugar content", "salt content", "fat content",
-    "tell me about", "what is the score", "what's the score", "score of",
-    "rating of", "details of", "info on", "information about",
-)
-
-_ADVICE_PATTERNS = (
-    "why", "healthier", "alternative", "instead of", "substitute", "swap",
-    "compare", "better than", "should i",
-)
-
-
-def is_product_fact_question(question: str) -> bool:
-    """True when the question wants stored figures, not reasoning or advice."""
-    text = (question or "").lower()
-    if any(pat in text for pat in _ADVICE_PATTERNS):
-        return False
-    return any(pat in text for pat in PRODUCT_FACT_PATTERNS)
-
-
-def product_answer_from_db(product: dict, matched_by_name: bool = False) -> str:
-    """Deterministic, DB-grounded answer about one product.
-
-    Used instead of the LLM for straightforward "what's in X / how does X score"
-    questions: it is accurate by construction, cannot hallucinate a nutrition
-    panel, and returns in milliseconds rather than the ~25s a free-tier model
-    took to produce an invented one.
-    """
-    def fmt(v, unit=""):
-        return f"{v}{unit}" if v is not None else "not disclosed on the label"
-
-    name = product.get("product_name", "This product")
-    brand = product.get("brand")
-    serving = product.get("serving_size_g")
-    lines = [
-        f"**{name}**" + (f" ({brand})" if brand else ""),
-        f"Swapify score: {product.get('score')}/10 (grade {product.get('grade')})",
-        "",
-        f"Per {fmt(serving, 'g')} serving:",
-        f"- Sugar: {fmt(product.get('sugar_g_per_serving'), 'g')}",
-        f"- Saturated fat: {fmt(product.get('saturated_fat_g_per_serving'), 'g')}",
-        f"- Sodium: {fmt(product.get('sodium_mg_per_serving'), 'mg')}",
-        f"- Protein: {fmt(product.get('protein_g_per_serving'), 'g')}",
-        f"- Fiber: {fmt(product.get('fiber_g_per_serving'), 'g')}",
-        f"- Calories: {fmt(product.get('calories_kcal_per_serving'), 'kcal')}",
-    ]
-
-    penalties = (product.get("breakdown") or {}).get("nutrition_penalties") or []
-    if penalties:
-        bits = [
-            f"{p['nutrient'].replace('_', ' ')} {p.get('value')}"
-            f"{'g/100g' if p.get('basis') == 'per_100g' else ''} ({p['points']})"
-            for p in penalties
-        ]
-        lines += ["", "Main things pulling the score down: " + ", ".join(bits) + "."]
-
-    flags = product.get("ingredient_flags") or []
-    if flags:
-        named = ", ".join(f["name"] if isinstance(f, dict) else str(f) for f in flags[:4])
-        lines.append(f"Flagged ingredients: {named}.")
-
-    if product.get("undisclosed_nutrients"):
-        missing = ", ".join(n.replace("_", " ") for n in product["undisclosed_nutrients"])
-        lines += ["", f"Note: the label doesn't disclose {missing}, so those are "
-                      "excluded from the score rather than counted as zero."]
-
-    if matched_by_name:
-        # The match came from the words in the question, not a scan, so it can
-        # land on a different variant of the same brand. Say which product these
-        # figures describe rather than let them read as the one the user meant.
-        lines += ["", "_(Matched from your message. If you meant a different "
-                      "size or variant, scan its barcode for exact figures.)_"]
-
-    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------------------
@@ -4374,46 +4396,6 @@ def chat(req: ChatRequest):
 
     budget = _Budget(CHAT_BUDGET_S)
     product = get_scored_product(req.barcode) if req.barcode else None
-
-    # No barcode attached? The user may still have named a product ("how much
-    # sugar is in Frooti?"). Resolve it from the catalogue so the answer comes
-    # from our data instead of the model's memory.
-    resolved_by_name = False
-    if product is None:
-        named_barcode = find_product_in_question(req.question)
-        if named_barcode:
-            product = get_scored_product(named_barcode)
-            resolved_by_name = product is not None
-
-    # A product question we could not pin to a catalogue row. Answering it from
-    # the LLM is exactly how the bot came to invent Frooti's nutrition panel, so
-    # send the user to the scanner instead — instantly, and without an LLM call.
-    if product is None:
-        q_lower = (req.question or "").lower()
-        if any(pat in q_lower for pat in PRODUCT_QUESTION_PATTERNS):
-            return {
-                "response": SCAN_PROMPT_REPLY,
-                "barcode": None,
-                "product_found": False,
-                "source": "scan-prompt",
-                "model": None,
-                "ai_enabled": AI_ENABLED,
-            }
-
-    # A factual question about a product we *do* have is answered straight from
-    # the database: accurate by construction and ~instant, versus a free-tier
-    # model taking tens of seconds to paraphrase (or invent) the same figures.
-    if product is not None and is_product_fact_question(req.question):
-        return {
-            "response": product_answer_from_db(product, matched_by_name=resolved_by_name),
-            "barcode": product.get("barcode"),
-            "product_found": True,
-            "resolved_by_name": resolved_by_name,
-            "source": "database",
-            "model": None,
-            "ai_enabled": AI_ENABLED,
-        }
-
     context = build_product_context(product)
 
     # Detect "what can I use instead of X?" style questions and ground the
@@ -4904,15 +4886,15 @@ def compute_recommendations(effective_user_id, limit=10):
 
         relevance = float(score)  # personalized health score is the base signal
         if cat in category_rank:
-            relevance += 4.0 - min(category_rank[cat], 3)   # 4 (top) .. 1
+            relevance += 4.0 - min(category_rank[cat], 3)  # 4 (top) .. 1
         if cat in compared_categories:
             relevance += 2.0
         if community_entry and community_entry["count"] > 0:
-            relevance += community_entry["overall"] - 3.0   # +2 .. -2 around neutral
+            relevance += community_entry["overall"] - 3.0  # +2 .. -2 around neutral
 
         already = p["barcode"] in scanned_barcodes
         if already:
-            relevance -= 3.0   # prefer fresh discoveries over re-recommending
+            relevance -= 3.0  # prefer fresh discoveries over re-recommending
 
         p["_relevance"] = relevance
         p["_already_scanned"] = already
@@ -4953,9 +4935,9 @@ def compute_recommendations(effective_user_id, limit=10):
 
 @app.get("/recommendations")
 def get_recommendations(
-    user_id: Optional[int] = None,
-    limit: int = 10,
-    token_user_id: Optional[int] = Depends(get_current_user_optional),
+        user_id: Optional[int] = None,
+        limit: int = 10,
+        token_user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Personalized product recommendations.
 
@@ -5000,8 +4982,8 @@ def _score_scan_row(p_dict, preferences):
         "product_name": p_dict.get("product_name"),
         "brand": p_dict.get("brand"),
         "category": p_dict.get("category"),
-        "score": score,          # Task 3 response key
-        "health_score": score,   # kept for backward compatibility
+        "score": score,  # Task 3 response key
+        "health_score": score,  # kept for backward compatibility
         "grade": grade,
         "image_url": image_or_placeholder(p_dict.get("image_url")),
         "scanned_at": p_dict.get("scanned_at"),
@@ -5116,8 +5098,8 @@ def _challenge_progress_summary(weekly):
 
 @app.get("/home-feed")
 def home_feed(
-    user_id: Optional[int] = None,
-    token_user_id: Optional[int] = Depends(get_current_user_optional),
+        user_id: Optional[int] = None,
+        token_user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Personalized home feed (Task 3).
 
@@ -5318,8 +5300,8 @@ def _parse_activity_row(row):
 
 @app.post("/activity")
 def create_activity(
-    entry: ActivityLog,
-    token_user_id: Optional[int] = Depends(get_current_user_optional),
+        entry: ActivityLog,
+        token_user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Log a user action (scan, compare, share, rate, favorite).
 
@@ -5362,9 +5344,9 @@ def create_activity(
 
 @app.get("/activity/user/{user_id}")
 def get_user_activity(
-    user_id: int,
-    action_type: Optional[str] = None,
-    limit: int = 50,
+        user_id: int,
+        action_type: Optional[str] = None,
+        limit: int = 50,
 ):
     """Return a user's activity history, newest first.
 
@@ -5494,9 +5476,9 @@ def _digest_product_summary(item):
 
 @app.get("/digest/{user_id}")
 def get_daily_digest(
-    user_id: int,
-    date: Optional[str] = None,
-    token_user_id: Optional[int] = Depends(get_current_user_optional),
+        user_id: int,
+        date: Optional[str] = None,
+        token_user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Daily scan digest for a user, ready for email / push notification.
 
@@ -5796,6 +5778,62 @@ def ensure_performance_and_image_schema():
         existing_cols = {r[1] for r in cur.execute("PRAGMA table_info(products)")}
         if "image_url" not in existing_cols:
             cur.execute("ALTER TABLE products ADD COLUMN image_url TEXT")
+
+        # --- Bug fix: favorites of products that only exist in the bundled CSV
+        # database or Open Food Facts (never our own `products` table) used to
+        # 404 on POST /favorites and, even when a row did exist, silently
+        # vanished from GET /favorites (INNER JOIN against `products`). These
+        # columns hold a denormalized snapshot supplied by the client at
+        # favorite-time so such favorites can be stored and displayed without
+        # needing a `products` match at all.
+        fav_cols = {r[1] for r in cur.execute("PRAGMA table_info(favorites)")}
+        if "product_name" not in fav_cols:
+            cur.execute("ALTER TABLE favorites ADD COLUMN product_name TEXT")
+        if "brand" not in fav_cols:
+            cur.execute("ALTER TABLE favorites ADD COLUMN brand TEXT")
+        if "health_score" not in fav_cols:
+            cur.execute("ALTER TABLE favorites ADD COLUMN health_score REAL")
+        if "grade" not in fav_cols:
+            cur.execute("ALTER TABLE favorites ADD COLUMN grade TEXT")
+
+        # --- My Swaps (Bug 2): this feature had no backend table at all before —
+        # it was pure localStorage, which is exactly why a swap saved in one
+        # browser never showed up in another. Stores a denormalized snapshot
+        # (same reasoning as the favorites columns above) since a swap's
+        # alternative product may not be in our own `products` table either.
+        cur.executescript('''
+            CREATE TABLE IF NOT EXISTS my_swaps (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id           INTEGER NOT NULL,
+                original_barcode  TEXT NOT NULL,
+                original_name     TEXT,
+                alt_barcode       TEXT NOT NULL,
+                alt_name          TEXT,
+                alt_brand         TEXT,
+                alt_score         REAL,
+                alt_grade         TEXT,
+                note              TEXT DEFAULT '',
+                added_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, original_barcode, alt_barcode),
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_my_swaps_user ON my_swaps(user_id);
+        ''')
+
+        # --- Achievements/badges (Bug 4): the badge system (Health Champion,
+        # Sugar Detective, etc.) was computed entirely from this browser's
+        # localStorage scan history, so the same account could show a
+        # different number of earned badges in every browser — including
+        # Profile, since it read the same local-only data. These columns let
+        # scan_history carry what each badge's metric actually needs
+        # (product name pattern + health score) without requiring a
+        # `products` match, so badge progress can be computed once, from the
+        # server, the same everywhere.
+        sh_cols = {r[1] for r in cur.execute("PRAGMA table_info(scan_history)")}
+        if "product_name" not in sh_cols:
+            cur.execute("ALTER TABLE scan_history ADD COLUMN product_name TEXT")
+        if "health_score" not in sh_cols:
+            cur.execute("ALTER TABLE scan_history ADD COLUMN health_score REAL")
 
         # --- Task 1A: indexes on frequently searched columns + a composite index
         cur.executescript('''
@@ -6296,8 +6334,8 @@ def load_shopping_list(list_id, preferences=None):
 
 @app.post("/shopping-list")
 def create_shopping_list(
-    body: ShoppingListCreate,
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        body: ShoppingListCreate,
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Create a shopping list from a set of product barcodes.
 
@@ -6338,8 +6376,8 @@ def create_shopping_list(
 
 @app.get("/shopping-list/{list_id}")
 def get_shopping_list(
-    list_id: int,
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        list_id: int,
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Return a saved shopping list with each item scored."""
     preferences = load_user_preferences(user_id)
@@ -6351,8 +6389,8 @@ def get_shopping_list(
 
 @app.get("/shopping-list/{list_id}/optimize")
 def optimize_shopping_list(
-    list_id: int,
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        list_id: int,
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Optimize a shopping list: for every item return the original plus its top
     2 healthier same-category alternatives (higher score / better nutrition).
@@ -6402,9 +6440,9 @@ def optimize_shopping_list(
 
 @app.post("/shopping-list/{list_id}/replace")
 def replace_shopping_list_item(
-    list_id: int,
-    body: ShoppingListReplace,
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        list_id: int,
+        body: ShoppingListReplace,
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Replace one item in the list (e.g. swap it for a healthier alternative)."""
     old_bc = (body.old_barcode or "").strip()
@@ -6440,8 +6478,8 @@ def replace_shopping_list_item(
 
 @app.delete("/shopping-list/{list_id}")
 def delete_shopping_list(
-    list_id: int,
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        list_id: int,
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Delete a shopping list and its items."""
     conn = get_db_connection()
@@ -6740,7 +6778,7 @@ async def ocr_scan_label(file: UploadFile = File(...)):
     # Map the OCR output onto a product-shaped dict and score it with the real
     # engine, so a scanned label is scored exactly like a catalogue product.
     pseudo_product = {
-        "product_name": "Scanned label",
+        "product_name": scan.get("guessed_name") or "Scanned label",
         "ingredients_text": scan["ingredients_text"],
         **scan["nutrition"],
     }
@@ -6752,6 +6790,10 @@ async def ocr_scan_label(file: UploadFile = File(...)):
         "ingredients": scan["ingredients"],
         "ingredients_text": scan["ingredients_text"],
         "nutrition": scan["nutrition"],
+        # Best-effort guess at the product's name (see guess_product_name in
+        # ocr_label_scanner.py) — lets the camera search by name from a photo
+        # of the packaging, not just parse nutrition facts.
+        "guessed_name": scan.get("guessed_name"),
         "score": score,
         "grade": grade,
         "rule_version": rule_version,
@@ -6813,8 +6855,8 @@ class ExperimentScanLog(BaseModel):
 
 
 def require_admin(
-    x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Admin gate for the log-retrieval endpoints.
 
@@ -6964,9 +7006,9 @@ def ensure_experiment_schema():
 
 @app.post("/experiment/log-scan")
 def log_experiment_scan(
-    entry: ExperimentScanLog,
-    user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
-    user_id: Optional[int] = Depends(get_current_user_optional),
+        entry: ExperimentScanLog,
+        user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
+        user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Record one scan from a real-world test device (Task 3A).
 
@@ -7101,13 +7143,13 @@ def _experiment_analytics(cur, where: str, params: list) -> dict:
 
 @app.get("/experiment/logs")
 def get_experiment_logs(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    device_type: Optional[str] = None,
-    barcode: Optional[str] = None,
-    limit: int = 100,
-    offset: int = 0,
-    admin: dict = Depends(require_admin),
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        device_type: Optional[str] = None,
+        barcode: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+        admin: dict = Depends(require_admin),
 ):
     """Retrieve the experiment scan log — **admin only** (Task 3B).
 
@@ -7207,11 +7249,11 @@ def sentry_test(kind: str = "exception", admin: dict = Depends(require_admin)):
 
 @app.get("/experiment/analytics")
 def get_experiment_analytics(
-    start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
-    device_type: Optional[str] = None,
-    barcode: Optional[str] = None,
-    admin: dict = Depends(require_admin),
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        device_type: Optional[str] = None,
+        barcode: Optional[str] = None,
+        admin: dict = Depends(require_admin),
 ):
     """Experiment analytics without the log rows — **admin only** (Task 3C).
 
@@ -7360,7 +7402,6 @@ ensure_products_seeded()
 ensure_performance_and_image_schema()
 # Task 3 — the real-world experiment scan log.
 ensure_experiment_schema()
-
 
 if __name__ == "__main__":
     import uvicorn
