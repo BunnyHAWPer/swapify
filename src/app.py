@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import sqlite3
 import os
+import math
 import re
 import requests
 import bcrypt
@@ -153,8 +154,14 @@ except Exception:
 
 # --- Provider 1: OpenRouter (OpenAI-compatible; many free-tier models) --------
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+# Default primary model. Free slugs get retired without notice — the previous
+# default, `openai/gpt-oss-120b:free`, now returns 404 ("unavailable for free"),
+# so every request wasted a round trip (two, before permanent errors stopped
+# being retried) before failing over. Verified working as of 2026-07-19; if chat
+# latency regresses, re-probe the configured slugs first — a dead primary is the
+# cheapest thing to rule out.
 OPENROUTER_MODEL = os.environ.get(
-    "OPENROUTER_MODEL", "openai/gpt-oss-120b:free"
+    "OPENROUTER_MODEL", "openai/gpt-oss-20b:free"
 ).strip()
 
 OPENROUTER_FALLBACK_MODELS = [
@@ -173,8 +180,31 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # stacks into ~25s+ for a message as trivial as "hi". A 12s ceiling still gives a
 # healthy model ample time to answer but fails over to the next model/provider far
 # sooner when one is slow. Overridable via the environment for tuning per deploy.
-OPENROUTER_TIMEOUT_S = float(os.environ.get("OPENROUTER_TIMEOUT", "12"))
-GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT", "12"))
+# 4.5s per provider call. `requests` applies this per socket read rather than as a
+# wall-clock deadline, so a slow-dribbling response can overshoot slightly; 4.5s
+# keeps even that case inside the 7s target the client asked for. A free-tier
+# model that cannot answer in 4.5s is one the user is waiting on for no benefit —
+# the deterministic fallback below is grounded in our own data and returns at once.
+OPENROUTER_TIMEOUT_S = float(os.environ.get("OPENROUTER_TIMEOUT", "4.5"))
+GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT", "4.5"))
+
+# Whole-endpoint budget for /chat (Task: chat latency). Per-call timeouts alone
+# don't bound the total: two OpenRouter models x two attempts each, plus Gemini
+# x two attempts, could stack well past 60s, which is what produced the observed
+# 15-20s+ replies. Every provider call now takes min(its timeout, budget left),
+# and a retry or a further provider is only attempted when enough budget remains
+# to be worth it — so /chat degrades to the deterministic answer at a predictable
+# ceiling instead of making the user wait indefinitely.
+# Target: a reply inside 5-7s. Product questions now bypass the LLM entirely
+# (answered from the database), so this budget only bounds the open-ended asks.
+CHAT_BUDGET_S = float(os.environ.get("CHAT_BUDGET", "6.5"))
+# Don't start another provider call unless at least this much budget is left.
+CHAT_MIN_CALL_S = 2.5
+
+# Cap the reply length. The system prompt asks for <=150 words, so 700 tokens was
+# far more headroom than needed and every unused token is latency: free-tier
+# models stream slowly, and time-to-last-token scales with what's generated.
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "400"))
 
 # --- Provider 2 (optional): Google Gemini (generous free tier) ----------------
 # Used as an automatic failover when every OpenRouter free model is rate-limited,
@@ -623,10 +653,33 @@ def fetch_off_product(barcode: str):
                     continue
         return None
 
+    # Basis discipline: we declare serving_size_g = 100 below, so every nutrient
+    # here must be the per-100g figure. Reading '<n>_serving' first (the previous
+    # behaviour) mixed a real per-serving number into a row labelled as 100g —
+    # and per-100g scoring then divides by 100, silently under-reporting a 30g
+    # pack by ~3x. Prefer _100g; fall back to _serving only when OFF also tells us
+    # the serving size, so the value can be converted honestly.
+    try:
+        off_serving_g = float(
+            re.search(r"[\d.]+", str(p.get("serving_size") or "")).group()
+        )
+    except (AttributeError, ValueError):
+        off_serving_g = None
+
+    def _per_100g(base: str):
+        """Per-100g value for `base`, converting a per-serving figure if needed."""
+        val = _num(f"{base}_100g")
+        if val is not None:
+            return val
+        serving_val = _num(f"{base}_serving")
+        if serving_val is not None and off_serving_g:
+            return serving_val * 100.0 / off_serving_g
+        return None
+
     # OFF stores sodium in grams; fall back to salt/2.5 when sodium is absent.
-    sodium_val = _num('sodium_serving', 'sodium_100g')
+    sodium_val = _per_100g('sodium')
     if sodium_val is None:
-        salt_val = _num('salt_serving', 'salt_100g')
+        salt_val = _per_100g('salt')
         sodium_val = (salt_val / 2.5) if salt_val is not None else None
     sodium_mg = sodium_val * 1000 if sodium_val is not None else None
 
@@ -660,13 +713,15 @@ def fetch_off_product(barcode: str):
             or None
         ),
         "category": category,
+        # Every nutrient above/below is per 100g, so the declared serving must be
+        # 100g for the two to agree. See _per_100g.
         "serving_size_g": 100.0,
-        "sugar_g_per_serving": _num('sugars_serving', 'sugars_100g'),
-        "saturated_fat_g_per_serving": _num('saturated-fat_serving', 'saturated-fat_100g'),
+        "sugar_g_per_serving": _per_100g('sugars'),
+        "saturated_fat_g_per_serving": _per_100g('saturated-fat'),
         "sodium_mg_per_serving": sodium_mg,
-        "protein_g_per_serving": _num('proteins_serving', 'proteins_100g'),
-        "fiber_g_per_serving": _num('fiber_serving', 'fiber_100g'),
-        "calories_kcal_per_serving": _num('energy-kcal_serving', 'energy-kcal_100g'),
+        "protein_g_per_serving": _per_100g('proteins'),
+        "fiber_g_per_serving": _per_100g('fiber'),
+        "calories_kcal_per_serving": _per_100g('energy-kcal'),
         "ingredients_text": off_ingredients,
     }
 
@@ -706,7 +761,28 @@ def get_scored_product(barcode: str, preferences: dict = None):
     p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
     p_dict['preferences_applied'] = breakdown.get('preferences_applied', {})
     p_dict['source'] = source
+    attach_data_quality(p_dict, breakdown)
     return p_dict
+
+
+def attach_data_quality(p_dict: dict, breakdown: dict) -> None:
+    """Promote the scorer's data-completeness signals onto the product payload.
+
+    A client rendering a scan needs to distinguish "0g sugar" from "sugar was
+    never disclosed" without digging into ``breakdown``. Without this the two are
+    indistinguishable in the UI, which is how an unscored product came to look
+    like an average one.
+    """
+    p_dict['undisclosed_nutrients'] = breakdown.get('undisclosed_nutrients', [])
+    p_dict['data_complete'] = breakdown.get('data_complete', True)
+    p_dict['score_confidence'] = breakdown.get('score_confidence', 'high')
+    p_dict['insufficient_data'] = breakdown.get('insufficient_data', False)
+    if p_dict['insufficient_data']:
+        p_dict['data_notice'] = (
+            "This product's label data is missing, so it cannot be scored "
+            "reliably. Scan the barcode again or report it so we can add the "
+            "nutrition panel."
+        )
 
 
 def generic_scored_product(barcode: str):
@@ -747,6 +823,7 @@ def generic_scored_product(barcode: str):
     p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
     p_dict['preferences_applied'] = {}
     p_dict['source'] = source
+    attach_data_quality(p_dict, breakdown)
     badge = evaluate_recommended_badge(p_dict, breakdown, None)
     p_dict['is_recommended'] = badge['is_recommended']
     p_dict['recommended_badge'] = badge
@@ -1054,8 +1131,33 @@ def calculate_health_score(product: dict):
         
     return score, grade
 
+# ==============================================================================
+# Scoring rules — implements ScoringLogic_Swapify.md (Chandrika's spec)
+# ==============================================================================
+# Section numbers below refer to that document. Every ingredient carries a
+# ``match`` list of lower-case substrings; matching is longest-keyword-first so a
+# specific entry beats a generic one ("invert sugar syrup" wins over "sugar",
+# "rice bran oil" over "rice bran"). Short keywords (<= 4 chars, e.g. "msg",
+# "bha", "e102") are matched on word boundaries so they cannot fire inside an
+# unrelated word.
+#
+# Indian RDA reference used for the sodium %RDA bands in spec section 3.7.
+SODIUM_RDA_MG = 2000.0
+
+# Nutrients whose penalty thresholds are judged on concentration (per 100g)
+# rather than on portion size. Sodium is deliberately absent: spec 3.7 defines it
+# as a share of the daily value *per serving*. See calculate_health_score_v2.
+PER_100G_PENALTY_NUTRIENTS = frozenset({"sugar", "saturated_fat"})
+
 SCORING_RULES = {
-    "base_score": 5.0,
+    "base_score": 5.0,  # spec 2.1 — neutral midpoint, not 10
+
+    # --- Nutrient thresholds --------------------------------------------------
+    # Sugar / sodium / saturated fat penalties feed the same category caps as the
+    # ingredient deductions (spec 2.4). Sodium uses the spec 3.7 %RDA bands:
+    # >30% RDA (>600mg) = -1.0, 15-30% RDA (300-600mg) = -0.6.
+    # The three "bonus, stacks" rows in spec 4.1/4.2/4.4 are per-100g and are
+    # applied separately in calculate_health_score_v2 (see _per_100g bonuses).
     "rules": [
         {
             "nutrient": "sugar",
@@ -1067,54 +1169,207 @@ SCORING_RULES = {
         {
             "nutrient": "sodium",
             "thresholds": [
-                { "min": 400, "points": -2 },
-                { "min": 200, "max": 400, "points": -1 }
+                { "min": 0.30 * SODIUM_RDA_MG, "points": -1.0 },
+                { "min": 0.15 * SODIUM_RDA_MG, "max": 0.30 * SODIUM_RDA_MG, "points": -0.6 }
             ]
         },
         {
+            # Monotonic sliding scale (spec: "penalised on a sliding scale up to
+            # -2"). The previous table was non-monotonic — 8g scored -2 while
+            # 15g scored -1 — so a fattier product could out-score a leaner one.
             "nutrient": "saturated_fat",
             "thresholds": [
-                { "min": 20, "points": -2 },
-                { "min": 6, "max": 10, "points": -2 },
-                { "min": 10, "max": 20, "points": -1 },
-                { "min": 0, "max": 6, "points": -1 }
+                { "min": 20, "points": -2.0 },
+                { "min": 10, "max": 20, "points": -1.5 },
+                { "min": 6, "max": 10, "points": -1.0 },
+                { "min": 3, "max": 6, "points": -0.5 }
             ]
         },
-        {
-            "nutrient": "protein",
-            "thresholds": [
-                { "min": 8, "points": 1 }
-            ]
-        },
-        {
-            "nutrient": "fiber",
-            "thresholds": [
-                { "min": 5, "points": 1 }
-            ]
-        }
     ],
+
+    # --- Section 3: negative ingredients (deductions) -------------------------
     "ingredients": [
-        { "name": "palm oil", "penalty": -0.6, "category": "Oils & Fats", "risk": "Medium" },
-        { "name": "fractionated fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "High" },
-        { "name": "maida", "penalty": -0.5, "category": "Refined Carbohydrates", "risk": "High" },
-        { "name": "refined wheat flour", "penalty": -0.5, "category": "Refined Carbohydrates", "risk": "High" },
-        { "name": "salt", "penalty": -0.6, "category": "Sodium", "risk": "Medium" },
-        { "name": "msg", "penalty": -0.5, "category": "Flavor Enhancers", "risk": "Medium" },
-        { "name": "tbhq", "penalty": -0.8, "category": "Preservatives", "risk": "Severe" },
-        { "name": "sodium benzoate", "penalty": -0.6, "category": "Preservatives", "risk": "Medium" },
-        { "name": "tartrazine", "penalty": -0.7, "category": "Artificial Colors", "risk": "High" },
-        { "name": "sugar", "penalty": -0.8, "category": "Sugars & Sweeteners", "risk": "High" },
-        { "name": "corn syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "High" },
-        { "name": "peanuts", "penalty": 0.4, "category": "Healthy Fats" },
-        { "name": "skimmed milk", "penalty": 0.5, "category": "Protein Quality" },
-        { "name": "milk solids", "penalty": 0.5, "category": "Protein Quality" }
+        # 3.1 Oils & Fats
+        { "name": "partially hydrogenated oil / vanaspati", "penalty": -1.2, "category": "Oils & Fats", "risk": "Severe",
+          "match": ["partially hydrogenated", "hydrogenated vegetable oil", "hydrogenated fat", "vanaspati"] },
+        { "name": "repeatedly reused frying oil", "penalty": -1.0, "category": "Oils & Fats", "risk": "Severe",
+          "match": ["reused frying oil", "repeatedly fried oil"] },
+        { "name": "interesterified fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "Medium",
+          "match": ["interesterified"] },
+        { "name": "fractionated fat", "penalty": -0.7, "category": "Oils & Fats", "risk": "Medium",
+          "match": ["fractionated fat", "fractionated vegetable fat"] },
+        { "name": "refined palm oil / palmolein", "penalty": -0.6, "category": "Oils & Fats", "risk": "Medium",
+          "match": ["palm oil", "palmolein", "palm fat", "palm kernel"] },
+        { "name": "cottonseed oil", "penalty": -0.3, "category": "Oils & Fats", "risk": "Low",
+          "match": ["cottonseed oil"] },
+
+        # 3.2 Sugars & Sweeteners
+        { "name": "high fructose corn syrup", "penalty": -1.0, "category": "Sugars & Sweeteners", "risk": "Severe",
+          "match": ["high fructose corn syrup", "hfcs", "corn syrup solids", "fructose syrup"] },
+        { "name": "refined sugar", "penalty": -0.8, "category": "Sugars & Sweeteners", "risk": "High",
+          "match": ["refined sugar", "white sugar", "sucrose", "sugar"] },
+        { "name": "corn syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
+          "match": ["corn syrup", "glucose syrup", "liquid glucose"] },
+        { "name": "invert sugar syrup", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
+          "match": ["invert sugar syrup", "invert syrup", "invert sugar"] },
+        { "name": "aspartame", "penalty": -0.6, "category": "Sugars & Sweeteners", "risk": "Medium",
+          "match": ["aspartame", "e951", "ins 951"] },
+        { "name": "acesulfame-k", "penalty": -0.4, "category": "Sugars & Sweeteners", "risk": "Low",
+          "match": ["acesulfame", "e950", "ins 950"] },
+        { "name": "maltodextrin", "penalty": -0.4, "category": "Sugars & Sweeteners", "risk": "Low",
+          "match": ["maltodextrin"] },
+        { "name": "sucralose", "penalty": -0.3, "category": "Sugars & Sweeteners", "risk": "Low",
+          "match": ["sucralose", "e955", "ins 955"] },
+
+        # 3.3 Preservatives
+        { "name": "sodium nitrite / nitrate", "penalty": -1.2, "category": "Preservatives", "risk": "Severe",
+          "match": ["sodium nitrite", "sodium nitrate", "potassium nitrite", "potassium nitrate", "e250", "e251", "ins 250", "ins 251"] },
+        { "name": "bha (e320)", "penalty": -1.0, "category": "Preservatives", "risk": "Severe",
+          "match": ["butylated hydroxyanisole", "bha", "e320", "ins 320"] },
+        { "name": "tbhq", "penalty": -0.8, "category": "Preservatives", "risk": "Severe",
+          "match": ["tertiary butylhydroquinone", "tbhq", "e319", "ins 319"] },
+        { "name": "sulphur dioxide / sulphites", "penalty": -0.6, "category": "Preservatives", "risk": "Medium",
+          "match": ["sulphur dioxide", "sulfur dioxide", "sulphite", "sulfite", "e220", "e223", "e224", "ins 220", "ins 223"] },
+        { "name": "sodium benzoate (e211)", "penalty": -0.6, "category": "Preservatives", "risk": "Medium",
+          "match": ["sodium benzoate", "benzoate", "e211", "ins 211"] },
+        { "name": "bht (e321)", "penalty": -0.5, "category": "Preservatives", "risk": "Medium",
+          "match": ["butylated hydroxytoluene", "bht", "e321", "ins 321"] },
+        { "name": "potassium sorbate", "penalty": -0.2, "category": "Preservatives", "risk": "Low",
+          "match": ["potassium sorbate", "sorbate", "e202", "ins 202"] },
+
+        # 3.4 Artificial Colors
+        { "name": "tartrazine (e102)", "penalty": -0.7, "category": "Artificial Colors", "risk": "High",
+          "match": ["tartrazine", "yellow 5", "e102", "ins 102"] },
+        { "name": "sunset yellow (e110)", "penalty": -0.7, "category": "Artificial Colors", "risk": "High",
+          "match": ["sunset yellow", "e110", "ins 110"] },
+        { "name": "carmoisine (e122)", "penalty": -0.6, "category": "Artificial Colors", "risk": "Medium",
+          "match": ["carmoisine", "e122", "ins 122"] },
+        { "name": "allura red (e129)", "penalty": -0.6, "category": "Artificial Colors", "risk": "Medium",
+          "match": ["allura red", "red 40", "e129", "ins 129"] },
+        { "name": "erythrosine (e127)", "penalty": -0.5, "category": "Artificial Colors", "risk": "Medium",
+          "match": ["erythrosine", "e127", "ins 127"] },
+        { "name": "caramel colour iv (ammonia-sulphite)", "penalty": -0.5, "category": "Artificial Colors", "risk": "Medium",
+          "match": ["caramel colour iv", "caramel color iv", "ammonia sulphite caramel", "150d", "e150d", "ins 150d"] },
+
+        # 3.5 Flavor Enhancers
+        { "name": "msg (e621)", "penalty": -0.5, "category": "Flavor Enhancers", "risk": "Medium",
+          "match": ["monosodium glutamate", "yeast extract", "msg", "e621", "ins 621"] },
+        { "name": "disodium inosinate / guanylate", "penalty": -0.3, "category": "Flavor Enhancers", "risk": "Low",
+          "match": ["disodium inosinate", "disodium guanylate", "e631", "e627", "ins 631", "ins 627"] },
+        { "name": "unspecified artificial flavouring", "penalty": -0.3, "category": "Flavor Enhancers", "risk": "Low",
+          "match": ["artificial flavouring", "artificial flavoring", "artificial flavour", "artificial flavor"] },
+
+        # 3.6 Emulsifiers & Stabilizers
+        { "name": "polysorbate 80", "penalty": -0.5, "category": "Emulsifiers & Stabilizers", "risk": "Medium",
+          "match": ["polysorbate", "e433", "e435", "ins 433"] },
+        { "name": "carboxymethyl cellulose (cmc)", "penalty": -0.5, "category": "Emulsifiers & Stabilizers", "risk": "Medium",
+          "match": ["carboxymethyl cellulose", "cmc", "e466", "ins 466"] },
+        { "name": "sodium stearoyl lactylate", "penalty": -0.2, "category": "Emulsifiers & Stabilizers", "risk": "Low",
+          "match": ["sodium stearoyl lactylate", "e481", "ins 481"] },
+
+        # 3.7 Sodium & salt-related (the %RDA bands live in "rules" above)
+        { "name": "disodium phosphate", "penalty": -0.3, "category": "Sodium", "risk": "Low",
+          "match": ["disodium phosphate", "e339", "ins 339"] },
+
+        # 3.8 Refined Carbohydrates
+        { "name": "maida (refined wheat flour)", "penalty": -0.5, "category": "Refined Carbohydrates", "risk": "Medium",
+          "match": ["refined wheat flour", "refined flour", "maida"] },
+        { "name": "modified starch", "penalty": -0.3, "category": "Refined Carbohydrates", "risk": "Low",
+          "match": ["modified starch", "modified corn starch", "modified maize starch", "e1422", "ins 1422"] },
+
+        # 3.9 Caffeine & Stimulants
+        { "name": "caffeine", "penalty": -0.6, "category": "Caffeine & Stimulants", "risk": "Medium",
+          "match": ["caffeine"] },
+        { "name": "taurine", "penalty": -0.6, "category": "Caffeine & Stimulants", "risk": "Medium",
+          "match": ["taurine"] },
+
+        # 3.10 Other Additives of Concern
+        { "name": "potassium bromate", "penalty": -1.2, "category": "Other Additives", "risk": "Severe",
+          "match": ["potassium bromate", "e924", "ins 924"] },
+        { "name": "titanium dioxide (e171)", "penalty": -0.7, "category": "Other Additives", "risk": "Medium",
+          "match": ["titanium dioxide", "e171", "ins 171"] },
+        { "name": "propylene glycol", "penalty": -0.3, "category": "Other Additives", "risk": "Low",
+          "match": ["propylene glycol", "e1520", "ins 1520"] },
+        { "name": "undisclosed natural flavours", "penalty": -0.2, "category": "Other Additives", "risk": "Low",
+          "match": ["nature identical", "natural flavour", "natural flavor"] },
+
+        # --- Section 4: positive ingredients (additions) ----------------------
+        # 4.1 Protein Quality
+        { "name": "whey protein", "penalty": 0.8, "category": "Protein Quality",
+          "match": ["whey protein isolate", "whey protein", "whey"] },
+        { "name": "pea / soy protein isolate", "penalty": 0.7, "category": "Protein Quality",
+          "match": ["soy protein isolate", "soya protein isolate", "pea protein", "soy protein", "soya protein"] },
+        { "name": "milk solids / paneer / curd", "penalty": 0.5, "category": "Protein Quality",
+          "match": ["milk solids", "milk protein", "skimmed milk", "skim milk", "paneer", "curd", "yoghurt", "yogurt"] },
+        { "name": "lentil / chickpea / besan flour", "penalty": 0.5, "category": "Protein Quality",
+          "match": ["chickpea flour", "gram flour", "lentil flour", "besan", "lentil", "chana dal"] },
+        { "name": "nuts & seeds", "penalty": 0.4, "category": "Protein Quality",
+          "match": ["almond", "peanut", "cashew", "pistachio", "walnut", "chia", "flaxseed", "flax seed", "sesame", "sunflower seed"] },
+        { "name": "egg / egg powder", "penalty": 0.4, "category": "Protein Quality",
+          "match": ["egg powder", "egg white", "egg solids", "egg"] },
+
+        # 4.2 Fiber
+        { "name": "whole grain base", "penalty": 0.7, "category": "Fiber",
+          "match": ["whole wheat flour", "whole wheat", "whole grain", "wholegrain", "whole oat", "atta", "oats", "oatmeal", "jowar", "bajra", "ragi", "millet", "quinoa", "brown rice"] },
+        { "name": "oat / wheat bran", "penalty": 0.6, "category": "Fiber",
+          "match": ["oat bran", "wheat bran", "rice bran"] },
+        { "name": "psyllium husk (isabgol)", "penalty": 0.4, "category": "Fiber",
+          "match": ["psyllium", "isabgol"] },
+        { "name": "inulin / chicory root fiber", "penalty": 0.4, "category": "Fiber",
+          "match": ["chicory root fiber", "chicory root fibre", "inulin", "chicory"] },
+
+        # 4.3 Healthy Fats & Oils
+        { "name": "cold-pressed / virgin oil", "penalty": 0.5, "category": "Healthy Fats & Oils",
+          "match": ["extra virgin olive oil", "virgin coconut oil", "cold pressed", "cold-pressed", "extra virgin", "virgin olive oil"] },
+        { "name": "olive / rice bran oil", "penalty": 0.4, "category": "Healthy Fats & Oils",
+          "match": ["olive oil", "rice bran oil"] },
+        { "name": "omega-3 source", "penalty": 0.4, "category": "Healthy Fats & Oils",
+          "match": ["flaxseed oil", "fish oil", "walnut oil", "omega-3", "omega 3"] },
+
+        # 4.4 Natural Sweeteners & Low-Sugar Design
+        { "name": "no added sugar", "penalty": 0.7, "category": "Natural Sweeteners",
+          "match": ["no added sugar", "sugar free", "sugarfree", "unsweetened"] },
+        { "name": "jaggery / date paste / honey", "penalty": 0.4, "category": "Natural Sweeteners",
+          "match": ["jaggery", "date paste", "date syrup", "dates", "honey", "gur"] },
+        { "name": "stevia", "penalty": 0.3, "category": "Natural Sweeteners",
+          "match": ["steviol glycoside", "stevia"] },
+        { "name": "monk fruit extract", "penalty": 0.3, "category": "Natural Sweeteners",
+          "match": ["monk fruit", "luo han guo"] },
+
+        # 4.5 Natural Preservation & Clean Label
+        { "name": "tocopherols (natural antioxidant)", "penalty": 0.3, "category": "Natural Preservation",
+          "match": ["mixed tocopherols", "tocopherol", "vitamin e"] },
+        { "name": "rosemary extract", "penalty": 0.3, "category": "Natural Preservation",
+          "match": ["rosemary extract", "rosemary"] },
+
+        # 4.6 Micronutrients & Fortification
+        { "name": "iron + folic acid fortification", "penalty": 0.4, "category": "Micronutrients",
+          "match": ["folic acid", "ferrous fumarate", "ferrous sulphate", "iron"] },
+        { "name": "vitamin d fortification", "penalty": 0.4, "category": "Micronutrients",
+          "match": ["vitamin d3", "vitamin d2", "vitamin d", "cholecalciferol"] },
+        { "name": "vitamin b12 fortification", "penalty": 0.3, "category": "Micronutrients",
+          "match": ["vitamin b12", "cyanocobalamin", "cobalamin"] },
+        { "name": "calcium fortification", "penalty": 0.2, "category": "Micronutrients",
+          "match": ["calcium carbonate", "calcium"] },
+        { "name": "zinc fortification", "penalty": 0.2, "category": "Micronutrients",
+          "match": ["zinc sulphate", "zinc"] },
+
+        # 4.7 Probiotics & Gut Health
+        { "name": "named probiotic strain", "penalty": 0.5, "category": "Probiotics",
+          "match": ["lactobacillus", "bifidobacterium", "l. acidophilus", "s. thermophilus"] },
+        { "name": "live active cultures", "penalty": 0.4, "category": "Probiotics",
+          "match": ["live active cultures", "active cultures", "live cultures", "probiotic"] },
+        { "name": "prebiotic fiber", "penalty": 0.2, "category": "Probiotics",
+          "match": ["prebiotic"] },
     ],
-    "position_multiplier": {
+
+    "position_multiplier": {   # spec 2.3
         "top_3": 1.5,
         "middle": 1.0,
         "trace": 0.5
     },
-    "category_caps": {
+
+    "category_caps": {         # spec 2.4 — maximum total deduction per category
         "Oils & Fats": 2.5,
         "Sugars & Sweeteners": 2.5,
         "Preservatives": 2.0,
@@ -1126,12 +1381,78 @@ SCORING_RULES = {
         "Caffeine & Stimulants": 2.0,
         "Other Additives": 1.5
     },
-    "transparency_multiplier": {
+
+    "addition_caps": {         # spec 2.4 — maximum total addition per category
+        "Protein Quality": 2.0,
+        "Fiber": 1.5,
+        "Healthy Fats & Oils": 1.0,
+        "Natural Sweeteners": 1.0,
+        "Natural Preservation": 1.0,
+        "Micronutrients": 1.0,
+        "Probiotics": 0.75,
+        "Whole-Food": 1.0
+    },
+
+    "transparency_multiplier": {   # spec 5
         "disclosed": 1.05,
         "vague": 0.95,
         "default": 1.0
     }
 }
+
+
+def _compile_ingredient_matchers(rules):
+    """Flatten SCORING_RULES["ingredients"] into (keyword, regex, rule) tuples
+    sorted longest-keyword-first.
+
+    Longest-first ordering is what makes the specific rule win over the generic
+    one: "invert sugar syrup" must beat "sugar", and "rice bran oil" (a healthy
+    fat, +0.4) must beat "rice bran" (fiber, +0.6). Short keywords such as "msg",
+    "bha" or "e102" get a word-boundary regex so they cannot fire inside an
+    unrelated word.
+    """
+    compiled = []
+    for rule in rules:
+        for kw in rule.get("match") or [rule["name"]]:
+            kw = kw.lower()
+            pattern = re.compile(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])") \
+                if len(kw) <= 4 else None
+            compiled.append((kw, pattern, rule))
+    compiled.sort(key=lambda item: len(item[0]), reverse=True)
+    return compiled
+
+
+INGREDIENT_MATCHERS = _compile_ingredient_matchers(SCORING_RULES["ingredients"])
+
+
+# Catch-all label terms that hide what is actually in the product. They drive the
+# spec 5 transparency penalty, and they also disqualify a product from the
+# "verified absence" clean-label bonus in spec 4.5 — you cannot certify that a
+# label contains no artificial colour when it just says "permitted colour".
+VAGUE_LABEL_TERMS = (
+    "flavouring", "flavoring", "flavour", "flavor",
+    "permitted emulsifier", "permitted colour", "permitted color",
+    "permitted", "edible vegetable oil", "vegetable fat",
+    "spices", "condiments", "raising agent", "anticaking",
+    "artificial colour", "artificial color",
+    "artificial flavour", "artificial flavor",
+)
+
+
+def _has_vague_terms(ingredients_text: str) -> bool:
+    """True when the ingredient list uses catch-all terms instead of naming
+    the actual additives."""
+    lowered = (ingredients_text or "").lower()
+    return any(term in lowered for term in VAGUE_LABEL_TERMS)
+
+
+def match_ingredient_rule(ing_text: str):
+    """Return the most specific SCORING_RULES entry matching one ingredient
+    token, or None. See _compile_ingredient_matchers for the ordering contract."""
+    for kw, pattern, rule in INGREDIENT_MATCHERS:
+        if pattern.search(ing_text) if pattern else (kw in ing_text):
+            return rule
+    return None
 
 
 # Risk levels live in the database (ingredient_rules.risk_level) so the DB is the
@@ -1367,50 +1688,138 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         "additions": []
     }
     
-    nutrient_bonuses_total = 0
     cat_deductions = {}
-    
+    cat_additions = {}
+
     nutr_cat_map = {
         "sugar": "Sugars & Sweeteners",
         "saturated_fat": "Oils & Fats",
         "sodium": "Sodium"
     }
-    
+
     # 1. Apply nutrient penalties & bonuses, re-weighted by user preferences.
     pen_mult = weights["nutrient_penalty_mult"]
     bonus_mult = weights["nutrient_bonus_mult"]
+
+    # Serving size is the divisor for per-100g normalisation below, so parse it
+    # once and treat a missing/zero/absurd value as "cannot normalise".
+    try:
+        serving_g = float(product.get("serving_size_g") or 0)
+    except (TypeError, ValueError):
+        serving_g = 0.0
+    can_normalise = serving_g > 0
+
+    # Nutrients we could not score, so the caller can say "not disclosed" rather
+    # than let a missing value read as a clean result.
+    undisclosed = []
+
     for rule in scoring_rules_dict["rules"]:
         nutrient = rule["nutrient"]
         val = product.get(f"{nutrient}_g_per_serving")
         if val is None and nutrient == "sodium":
             val = product.get("sodium_mg_per_serving")
         if val is None:
+            # The label never disclosed it. Scoring it as 0 would hand the product
+            # a clean sheet it did not earn, so it is skipped and reported.
+            undisclosed.append(nutrient)
             continue
+
+        # --- per-100g normalisation (spec: density, not portion) ---------------
+        # Sugar and saturated fat are judged on concentration, so a 30g pack and a
+        # 100g pack of the same food must score identically. Comparing the raw
+        # per-serving grams (the previous behaviour) meant a manufacturer could
+        # improve its score just by declaring a smaller serving.
+        #
+        # Sodium deliberately stays per-serving: spec 3.7 defines it as a share of
+        # the 2000mg daily value *per serving*, which is a genuine portion-based
+        # measure, not a density one.
+        basis = "per_serving"
+        scored_val = val
+        if nutrient in PER_100G_PENALTY_NUTRIENTS:
+            if not can_normalise:
+                # No serving size means no defensible density figure. Scoring the
+                # raw grams here would silently compare a per-100g threshold
+                # against a per-serving number.
+                undisclosed.append(nutrient)
+                continue
+            scored_val = val * 100.0 / serving_g
+            basis = "per_100g"
 
         for threshold in rule["thresholds"]:
             t_min = threshold["min"]
             t_max = threshold.get("max", float("inf"))
             points = threshold["points"]
 
-            if t_min <= val < t_max:
+            if t_min <= scored_val < t_max:
                 if points < 0:
                     pts = round(points * pen_mult.get(nutrient, 1.0), 2)
                     cat = nutr_cat_map.get(nutrient, nutrient)
                     cat_deductions[cat] = cat_deductions.get(cat, 0) + abs(pts)
                     breakdown["nutrition_penalties"].append({
                         "nutrient": nutrient,
-                        "value": val,
+                        # `value` stays the figure the threshold was applied to, so
+                        # the breakdown the user sees explains the points awarded.
+                        # The raw label figure is kept alongside it.
+                        "value": round(scored_val, 2),
+                        "basis": basis,
+                        "value_per_serving": val,
+                        "serving_size_g": serving_g if can_normalise else None,
                         "points": float(pts)
                     })
                 else:
                     pts = round(points * bonus_mult.get(nutrient, 1.0), 2)
-                    nutrient_bonuses_total += pts
+                    cat = nutr_cat_map.get(nutrient, nutrient)
+                    cat_additions[cat] = cat_additions.get(cat, 0) + pts
                     breakdown["additions"].append({
-                        "category": "nutrient_bonus",
+                        "category": cat,
                         "nutrient": nutrient,
+                        "value": round(scored_val, 2),
+                        "basis": basis,
                         "points": float(pts)
                     })
                 break
+
+    # 1b. Per-100g "bonus, stacks" rows (spec 4.1 / 4.2 / 4.4). The catalogue
+    # stores nutrients per serving, so normalise via serving_size_g. Each lands in
+    # its spec category and is therefore subject to that category's addition cap.
+    per_100g_bonuses = [
+        ("protein", "protein_g_per_serving", 10.0, "ge", 0.6, "Protein Quality",
+         ">=10g protein per 100g"),
+        ("fiber", "fiber_g_per_serving", 5.0, "ge", 0.5, "Fiber",
+         ">=5g fiber per 100g"),
+        ("sugar", "sugar_g_per_serving", 5.0, "lt", 0.5, "Natural Sweeteners",
+         "<5g sugar per 100g"),
+    ]
+    # serving_g / can_normalise are parsed once at the top of this function.
+    if can_normalise:
+        for nutrient, field, threshold, op, points, cat, label in per_100g_bonuses:
+            raw = product.get(field)
+            if raw is None:
+                # Undisclosed. Must not qualify for a bonus — a blank sugar cell
+                # previously read as 0g and earned the "<5g per 100g" award.
+                if nutrient not in undisclosed:
+                    undisclosed.append(nutrient)
+                continue
+            try:
+                per_100g = float(raw) * 100.0 / serving_g
+            except (TypeError, ValueError):
+                continue
+            qualifies = per_100g >= threshold if op == "ge" else per_100g < threshold
+            if not qualifies:
+                continue
+            pts = round(points * bonus_mult.get(nutrient, 1.0), 2)
+            cat_additions[cat] = cat_additions.get(cat, 0) + pts
+            breakdown["additions"].append({
+                "category": cat,
+                "nutrient": nutrient,
+                "attribute": label,
+                # Same keys as the penalty entries above, so a client reads one
+                # shape for every line in the breakdown.
+                "value": round(per_100g, 2),
+                "basis": "per_100g",
+                "value_per_100g": round(per_100g, 1),
+                "points": float(pts),
+            })
 
     # 2. Apply ingredient penalties
     ingredients_text = product.get('ingredients_text', '') or ''
@@ -1427,50 +1836,95 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         elif idx >= 8:
             multiplier = scoring_rules_dict["position_multiplier"]["trace"]
             
-        for rule in scoring_rules_dict["ingredients"]:
-            if rule["name"] in ing_text:
-                pts = round(rule["penalty"] * multiplier, 2)
-                cat = rule["category"]
+        # Longest-keyword-first match, so the most specific rule wins.
+        rule = match_ingredient_rule(ing_text)
+        if rule is not None:
+            penalty = rule["penalty"]
+            cat = rule["category"]
 
-                if pts < 0:
-                    # Re-weight the penalty by the user's category preference
-                    # (e.g. low_sugar penalises "Sugars & Sweeteners" harder).
-                    pts = round(pts * cat_pen_mult.get(cat, 1.0), 2)
-                    cat_deductions[cat] = cat_deductions.get(cat, 0) + abs(pts)
-                    ingredient_flags.append({
-                        "name": rule["name"],
-                        "risk": resolve_ingredient_risk(
-                            rule["name"], rule.get("risk", "Low")
-                        ),
-                    })
-                    breakdown["deductions"].append({
-                        "category": cat,
-                        "ingredient": rule["name"],
-                        "position": idx + 1,
-                        "multiplier": multiplier,
-                        "points": pts
-                    })
-                elif cat in drop_bonus:
-                    # A preference (e.g. vegan) cancels this bonus — record it
-                    # as a zero-point, dropped addition for transparency.
-                    breakdown["additions"].append({
-                        "category": cat,
-                        "ingredient": rule["name"],
-                        "position": idx + 1,
-                        "multiplier": multiplier,
-                        "points": 0.0,
-                        "dropped_by_preference": True
-                    })
-                else:
-                    nutrient_bonuses_total += pts
-                    breakdown["additions"].append({
-                        "category": cat,
-                        "ingredient": rule["name"],
-                        "position": idx + 1,
-                        "multiplier": multiplier,
-                        "points": pts
-                    })
-                break
+            # Spec 3.9: a plain caffeine listing is a moderate flag, but an
+            # energy drink's undisclosed caffeine load is the SEVERE -1.0 row.
+            if cat == "Caffeine & Stimulants" and penalty == -0.6:
+                if (product.get("category") or "").strip().lower() == "energy_drink":
+                    penalty = -1.0
+
+            pts = round(penalty * multiplier, 2)
+
+            if pts < 0:
+                # Re-weight the penalty by the user's category preference
+                # (e.g. low_sugar penalises "Sugars & Sweeteners" harder).
+                pts = round(pts * cat_pen_mult.get(cat, 1.0), 2)
+                cat_deductions[cat] = cat_deductions.get(cat, 0) + abs(pts)
+                ingredient_flags.append({
+                    "name": rule["name"],
+                    "risk": resolve_ingredient_risk(
+                        rule["name"], rule.get("risk", "Low")
+                    ),
+                })
+                breakdown["deductions"].append({
+                    "category": cat,
+                    "ingredient": rule["name"],
+                    "position": idx + 1,
+                    "multiplier": multiplier,
+                    "points": pts
+                })
+            elif cat in drop_bonus:
+                # A preference (e.g. vegan) cancels this bonus — record it
+                # as a zero-point, dropped addition for transparency.
+                breakdown["additions"].append({
+                    "category": cat,
+                    "ingredient": rule["name"],
+                    "position": idx + 1,
+                    "multiplier": multiplier,
+                    "points": 0.0,
+                    "dropped_by_preference": True
+                })
+            else:
+                cat_additions[cat] = cat_additions.get(cat, 0) + pts
+                breakdown["additions"].append({
+                    "category": cat,
+                    "ingredient": rule["name"],
+                    "position": idx + 1,
+                    "multiplier": multiplier,
+                    "points": pts
+                })
+
+    # 2b. Clean-label (spec 4.5) and whole-food (spec 4.8) markers.
+    #     These are *verified absence / whole-product* attributes, so they only
+    #     apply when an ingredient list actually exists — with no list, absence of
+    #     a preservative proves nothing and must not earn a bonus. This is why the
+    #     244 catalogue rows with no ingredients_text collect none of these.
+    if ingredients_list:
+        # Spec 4.5 marks these rows "(verified)". We can only treat absence as
+        # verification when the label is *specific* — a list saying "permitted
+        # preservative" or "spices" hides exactly the additives we'd be crediting
+        # the product for not having. So the bonus requires both a clean additive
+        # profile and a non-vague list, and it is awarded once rather than three
+        # times over (which would hand +1.4 to any product whose additives simply
+        # aren't in our keyword table).
+        flagged_cats = {d["category"] for d in breakdown["deductions"]}
+        additive_cats = {
+            "Preservatives", "Artificial Colors", "Flavor Enhancers",
+            "Emulsifiers & Stabilizers", "Other Additives",
+        }
+        if not (flagged_cats & additive_cats) and not _has_vague_terms(ingredients_text):
+            cat_additions["Natural Preservation"] = (
+                cat_additions.get("Natural Preservation", 0) + 0.6
+            )
+            breakdown["additions"].append({
+                "category": "Natural Preservation",
+                "attribute": "clean label — no artificial preservatives, colours or flavour enhancers",
+                "points": 0.6,
+            })
+
+        # Short ingredient list (<=5 items) indicates minimal processing.
+        if len(ingredients_list) <= 5:
+            cat_additions["Whole-Food"] = cat_additions.get("Whole-Food", 0) + 0.6
+            breakdown["additions"].append({
+                "category": "Whole-Food",
+                "attribute": f"short ingredient list ({len(ingredients_list)} items)",
+                "points": 0.6,
+            })
 
     # 3. Apply category caps (to the combined ingredient + nutrition penalty per category)
     ingredient_penalties_total = 0
@@ -1492,23 +1946,34 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         })
     breakdown["category_totals"] = category_totals
 
+    # 3b. Apply the positive category caps (spec 2.4, second table). Previously
+    #     additions were summed uncapped, so a product listing many minor "good"
+    #     ingredients could inflate its score past what the spec allows.
+    nutrient_bonuses_total = 0
+    addition_totals = []
+    for cat, total_add in cat_additions.items():
+        cap = scoring_rules_dict["addition_caps"].get(cat, float('inf'))
+        actual_add = min(total_add, cap)
+        nutrient_bonuses_total += actual_add
+        addition_totals.append({
+            "category": cat,
+            "raw_addition": round(total_add, 2),
+            "cap": (cap if cap != float('inf') else None),
+            "applied_addition": round(actual_add, 2),
+            "capped": total_add > cap,
+        })
+    breakdown["addition_totals"] = addition_totals
+
     score = base_score - ingredient_penalties_total + nutrient_bonuses_total
-        
+
+
     # 4. Apply transparency multiplier
     #    - Vague catch-all terms ("flavouring", "permitted emulsifier", ...) -> 0.95
     #    - Full disclosure of additives (named INS/E numbers, no vague terms) -> 1.05
     #    - No ingredient list / nothing special                              -> 1.0
     trans_mult = scoring_rules_dict["transparency_multiplier"]["default"]
     ing_lower = ingredients_text.lower()
-    vague_terms = [
-        "flavouring", "flavoring", "flavour", "flavor",
-        "permitted emulsifier", "permitted colour", "permitted color",
-        "permitted", "edible vegetable oil", "vegetable fat",
-        "spices", "condiments", "raising agent", "anticaking",
-        "artificial colour", "artificial color",
-        "artificial flavour", "artificial flavor",
-    ]
-    has_vague = any(v in ing_lower for v in vague_terms)
+    has_vague = _has_vague_terms(ingredients_text)
     # Explicit additive disclosure, e.g. "ins 471", "e322", "(442, 476)"
     has_additive_codes = bool(
         re.search(r"\b(?:ins|e)\s?\d{3}", ing_lower)
@@ -1534,6 +1999,35 @@ def calculate_health_score_v2(product: dict, version: int = 1,
     breakdown["preferences_applied"] = {
         k: v for k, v in (preferences or {}).items() if v
     }
+
+    # Which nutrients the label never disclosed, so the client can render "not
+    # disclosed" instead of letting an absent value look like a clean result.
+    # `scoring_basis` documents which side of the per-100g / per-serving split
+    # each nutrient was judged on.
+    breakdown["undisclosed_nutrients"] = sorted(set(undisclosed))
+    breakdown["data_complete"] = not undisclosed
+    breakdown["scoring_basis"] = {
+        "sugar": "per_100g",
+        "saturated_fat": "per_100g",
+        "sodium": "per_serving",
+        "protein": "per_100g",
+        "fiber": "per_100g",
+    }
+
+    # How much of the score is actually evidence-based. Sugar, saturated fat and
+    # sodium are what drive the penalties; with none of them disclosed the result
+    # is just the untouched 5.0 base, which would otherwise be presented as a
+    # confident "C" — indistinguishable from a genuinely average product that we
+    # did measure. Callers must be able to tell those two cases apart.
+    driving = ("sugar", "saturated_fat", "sodium")
+    missing_driving = [n for n in driving if n in undisclosed]
+    if not missing_driving:
+        breakdown["score_confidence"] = "high"
+    elif len(missing_driving) < len(driving):
+        breakdown["score_confidence"] = "partial"
+    else:
+        breakdown["score_confidence"] = "insufficient"
+    breakdown["insufficient_data"] = breakdown["score_confidence"] == "insufficient"
     
     if final_score >= 9:
         grade = "A"
@@ -1545,6 +2039,11 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         grade = "D"
     else:
         grade = "F"
+
+    # With nothing disclosed there is no evidence for a letter grade. Emitting "C"
+    # here would assert the product is average when we simply have no data on it.
+    if breakdown["insufficient_data"]:
+        grade = "?"
 
     return final_score, grade, version, breakdown
 
@@ -2533,6 +3032,11 @@ SEARCH_COLUMNS = (
     "protein_g_per_serving, fiber_g_per_serving"
 )
 
+# Upper bound on ``/search?limit=``. The curated catalogue is ~250 products, so
+# 500 lets a client fetch the whole thing in one call while still refusing an
+# unbounded scan.
+SEARCH_MAX_LIMIT = 500
+
 
 @app.get("/search")
 def search_products(
@@ -2543,8 +3047,9 @@ def search_products(
     max_score: Optional[float] = None,
     grade: Optional[str] = None,
     sort: str = "score_desc",
-    limit: int = 10,
+    limit: int = 50,
     offset: int = 0,
+    meta: bool = False,
 ):
     """Search the product catalogue by name/brand text, with optional filtering.
 
@@ -2556,9 +3061,14 @@ def search_products(
     - ``min_score`` / ``max_score`` / ``grade``: filter on the computed health
       score / letter grade (applied after scoring).
     - ``sort``: ``score_desc`` (default, healthiest first), ``score_asc`` or ``name``.
-    - ``limit``: 1-50 results per page (default 10).
+    - ``limit``: 1-500 results per page (default 50). The old default of 10 and
+      hard cap of 50 meant a client that did not paginate could never show the
+      full curated catalogue — it silently displayed the first page only.
     - ``offset``: number of ranked results to skip for pagination (default 0);
-      e.g. ``?limit=10&offset=10`` returns the second page.
+      e.g. ``?limit=50&offset=50`` returns the second page.
+    - ``meta``: when true, return ``{"total", "count", "limit", "offset",
+      "has_more", "results"}`` instead of a bare array, so a client can tell the
+      difference between "this is everything" and "this is page 1 of 6".
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -2593,7 +3103,7 @@ def search_products(
             })
         return results
 
-    limit = max(1, min(limit, 50))
+    limit = max(1, min(limit, SEARCH_MAX_LIMIT))
     offset = max(0, offset)
 
     # Build the text/brand/category WHERE clause dynamically so any subset of
@@ -2647,7 +3157,18 @@ def search_products(
         results.sort(key=lambda x: (-x["score"], (x["name"] or "").lower()))
 
     # Paginate the ranked result set: skip ``offset`` then take ``limit`` (Task 1B).
-    return results[offset:offset + limit]
+    total = len(results)
+    page = results[offset:offset + limit]
+    if meta:
+        return {
+            "total": total,
+            "count": len(page),
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < total,
+            "results": page,
+        }
+    return page
 
 # ==============================================================================
 # AI Nutritionist Chatbot (/chat)
@@ -2674,7 +3195,35 @@ NUTRITIONIST_SYSTEM_PROMPT = (
     "base your alternatives on it. Be honest about health concerns but never "
     "alarmist. For medical questions (diabetes, blood pressure, allergies, "
     "pregnancy) give general guidance and remind the user to consult a doctor or "
-    "dietitian. Keep answers concise (under ~150 words) unless the user asks for detail."
+    "dietitian.\n"
+    "\n"
+    "LENGTH — the user is waiting on a slow free-tier model, so every extra token "
+    "is latency they feel. Answer in **under 80 words** unless they explicitly ask "
+    "for more detail. Write short plain sentences or at most 3 short bullets. Do "
+    "not use markdown tables, do not restate the question, and do not add a "
+    "closing summary — a table of penalties costs several seconds of generation "
+    "to say what one sentence conveys.\n"
+    "\n"
+    "STAYING ON TOPIC — this matters as much as being accurate:\n"
+    "- PRODUCT CONTEXT is background, not the subject. The app attaches whatever "
+    "product the user last scanned to every message, so it is often irrelevant to "
+    "what they actually asked. Only discuss that product when the question is "
+    "genuinely about it (or about food/nutrition it can illustrate). Never answer "
+    "an unrelated question by talking about the attached product's score — if "
+    "someone asks whether they can buy things here, do not start explaining a "
+    "cola's rating.\n"
+    "- You cover food, drink, ingredients, nutrition, food labelling, and how "
+    "Swapify scores products. That is your scope.\n"
+    "- For anything outside it (general trivia, maths, coding, news, sport, "
+    "politics, personal advice), do not answer it even if you know the answer. "
+    "Say in one friendly sentence that you're Swapify's nutrition assistant and "
+    "can't help with that, then offer what you can do — check a product, explain a "
+    "score, or suggest a healthier swap. Keep the whole reply to about 40 words. "
+    "Do not lecture the user and do not pad it with a nutrition fact they didn't "
+    "ask for.\n"
+    "- Swapify does not sell anything: it is a scanner and comparison tool, not a "
+    "shop. There is no cart, checkout, delivery or pricing. Say so plainly if "
+    "asked."
 )
 
 
@@ -2683,19 +3232,43 @@ NUTRITIONIST_SYSTEM_PROMPT = (
 # instead of guessing at the methodology.
 SCORING_METHODOLOGY = (
     "SCORING METHODOLOGY (how Swapify computes the 1-10 health score):\n"
-    "- Every product starts at a base score of 5.0.\n"
-    "- Nutrient penalties (per serving): sugar >=10g -2 (>=5g -1); sodium >=400mg "
-    "-2 (>=200mg -1); saturated fat is penalised on a sliding scale up to -2.\n"
-    "- Nutrient bonuses: protein >=8g +1; fiber >=5g +1.\n"
-    "- Ingredient penalties: harmful ingredients (e.g. palm oil, refined sugar, "
-    "TBHQ, artificial colours) subtract points, multiplied by position (x1.5 if in "
-    "the first 3 ingredients, x0.5 if in trace amounts). Beneficial ingredients add "
-    "a little back.\n"
-    "- Category caps limit how much any single ingredient category can subtract.\n"
-    "- A transparency multiplier rewards full additive disclosure (x1.05) and "
-    "penalises vague catch-all terms like 'edible vegetable oil' (x0.95).\n"
+    "- Every product starts at a neutral base of 5.0 — a 10 has to be earned, it "
+    "is not the default.\n"
+    "- Nutrient penalties. Sugar and saturated fat are judged PER 100g, so pack "
+    "size never changes the score: sugar >=10g/100g -2 (>=5g/100g -1); saturated "
+    "fat on a sliding scale -0.5 (3-6g/100g) to -2.0 (>=20g/100g). Sodium is "
+    "judged PER SERVING as a share of the 2000mg daily value: >30% (>600mg) -1.0, "
+    "15-30% (300-600mg) -0.6.\n"
+    "- Nutrient bonuses (per 100g): protein >=10g +0.6; fiber >=5g +0.5; sugar "
+    "<5g +0.5.\n"
+    "- A nutrient the label never disclosed is scored as UNKNOWN, not as zero: it "
+    "earns no penalty and no bonus, and is listed under undisclosed_nutrients. "
+    "Never tell the user an undisclosed nutrient is 0.\n"
+    "- Ingredient deductions: flagged ingredients subtract points — e.g. "
+    "partially hydrogenated oil/vanaspati -1.2, potassium bromate -1.2, sodium "
+    "nitrite -1.2, BHA -1.0, high-fructose corn syrup -1.0, TBHQ -0.8, refined "
+    "sugar -0.8, titanium dioxide -0.7, tartrazine -0.7, palm oil -0.6, MSG -0.5, "
+    "maida -0.5.\n"
+    "- Ingredient additions: beneficial ingredients add points — e.g. whey "
+    "protein +0.8, pea/soy protein +0.7, whole grains/oats +0.7, no added sugar "
+    "+0.7, oat bran +0.6, milk solids +0.5, named probiotic strains +0.5, "
+    "cold-pressed oils +0.5, nuts & seeds +0.4, jaggery +0.4.\n"
+    "- Position multiplier (FSSAI lists ingredients by descending weight): x1.5 "
+    "for the top 3 ingredients, x1.0 for 4th-8th, x0.5 from 9th onward.\n"
+    "- Category caps limit both sides, so no single category dominates: "
+    "deductions cap at -2.5 (oils, sugars), -2.0 (preservatives, colours, sodium, "
+    "stimulants), -1.5 (flavour enhancers, emulsifiers, other additives), -1.0 "
+    "(refined carbs); additions cap at +2.0 (protein), +1.5 (fiber), +1.0 (healthy "
+    "fats, natural sweeteners, clean label, micronutrients, whole-food), +0.75 "
+    "(probiotics).\n"
+    "- A transparency multiplier is applied last: x1.05 for full additive "
+    "disclosure, x0.95 for vague catch-all terms like 'edible vegetable oil', "
+    "'permitted colour' or 'spices'.\n"
     "- The result is clamped to 1-10 and graded A (>=9), B (>=7), C (>=5), D (>=3), "
-    "F (<3). A personalized score also re-weights nutrients the user cares about."
+    "F (<3). A personalized score also re-weights nutrients the user cares about.\n"
+    "- IMPORTANT: most catalogue products currently have no ingredient list on "
+    "file, so their score comes from nutrition data alone. If a product has no "
+    "ingredients listed, say so rather than inventing ingredient reasons."
 )
 
 
@@ -2991,7 +3564,39 @@ class OpenRouterDailyLimit(LLMError):
     OpenRouter entirely (and let the caller fail over to another provider)."""
 
 
-def _call_openrouter_model(model: str, question: str, context: str) -> str:
+class ModelUnavailable(LLMError):
+    """The request itself is permanently wrong for this model — the slug no
+    longer exists (404), the key is rejected (401/403), or the payload is
+    malformed (400). Retrying is guaranteed to fail again, so move to the next
+    model immediately.
+
+    This is not hypothetical: free model slugs get retired. `openai/gpt-oss-120b:free`
+    started returning 404 ("unavailable for free"), and because the old code
+    treated every non-429 error as transient, every single /chat request burned
+    two full round trips plus a backoff sleep on a model that could never answer
+    before failing over to one that could."""
+
+
+class _Budget:
+    """Shared countdown for one /chat request (see CHAT_BUDGET_S).
+
+    ``remaining()`` is what each provider call gets as its HTTP timeout, so the
+    whole failover chain is bounded by a single wall-clock ceiling rather than by
+    the sum of every per-call timeout.
+    """
+
+    def __init__(self, seconds: float):
+        self.deadline = time.monotonic() + seconds
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - time.monotonic())
+
+    def exhausted(self) -> bool:
+        return self.remaining() < CHAT_MIN_CALL_S
+
+
+def _call_openrouter_model(model: str, question: str, context: str,
+                           budget: "_Budget" = None) -> str:
     """Make a single OpenRouter Chat Completions request for one model.
 
     Raises OpenRouterDailyLimit on the account-wide cap, ModelRateLimited on a
@@ -3004,8 +3609,11 @@ def _call_openrouter_model(model: str, question: str, context: str) -> str:
             {"role": "user", "content": f"{context}\n\nUser question: {question}"},
         ],
         "temperature": 0.4,
-        "max_tokens": 700,
+        "max_tokens": LLM_MAX_TOKENS,
     }
+    timeout = OPENROUTER_TIMEOUT_S if budget is None else min(
+        OPENROUTER_TIMEOUT_S, budget.remaining()
+    )
     try:
         resp = requests.post(
             OPENROUTER_URL,
@@ -3017,7 +3625,7 @@ def _call_openrouter_model(model: str, question: str, context: str) -> str:
                 "HTTP-Referer": "https://swapify.app",
                 "X-Title": "Swapify Nutritionist",
             },
-            timeout=OPENROUTER_TIMEOUT_S,
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"OpenRouter request failed: {exc}")
@@ -3031,6 +3639,12 @@ def _call_openrouter_model(model: str, question: str, context: str) -> str:
                     f"OpenRouter free-models-per-day limit reached: {body}"
                 )
             raise ModelRateLimited(f"{model} rate-limited (429): {body}")
+        if resp.status_code in (400, 401, 403, 404):
+            # Permanently wrong for this model — retired slug, rejected key or
+            # bad payload. Retrying cannot help; skip straight to the next model.
+            raise ModelUnavailable(
+                f"{model} unavailable ({resp.status_code}): {body}"
+            )
         raise RuntimeError(f"OpenRouter API error {resp.status_code}: {body}")
 
     data = resp.json()
@@ -3045,12 +3659,13 @@ def _call_openrouter_model(model: str, question: str, context: str) -> str:
     return text
 
 
-def call_openrouter(question: str, context: str):
+def call_openrouter(question: str, context: str, budget: "_Budget" = None):
     """Try each configured OpenRouter model in order and return (text, model).
 
     A per-model 429 skips straight to the next model (no wasted retry); other
-    transient errors get one quick retry. The account-wide daily cap aborts
-    OpenRouter immediately. Raises RuntimeError only when every model failed.
+    transient errors get one quick retry, but only while ``budget`` allows —
+    burning the user's remaining wait on a second attempt at a model that just
+    failed is worse than falling through to the next provider.
     """
     if not OPENROUTER_API_KEY:
         raise RuntimeError("OPENROUTER_API_KEY is not configured")
@@ -3058,8 +3673,11 @@ def call_openrouter(question: str, context: str):
     errors = []
     for model in OPENROUTER_MODELS:
         for attempt in (1, 2):
+            if budget is not None and budget.exhausted():
+                errors.append("chat time budget exhausted")
+                raise RuntimeError("All OpenRouter models failed: " + " | ".join(errors))
             try:
-                answer = _call_openrouter_model(model, question, context)
+                answer = _call_openrouter_model(model, question, context, budget)
                 logger.info("OpenRouter answered via model=%s (attempt %d)", model, attempt)
                 return answer, model
             except OpenRouterDailyLimit:
@@ -3070,16 +3688,25 @@ def call_openrouter(question: str, context: str):
                 errors.append(str(exc))
                 logger.warning("OpenRouter model rate-limited: %s", exc)
                 break
+            except ModelUnavailable as exc:
+                # Permanent for this model — no retry, no backoff, next model now.
+                errors.append(str(exc))
+                logger.warning(
+                    "OpenRouter model unavailable (skipping without retry): %s", exc
+                )
+                break
             except RuntimeError as exc:
                 errors.append(f"{model} (attempt {attempt}): {exc}")
                 logger.warning("OpenRouter call failed: %s", errors[-1])
                 if attempt == 1:
+                    if budget is not None and budget.exhausted():
+                        break
                     time.sleep(0.4)  # brief backoff before the single retry
 
     raise RuntimeError("All OpenRouter models failed: " + " | ".join(errors))
 
 
-def _call_gemini(question: str, context: str) -> str:
+def _call_gemini(question: str, context: str, budget: "_Budget" = None) -> str:
     """Make a single Google Gemini generateContent request. Raises
     ModelRateLimited on 429, RuntimeError on other failures."""
     payload = {
@@ -3087,15 +3714,18 @@ def _call_gemini(question: str, context: str) -> str:
         "contents": [
             {"role": "user", "parts": [{"text": f"{context}\n\nUser question: {question}"}]}
         ],
-        "generationConfig": {"temperature": 0.4, "maxOutputTokens": 700},
+        "generationConfig": {"temperature": 0.4, "maxOutputTokens": LLM_MAX_TOKENS},
     }
+    timeout = GEMINI_TIMEOUT_S if budget is None else min(
+        GEMINI_TIMEOUT_S, budget.remaining()
+    )
     try:
         resp = requests.post(
             GEMINI_URL,
             params={"key": GEMINI_API_KEY},
             json=payload,
             headers={"Content-Type": "application/json"},
-            timeout=GEMINI_TIMEOUT_S,
+            timeout=timeout,
         )
     except requests.RequestException as exc:
         raise RuntimeError(f"Gemini request failed: {exc}")
@@ -3115,14 +3745,17 @@ def _call_gemini(question: str, context: str) -> str:
     return text
 
 
-def call_gemini(question: str, context: str):
-    """Call Gemini with one quick retry; returns (text, model)."""
+def call_gemini(question: str, context: str, budget: "_Budget" = None):
+    """Call Gemini with one quick retry (budget permitting); returns (text, model)."""
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     errors = []
     for attempt in (1, 2):
+        if budget is not None and budget.exhausted():
+            errors.append("chat time budget exhausted")
+            break
         try:
-            answer = _call_gemini(question, context)
+            answer = _call_gemini(question, context, budget)
             logger.info("Gemini answered via model=%s (attempt %d)", GEMINI_MODEL, attempt)
             return answer, GEMINI_MODEL
         except ModelRateLimited as exc:
@@ -3133,11 +3766,13 @@ def call_gemini(question: str, context: str):
             errors.append(f"attempt {attempt}: {exc}")
             logger.warning("Gemini call failed: %s", errors[-1])
             if attempt == 1:
+                if budget is not None and budget.exhausted():
+                    break
                 time.sleep(0.4)
     raise RuntimeError("Gemini failed: " + " | ".join(errors))
 
 
-def call_llm(question: str, context: str):
+def call_llm(question: str, context: str, budget: "_Budget" = None):
     """Get an AI answer from the first available provider, returning
     (text, provider, model).
 
@@ -3146,18 +3781,20 @@ def call_llm(question: str, context: str):
     another real AI provider rather than to the rule-based answer. Raises
     RuntimeError only when every configured provider fails.
     """
+    if budget is None:
+        budget = _Budget(CHAT_BUDGET_S)
     errors = []
     if OPENROUTER_API_KEY:
         try:
-            text, model = call_openrouter(question, context)
+            text, model = call_openrouter(question, context, budget)
             return text, "openrouter", model
         except OpenRouterDailyLimit as exc:
             errors.append(f"openrouter daily cap: {exc}")
         except RuntimeError as exc:
             errors.append(f"openrouter: {exc}")
-    if GEMINI_API_KEY:
+    if GEMINI_API_KEY and not budget.exhausted():
         try:
-            text, model = call_gemini(question, context)
+            text, model = call_gemini(question, context, budget)
             return text, "gemini", model
         except RuntimeError as exc:
             errors.append(f"gemini: {exc}")
@@ -3245,6 +3882,74 @@ GREETING_REPLY = (
 )
 
 
+# ------------------------------------------------------------------------------
+# Fast-path for questions about Swapify itself
+# ------------------------------------------------------------------------------
+# "Can we buy products from this website?" used to go straight to the LLM with the
+# currently-scanned product attached as context, so the model dutifully answered
+# by explaining that product's score — a reply about Coca-Cola to a question about
+# shopping. These are questions about the *app*, they have one correct answer, and
+# it doesn't depend on any product. Answering them here is both accurate and
+# instant.
+#
+# Single words are matched on word boundaries and multi-word phrases as plain
+# substrings. That distinction is load-bearing: a bare "in" match for "order"
+# fires on "in order to", "ship" fires inside "relationship", "cart" inside
+# "carton" and "deliver" inside "delivers 5g of protein" — all of which would
+# silently divert a real nutrition question into a canned shopping answer.
+APP_META_INTENTS = (
+    (
+        ("buy", "buying", "purchase", "shop", "checkout", "cart", "delivery",
+         "shipping", "sell", "sells", "sold", "payment", "ecommerce",
+         "place an order", "order from", "order online", "add to cart",
+         "pay for", "how much does it cost", "how much is it",
+         "what is the price", "what's the price"),
+        "Swapify isn't a shop — you can't buy or order products here, and we don't "
+        "sell anything. Swapify is an ingredient-transparency tool: you scan or "
+        "enter a packaged food's barcode and it shows you a 1-10 health score, "
+        "which ingredients are flagged and why, and healthier alternatives to look "
+        "for when you're actually shopping. Want me to check a product for you?",
+    ),
+    (
+        ("what is swapify", "what's swapify", "about swapify", "who are you",
+         "what does this app do", "what does this website do", "how does this work",
+         "how does swapify work", "what can this do", "what is this app",
+         "what is this website"),
+        "Swapify helps you understand what's really in packaged food. Scan or enter "
+        "a barcode and you'll get a 1-10 health score, a breakdown of which "
+        "ingredients pushed it up or down (sugars, palm oil, preservatives, "
+        "artificial colours, protein, fibre and so on), and healthier alternatives "
+        "in the same category. Ask me things like \"why did this score so low?\" or "
+        "\"what can I use instead of palm oil?\".",
+    ),
+    (
+        ("is it free", "free to use", "do i have to pay", "subscription",
+         "premium plan"),
+        "Swapify is free to use — scan a product, see its score and breakdown, and "
+        "browse healthier alternatives at no cost. Ask me about any packaged food "
+        "and I'll break down what's in it.",
+    ),
+)
+
+
+def _meta_keyword_hit(keyword: str, text: str) -> bool:
+    """Single words match on word boundaries, phrases as substrings."""
+    if " " in keyword:
+        return keyword in text
+    return re.search(r"\b" + re.escape(keyword) + r"\b", text) is not None
+
+
+def app_meta_fast_reply(question: str):
+    """Instant, correct answer for a question about Swapify itself, else None."""
+    text = (question or "").strip().lower()
+    if not text:
+        return None
+    for keywords, reply in APP_META_INTENTS:
+        if any(_meta_keyword_hit(kw, text) for kw in keywords):
+            return reply
+    return None
+
+
 def greeting_fast_reply(question: str, has_barcode: bool):
     """Return an instant canned reply for a pure greeting/smalltalk message, else
     None. Never fires when a product barcode is attached (that's a real product
@@ -3262,6 +3967,213 @@ def greeting_fast_reply(question: str, has_barcode: bool):
     if len(stripped) <= 24 and any(pat in stripped for pat in SMALLTALK_PATTERNS):
         return GREETING_REPLY
     return None
+
+
+# ------------------------------------------------------------------------------
+# Resolving a product the user *named* rather than scanned
+# ------------------------------------------------------------------------------
+# The chatbot only ever received product data when the client attached a barcode.
+# So "tell me about Frooti" arrived with no context at all and the LLM answered
+# from memory — inventing a nutrition panel for a product sitting in our own
+# database. Matching the name against the catalogue fixes the common case; when
+# nothing matches we say "scan the barcode" instead of guessing.
+
+# Words too common across the catalogue (or in English) to identify a product on
+# their own — "milk" must not resolve to the first milk product in the table.
+_PRODUCT_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "it", "of", "in", "on", "for", "and", "or", "to",
+    "with", "this", "that", "what", "whats", "why", "how", "can", "do", "does",
+    "i", "me", "my", "you", "about", "tell", "give", "show", "have", "has",
+    "healthy", "health", "good", "bad", "score", "nutrition", "nutritional",
+    "ingredients", "ingredient", "value", "values", "info", "information",
+    "much", "many", "there", "are", "was", "should", "eat", "drink", "buy",
+    "product", "products", "food", "sugar", "salt", "fat", "protein", "fiber",
+    "calories", "sodium", "please", "know", "want", "like", "any", "some",
+    "g", "mg", "kcal", "per", "serving", "100g",
+})
+
+_PRODUCT_INDEX_CACHE = {"built_at": 0.0, "entries": None, "idf": None}
+_PRODUCT_INDEX_TTL_S = 300.0
+
+
+def _tokenize_name(text: str):
+    return [t for t in re.split(r"[^a-z0-9]+", (text or "").lower()) if t]
+
+
+def _build_product_index():
+    """Build (and cache) a token index over product names for name resolution.
+
+    Tokens are weighted by inverse document frequency, so a distinctive brand
+    word ("frooti", "amul") carries the match while a token shared by dozens of
+    rows ("chocolate", "juice") cannot resolve a product on its own.
+    """
+    now = time.time()
+    cached = _PRODUCT_INDEX_CACHE
+    if cached["entries"] is not None and now - cached["built_at"] < _PRODUCT_INDEX_TTL_S:
+        return cached["entries"], cached["idf"]
+
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT barcode, product_name, brand FROM products"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    entries = []
+    doc_freq = {}
+    for row in rows:
+        tokens = set(_tokenize_name(row["product_name"])) | set(_tokenize_name(row["brand"]))
+        tokens = {t for t in tokens if t not in _PRODUCT_STOPWORDS and len(t) > 2}
+        if not tokens:
+            continue
+        entries.append({
+            "barcode": row["barcode"],
+            "product_name": row["product_name"],
+            "brand": row["brand"],
+            "tokens": tokens,
+        })
+        for t in tokens:
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+    total = max(len(entries), 1)
+    idf = {t: math.log(total / df) for t, df in doc_freq.items()}
+
+    cached.update({"built_at": now, "entries": entries, "idf": idf})
+    return entries, idf
+
+
+def find_product_in_question(question: str):
+    """Return the catalogue product the question names, or None.
+
+    Requires a genuinely distinctive token to match, so a generic question like
+    "is chocolate healthy?" resolves to nothing rather than to an arbitrary
+    chocolate bar.
+    """
+    q_tokens = set(_tokenize_name(question))
+    if not q_tokens:
+        return None
+    entries, idf = _build_product_index()
+    if not entries:
+        return None
+
+    # A token this rare in the catalogue identifies a specific product line.
+    distinctive = math.log(max(len(entries), 2) / 8.0)
+
+    best, best_score = None, 0.0
+    for entry in entries:
+        overlap = entry["tokens"] & q_tokens
+        if not overlap:
+            continue
+        if not any(idf.get(t, 0.0) >= distinctive for t in overlap):
+            # Only generic words matched ("milk", "chips") — not an identification.
+            continue
+        # Reward matching more of the product's name, so "amul chaas" beats "amul".
+        score = sum(idf.get(t, 0.0) for t in overlap) + 0.25 * len(overlap)
+        if score > best_score:
+            best, best_score = entry, score
+
+    return best["barcode"] if best else None
+
+
+# A question that is *about a product* — if we cannot identify which one, the
+# right answer is "scan it", never a guess from the model's memory.
+PRODUCT_QUESTION_PATTERNS = (
+    "is it healthy", "is this healthy", "how healthy", "nutrition", "nutritional",
+    "ingredients", "how much sugar", "how much salt", "how much sodium",
+    "calories", "what score", "score of", "rating of", "tell me about",
+    "what about", "is it good", "is it safe", "should i eat", "should i drink",
+)
+
+SCAN_PROMPT_REPLY = (
+    "I don't have that product in the Swapify database yet, so I can't give you "
+    "its real numbers — and I won't guess at them.\n\n"
+    "Scan the product's barcode with the Swapify scanner and I'll show you its "
+    "full nutrition panel, health score and flagged ingredients. If the scan "
+    "comes back empty, tap \"Report missing product\" and we'll add it."
+)
+
+
+# Questions answerable from stored figures alone. Deliberately excludes "why did
+# it score that", "is there a healthier option" and other reasoning/advice asks —
+# those genuinely need the model, and it has the breakdown to ground them.
+PRODUCT_FACT_PATTERNS = (
+    "nutrition", "nutritional", "ingredients", "ingredient",
+    "how much sugar", "how much salt", "how much sodium", "how much fat",
+    "how much protein", "how much fiber", "how many calories", "calorie",
+    "sugar content", "salt content", "fat content",
+    "tell me about", "what is the score", "what's the score", "score of",
+    "rating of", "details of", "info on", "information about",
+)
+
+_ADVICE_PATTERNS = (
+    "why", "healthier", "alternative", "instead of", "substitute", "swap",
+    "compare", "better than", "should i",
+)
+
+
+def is_product_fact_question(question: str) -> bool:
+    """True when the question wants stored figures, not reasoning or advice."""
+    text = (question or "").lower()
+    if any(pat in text for pat in _ADVICE_PATTERNS):
+        return False
+    return any(pat in text for pat in PRODUCT_FACT_PATTERNS)
+
+
+def product_answer_from_db(product: dict, matched_by_name: bool = False) -> str:
+    """Deterministic, DB-grounded answer about one product.
+
+    Used instead of the LLM for straightforward "what's in X / how does X score"
+    questions: it is accurate by construction, cannot hallucinate a nutrition
+    panel, and returns in milliseconds rather than the ~25s a free-tier model
+    took to produce an invented one.
+    """
+    def fmt(v, unit=""):
+        return f"{v}{unit}" if v is not None else "not disclosed on the label"
+
+    name = product.get("product_name", "This product")
+    brand = product.get("brand")
+    serving = product.get("serving_size_g")
+    lines = [
+        f"**{name}**" + (f" ({brand})" if brand else ""),
+        f"Swapify score: {product.get('score')}/10 (grade {product.get('grade')})",
+        "",
+        f"Per {fmt(serving, 'g')} serving:",
+        f"- Sugar: {fmt(product.get('sugar_g_per_serving'), 'g')}",
+        f"- Saturated fat: {fmt(product.get('saturated_fat_g_per_serving'), 'g')}",
+        f"- Sodium: {fmt(product.get('sodium_mg_per_serving'), 'mg')}",
+        f"- Protein: {fmt(product.get('protein_g_per_serving'), 'g')}",
+        f"- Fiber: {fmt(product.get('fiber_g_per_serving'), 'g')}",
+        f"- Calories: {fmt(product.get('calories_kcal_per_serving'), 'kcal')}",
+    ]
+
+    penalties = (product.get("breakdown") or {}).get("nutrition_penalties") or []
+    if penalties:
+        bits = [
+            f"{p['nutrient'].replace('_', ' ')} {p.get('value')}"
+            f"{'g/100g' if p.get('basis') == 'per_100g' else ''} ({p['points']})"
+            for p in penalties
+        ]
+        lines += ["", "Main things pulling the score down: " + ", ".join(bits) + "."]
+
+    flags = product.get("ingredient_flags") or []
+    if flags:
+        named = ", ".join(f["name"] if isinstance(f, dict) else str(f) for f in flags[:4])
+        lines.append(f"Flagged ingredients: {named}.")
+
+    if product.get("undisclosed_nutrients"):
+        missing = ", ".join(n.replace("_", " ") for n in product["undisclosed_nutrients"])
+        lines += ["", f"Note: the label doesn't disclose {missing}, so those are "
+                      "excluded from the score rather than counted as zero."]
+
+    if matched_by_name:
+        # The match came from the words in the question, not a scan, so it can
+        # land on a different variant of the same brand. Say which product these
+        # figures describe rather than let them read as the one the user meant.
+        lines += ["", "_(Matched from your message. If you meant a different "
+                      "size or variant, scan its barcode for exact figures.)_"]
+
+    return "\n".join(lines)
 
 
 # ------------------------------------------------------------------------------
@@ -3306,14 +4218,27 @@ def _pick_category_from_question(question: str):
     return cat
 
 
+# Scoring the whole catalogue means reading and scoring ~250 rows; on a
+# "best chocolates" question that ran on every request, before the LLM call even
+# started. The generic (non-personalized) result is identical for every user, so
+# cache it briefly — a catalogue edit shows up within TTL, and the repeated cost
+# on the chat hot path disappears.
+_CATALOGUE_SCORE_CACHE = {}
+_CATALOGUE_SCORE_TTL_S = 300
+
+
 def _score_catalogue(category=None):
     """Score every product (optionally within ``category``); healthiest first.
 
     Returns a list of pick dicts, each carrying ``recommended`` = does it clear
     the 7+ rule. Reuses the same generic (non-personalized) scoring the Home page
     and product pages use, so a "top pick" here is identical to the score shown
-    everywhere else.
+    everywhere else. Results are cached for _CATALOGUE_SCORE_TTL_S seconds.
     """
+    cached = _CATALOGUE_SCORE_CACHE.get(category)
+    if cached and time.monotonic() - cached[0] < _CATALOGUE_SCORE_TTL_S:
+        return cached[1]
+
     conn = get_db_connection()
     cursor = conn.cursor()
     if category:
@@ -3342,6 +4267,7 @@ def _score_catalogue(category=None):
             "image_url": image_or_placeholder(p.get("image_url")),
         })
     scored.sort(key=lambda x: (-x["score"], (x["product_name"] or "").lower()))
+    _CATALOGUE_SCORE_CACHE[category] = (time.monotonic(), scored)
     return scored
 
 
@@ -3430,6 +4356,12 @@ def chat(req: ChatRequest):
     # Answer instantly, without touching any product data or the LLM, so a bare
     # "hi" returns in milliseconds instead of waiting out the provider chain.
     fast = greeting_fast_reply(req.question, bool(req.barcode))
+    if fast is None:
+        # Questions about Swapify itself ("can I buy from this website?") have one
+        # correct answer that does not depend on any product — and answering them
+        # from the LLM with a product attached is exactly what produced replies
+        # about a cola's score to a question about shopping.
+        fast = app_meta_fast_reply(req.question)
     if fast is not None:
         return {
             "response": fast,
@@ -3440,7 +4372,48 @@ def chat(req: ChatRequest):
             "ai_enabled": AI_ENABLED,
         }
 
+    budget = _Budget(CHAT_BUDGET_S)
     product = get_scored_product(req.barcode) if req.barcode else None
+
+    # No barcode attached? The user may still have named a product ("how much
+    # sugar is in Frooti?"). Resolve it from the catalogue so the answer comes
+    # from our data instead of the model's memory.
+    resolved_by_name = False
+    if product is None:
+        named_barcode = find_product_in_question(req.question)
+        if named_barcode:
+            product = get_scored_product(named_barcode)
+            resolved_by_name = product is not None
+
+    # A product question we could not pin to a catalogue row. Answering it from
+    # the LLM is exactly how the bot came to invent Frooti's nutrition panel, so
+    # send the user to the scanner instead — instantly, and without an LLM call.
+    if product is None:
+        q_lower = (req.question or "").lower()
+        if any(pat in q_lower for pat in PRODUCT_QUESTION_PATTERNS):
+            return {
+                "response": SCAN_PROMPT_REPLY,
+                "barcode": None,
+                "product_found": False,
+                "source": "scan-prompt",
+                "model": None,
+                "ai_enabled": AI_ENABLED,
+            }
+
+    # A factual question about a product we *do* have is answered straight from
+    # the database: accurate by construction and ~instant, versus a free-tier
+    # model taking tens of seconds to paraphrase (or invent) the same figures.
+    if product is not None and is_product_fact_question(req.question):
+        return {
+            "response": product_answer_from_db(product, matched_by_name=resolved_by_name),
+            "barcode": product.get("barcode"),
+            "product_found": True,
+            "resolved_by_name": resolved_by_name,
+            "source": "database",
+            "model": None,
+            "ai_enabled": AI_ENABLED,
+        }
+
     context = build_product_context(product)
 
     # Detect "what can I use instead of X?" style questions and ground the
@@ -3465,7 +4438,7 @@ def chat(req: ChatRequest):
     model = None
     fallback_reason = None
     try:
-        answer, provider, model = call_llm(req.question, context)
+        answer, provider, model = call_llm(req.question, context, budget)
         used_ai = True
     except RuntimeError as exc:
         # Every AI provider failed (e.g. all free models rate-limited and no
