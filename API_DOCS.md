@@ -685,12 +685,29 @@ searches return the shape below.
   - `min_score` / `max_score`: keep only products within this health-score range.
   - `grade`: keep only products with this letter grade (`A`–`F`).
   - `sort`: `score_desc` (default, healthiest first), `score_asc`, or `name`.
-  - `limit`: 1–50 results per page (default 10).
+  - `limit`: 1–500 results per page (**default 50**).
   - `offset`: number of ranked results to skip, for pagination (default 0).
+  - `meta`: when `true`, return a pagination envelope instead of a bare array.
+
+> **Changed:** `limit` used to default to 10 and was hard-capped at 50, so a
+> client that did not paginate could only ever display the first 10 of the ~250
+> curated products — which looked like "most products are missing" even though
+> the catalogue was complete. The default is now 50 and the cap is 500, so
+> `?limit=300` returns the whole catalogue in one call. Use `meta=true` to tell
+> "this is everything" apart from "this is page 1".
 
 **Pagination:** results are scored, filtered and ranked, then the page is sliced
-as `results[offset : offset + limit]`. For example `?limit=10&offset=0` is page 1
-and `?limit=10&offset=10` is page 2. Each result includes an `image_url` — the
+as `results[offset : offset + limit]`. For example `?limit=50&offset=0` is page 1
+and `?limit=50&offset=50` is page 2.
+
+With `?meta=true` the response is an object instead of an array:
+
+```json
+{ "total": 252, "count": 50, "limit": 50, "offset": 0, "has_more": true,
+  "results": [ ... ] }
+```
+
+Each result includes an `image_url` — the
 product's own uploaded image, or the shared placeholder
 (`/product-images/_placeholder.svg`) when it has none (see
 [Product Images](#28-product-image-upload-api)).
@@ -703,8 +720,14 @@ curl "http://127.0.0.1:8000/search?q=lays"
 # Filter: grade-A products in the "chips" category, cheapest-scoring first
 curl "http://127.0.0.1:8000/search?category=chips&min_score=3&sort=score_desc&limit=5"
 
-# Pagination — second page of 10
-curl "http://127.0.0.1:8000/search?q=&sort=name&limit=10&offset=10"
+# Pagination — second page of 50
+curl "http://127.0.0.1:8000/search?q=&sort=name&limit=50&offset=50"
+
+# The entire curated catalogue in one call
+curl "http://127.0.0.1:8000/search?limit=300"
+
+# With pagination metadata
+curl "http://127.0.0.1:8000/search?meta=true&limit=50"
 ```
 
 **Expected JSON Response (200 OK):**
@@ -857,12 +880,118 @@ context.
 A bare greeting or smalltalk message (`"hi"`, `"hello"`, `"thanks"`, `"how are
 you"`, …) with no barcode is answered **instantly from a canned welcome — the LLM
 is never called**. This is what keeps a one-word "hi" at a few **milliseconds**
-instead of the multi-second (previously ~25s) round-trip a free-tier model + its
-failover chain would otherwise cost. Such a response has `source: "fast-path"`.
-The match is conservative: anything beyond a plain greeting (e.g. *"hi, is Maggi
-healthy?"*) still goes to the AI. Provider HTTP timeouts are also lowered and
-configurable (`OPENROUTER_TIMEOUT` / `GEMINI_TIMEOUT`, default 12s) so a slow
-model fails over sooner.
+instead of the multi-second round-trip a free-tier model + its failover chain
+would otherwise cost. Such a response has `source: "fast-path"`. The match is
+conservative: anything beyond a plain greeting (e.g. *"hi, is Maggi healthy?"*)
+still goes to the AI.
+
+#### App / commerce fast-path (scope)
+Questions about **Swapify itself** — *"can we buy products from this website?"*,
+*"is there delivery?"*, *"what is Swapify?"*, *"is it free?"* — are answered
+instantly with a correct canned reply (`source: "fast-path"`), because they have
+one right answer that does not depend on any product.
+
+This fixes a real misbehaviour: the client attaches the last-scanned barcode to
+**every** message, and the system prompt instructed the model to ground every
+claim in that product — so *"can we buy products from this website?"* was
+answered with an explanation of the attached cola's health score. Swapify is a
+scanner and comparison tool, **not a shop**: there is no cart, checkout, delivery
+or pricing.
+
+Matching uses word boundaries for single keywords and substrings for phrases, so
+a genuine nutrition question is not diverted — *"what's the relationship between
+sugar and diabetes?"* (contains "ship"), *"in order to lose weight…"* (contains
+"order"), *"how many cartons of juice?"* (contains "cart") and *"this delivers 5g
+of protein"* (contains "deliver") all still reach the LLM.
+
+#### Scope guardrail (out-of-scope questions)
+The system prompt now enforces a scope boundary:
+- **Product context is background, not the subject.** The model is told to ignore
+  the attached product unless the question is genuinely about it, and explicitly
+  not to answer an unrelated question by discussing that product's score.
+- **In scope:** food, drink, ingredients, nutrition, food labelling, and how
+  Swapify scores products.
+- **Out of scope** (general trivia, maths, coding, news, sport, politics): the
+  model declines in one friendly sentence — *even when it knows the answer* — and
+  offers what it can do instead, in ~40 words, without padding the reply with an
+  unrequested nutrition fact.
+
+#### Latency budget
+`/chat` is bounded by a **single wall-clock budget** (`CHAT_BUDGET`, default
+**12s**) shared across the entire provider failover chain, not just per-call
+timeouts. Each provider call receives `min(its timeout, budget remaining)` as its
+HTTP timeout, and a retry or a further provider is only attempted when enough
+budget remains to be worth it.
+
+Without this ceiling the chain could stack to roughly **48s** (2 OpenRouter
+models x 2 attempts x 12s, plus Gemini x 2) — which is what produced the observed
+15–20s+ replies. Beyond the budget, `/chat` degrades to the deterministic
+food-science answer (`source: "fallback"`) rather than making the user wait.
+
+Tunable via environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CHAT_BUDGET` | `12` | Whole-endpoint wall-clock ceiling, in seconds |
+| `OPENROUTER_TIMEOUT` | `8` | Per-call OpenRouter HTTP timeout (was 12) |
+| `GEMINI_TIMEOUT` | `8` | Per-call Gemini HTTP timeout (was 12) |
+| `LLM_MAX_TOKENS` | `400` | Reply cap (was 700; the prompt asks for <=150 words, and unused tokens are pure latency) |
+
+The scored-catalogue lookup behind **top picks** is also cached for 300s, so a
+*"best chocolates"* question no longer re-scores ~250 products on every request
+before the LLM call even begins.
+
+#### Retired model slugs — check this first when chat is slow
+Permanent provider errors (**400 / 401 / 403 / 404**) now skip to the next model
+**immediately, with no retry and no backoff**. Only transient failures (5xx,
+timeouts, connection errors) are retried.
+
+This was a live latency bug, not a hypothetical. Free model slugs get retired
+without notice, and the configured primary `openai/gpt-oss-120b:free` had started
+returning **404** ("unavailable for free"). Because the old code treated every
+non-429 error as transient, **every single `/chat` request** burned two full
+round trips plus a 0.4s backoff on a model that could never answer, before
+failing over to one that could.
+
+Probe results (2026-07-19) for the models that were configured:
+
+| Model | Status |
+|---|---|
+| `openai/gpt-oss-20b:free` | **200 — working**, now the primary |
+| `google/gemma-4-31b-it:free` | 429 rate-limited — kept as fallback |
+| `openai/gpt-oss-120b:free` | **404 retired** — was the default |
+| `meta-llama/llama-3.3-70b-instruct:free` | **404 retired** |
+| `qwen/qwen3-next-80b-a3b-instruct:free` | **404 retired** |
+
+The model chain is now pinned in `render.yaml` rather than left to dashboard
+values, so a retired slug is visible in git. **If `/chat` latency regresses,
+re-probe the configured slugs before tuning anything else** — a dead primary is
+the cheapest cause to rule out:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST https://openrouter.ai/api/v1/chat/completions \
+  -H "Authorization: Bearer $OPENROUTER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"openai/gpt-oss-20b:free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
+```
+
+#### Remaining latency is provider-side, not code
+With the structural waste removed, what is left is **free-tier queue time, which
+no code change fixes**. Six identical requests to the same model with the same
+token cap, measured 2026-07-19:
+
+```
+1825 ms · 3692 ms · 6094 ms · 6312 ms · 6699 ms · 15225 ms
+```
+
+An 8x spread on an identical request. Typical `/chat` round-trips now land
+around **5–14s**, against a measured floor of ~1.5–2s (network + time-to-first-
+token) — so the tail is the provider queueing, not Swapify.
+
+Two things would actually move it, both outside this endpoint's current design:
+1. **Stream the response** (SSE). The user would see the first words in ~1.5–2s
+   instead of waiting for the whole reply. This is by far the biggest
+   *perceived*-latency win, and needs a matching frontend change.
+2. **A paid model tier**, which removes the free-tier queue entirely.
 
 #### Structured top picks (7+ rule)
 When the question asks for the best/top/healthiest products (*"what are the top
@@ -2697,53 +2826,108 @@ Final Score = (5.0 - Negative Deductions + Positive Additions) x Transparency Mu
 
 The result is clamped to the range **1.0 – 10.0**.
 
-### 1. Nutrient Penalties & Bonuses (per serving)
-- **Sugar:** >=10g (-2), 5-10g (-1)
-- **Sodium:** >=400mg (-2), 200-400mg (-1)
-- **Saturated Fat:** >=20g (-2), 6-10g (-2), 10-20g (-1), 0-6g (-1)
-- **Protein:** >=8g (+1)
-- **Fiber:** >=5g (+1)
+> **Source of truth:** this implements `ScoringLogic_Swapify.md` (Chandrika's
+> spec). Section numbers below map to that document. It supersedes the
+> 24th-June review numbers — see [What changed](#what-changed-vs-the-june-engine).
 
-Sugar, saturated-fat and sodium nutrient penalties are pooled into the same
-categories as ingredients (Sugars & Sweeteners, Oils & Fats, Sodium) and share
-their caps (see step 3).
+### 1. Nutrient Penalties & Bonuses
 
-### 2. Ingredient Penalties & Position Multipliers
-Each ingredient keyword is penalized (or rewarded) and multiplied by its position
-in the list:
+**Penalties (per serving):**
+- **Sugar:** >=10g (-2), 5–10g (-1)
+- **Sodium** (spec §3.7, % of the 2000mg daily value): >30% RDA / >600mg (-1.0),
+  15–30% RDA / 300–600mg (-0.6)
+- **Saturated Fat** (monotonic sliding scale): >=20g (-2.0), 10–20g (-1.5),
+  6–10g (-1.0), 3–6g (-0.5)
+
+**Bonuses (per 100g — the "bonus, stacks" rows in spec §4.1 / §4.2 / §4.4):**
+- **Protein:** >=10g (+0.6)
+- **Fiber:** >=5g (+0.5)
+- **Sugar:** <5g (+0.5)
+
+Per-serving figures are normalised to per-100g using `serving_size_g`; products
+without a serving size are skipped rather than guessed at.
+
+Nutrient penalties and bonuses are pooled into the same categories as
+ingredients (Sugars & Sweeteners, Oils & Fats, Sodium, Protein Quality, Fiber,
+Natural Sweeteners) and share their caps (see step 3).
+
+### 2. Ingredient Deductions & Additions
+
+Each matched ingredient is multiplied by its position in the list (spec §2.3 —
+FSSAI requires descending order by weight, so position proxies quantity):
 - **Top 3 ingredients:** x1.5
 - **Middle (4th–8th):** x1.0
 - **9th onward / trace (index >= 8):** x0.5
 
-**Ingredient penalties (base, before multiplier):**
-- **Oils & Fats:** palm oil (-0.6), fractionated fat (-0.7)
-- **Refined Carbohydrates:** maida / refined wheat flour (-0.5)
-- **Sodium:** salt (-0.6)
-- **Flavor Enhancers:** msg (-0.5)
-- **Preservatives:** tbhq (-0.8), sodium benzoate (-0.6)
-- **Artificial Colors:** tartrazine (-0.7)
-- **Sugars & Sweeteners:** sugar (-0.8), corn syrup (-0.6)
+**Matching is longest-keyword-first**, so the most specific rule wins: "invert
+sugar syrup" (-0.6) beats "sugar" (-0.8), and "rice bran oil" (a healthy fat,
++0.4) beats "rice bran" (fiber, +0.6). Short keywords (<=4 chars, e.g. `msg`,
+`bha`, `e102`) match on word boundaries so they cannot fire inside an unrelated
+word.
 
-**Positive additions (base, before multiplier):**
-- **Healthy Fats:** peanuts (+0.4)
-- **Protein Quality:** skimmed milk (+0.5), milk solids (+0.5)
+**Negative ingredients (spec §3.1–3.10)** — base points before multiplier:
+
+| Category | Examples (base deduction) |
+|---|---|
+| Oils & Fats | partially hydrogenated / vanaspati (-1.2), reused frying oil (-1.0), interesterified (-0.7), fractionated fat (-0.7), palm oil / palmolein (-0.6), cottonseed oil (-0.3) |
+| Sugars & Sweeteners | HFCS (-1.0), refined sugar (-0.8), corn syrup (-0.6), invert sugar syrup (-0.6), aspartame (-0.6), acesulfame-K (-0.4), maltodextrin (-0.4), sucralose (-0.3) |
+| Preservatives | sodium nitrite/nitrate (-1.2), BHA (-1.0), TBHQ (-0.8), sulphites (-0.6), sodium benzoate (-0.6), BHT (-0.5), potassium sorbate (-0.2) |
+| Artificial Colors | tartrazine (-0.7), sunset yellow (-0.7), carmoisine (-0.6), allura red (-0.6), erythrosine (-0.5), caramel colour IV (-0.5) |
+| Flavor Enhancers | MSG / yeast extract (-0.5), disodium inosinate / guanylate (-0.3), unspecified artificial flavouring (-0.3) |
+| Emulsifiers & Stabilizers | polysorbate 80 (-0.5), carboxymethyl cellulose (-0.5), sodium stearoyl lactylate (-0.2) |
+| Sodium | disodium phosphate (-0.3) |
+| Refined Carbohydrates | maida / refined wheat flour (-0.5), modified starch (-0.3) |
+| Caffeine & Stimulants | caffeine (-0.6, escalating to -1.0 for `energy_drink`), taurine (-0.6) |
+| Other Additives | potassium bromate (-1.2), titanium dioxide (-0.7), propylene glycol (-0.3), undisclosed natural flavours (-0.2) |
+
+**Positive ingredients (spec §4.1–4.8)** — base points before multiplier:
+
+| Category | Examples (base addition) |
+|---|---|
+| Protein Quality | whey protein (+0.8), pea / soy protein isolate (+0.7), milk solids / paneer / curd (+0.5), lentil / chickpea / besan (+0.5), nuts & seeds (+0.4), egg (+0.4) |
+| Fiber | whole grain / oats / atta / millet (+0.7), oat or wheat bran (+0.6), psyllium husk (+0.4), inulin / chicory (+0.4) |
+| Healthy Fats & Oils | cold-pressed / virgin oils (+0.5), olive or rice-bran oil (+0.4), omega-3 source (+0.4) |
+| Natural Sweeteners | no added sugar (+0.7), jaggery / date paste / honey (+0.4), stevia (+0.3), monk fruit (+0.3) |
+| Natural Preservation | tocopherols (+0.3), rosemary extract (+0.3), clean-label bonus (+0.6, conditional — see below) |
+| Micronutrients | iron + folic acid (+0.4), vitamin D (+0.4), vitamin B12 (+0.3), calcium (+0.2), zinc (+0.2) |
+| Probiotics | named strain e.g. *Lactobacillus* (+0.5), live active cultures (+0.4), prebiotic fiber (+0.2) |
+| Whole-Food | short ingredient list, <=5 items (+0.6) |
+
+**Conditional clean-label bonus.** Spec §4.5 marks its "no artificial
+preservatives / colours / MSG" rows *(verified)*. Absence is only treated as
+verification when the label is specific: the +0.6 requires an ingredient list
+that (a) triggers no deduction in any additive category and (b) uses no vague
+catch-all terms. A label reading "permitted preservative" or "spices" earns
+nothing — it hides exactly the additives the bonus would be crediting its
+absence of. Products with **no** ingredient list never earn it.
 
 Detected harmful ingredients are returned in the `ingredient_flags` list.
 
-### 3. Category Caps (maximum deduction per category)
-Caps apply to the **combined** ingredient + nutrient penalty for each category:
-- Oils & Fats: -2.5
-- Sugars & Sweeteners: -2.5
-- Preservatives: -2.0
-- Artificial Colors: -2.0
-- Sodium: -2.0
-- Caffeine & Stimulants: -2.0
-- Flavor Enhancers: -1.5
-- Emulsifiers & Stabilizers: -1.5
-- Other Additives: -1.5
-- Refined Carbohydrates: -1.0
+### 3. Category Caps (spec §2.4)
 
-Positive additions are **not** capped.
+**Deduction caps** apply to the **combined** ingredient + nutrient penalty per category:
+
+| Category | Cap | Category | Cap |
+|---|---|---|---|
+| Oils & Fats | -2.5 | Flavor Enhancers | -1.5 |
+| Sugars & Sweeteners | -2.5 | Emulsifiers & Stabilizers | -1.5 |
+| Preservatives | -2.0 | Other Additives | -1.5 |
+| Artificial Colors | -2.0 | Refined Carbohydrates | -1.0 |
+| Sodium | -2.0 | Caffeine & Stimulants | -2.0 |
+
+**Addition caps** apply the same way to the positive side, so a product cannot
+inflate its score by listing many minor "good" ingredients:
+
+| Category | Cap | Category | Cap |
+|---|---|---|---|
+| Protein Quality | +2.0 | Natural Preservation | +1.0 |
+| Fiber | +1.5 | Micronutrients | +1.0 |
+| Healthy Fats & Oils | +1.0 | Whole-Food | +1.0 |
+| Natural Sweeteners | +1.0 | Probiotics | +0.75 |
+
+Both sides are reported in the score breakdown as `category_totals` (deductions)
+and `addition_totals` (additions), each with `raw`, `cap`, `applied` and
+`capped` fields.
 
 ### 4. Transparency Multiplier
 Applied to the subtotal before the final clamp:
@@ -2761,19 +2945,58 @@ The clamped score (1.0 – 10.0) maps to a grade:
 
 ### Worked example — Cadbury Dairy Milk (`7622300441937`)
 
+Ingredients: *Sugar, Milk Solids (23%), Cocoa Butter, Cocoa Solids, Fractionated
+Fat, Emulsifiers (442, 476), Flavours*
+
 | Source | Item | Position | Mult | Points |
 |--------|------|----------|------|--------|
 | Ingredient | Sugar | 1 | x1.5 | -1.20 |
 | Ingredient | Fractionated Fat | 5 | x1.0 | -0.70 |
-| Nutrient | Sugar (57g) | – | x1.0 | -2.00 |
-| Nutrient | Saturated Fat (19.6g) | – | x1.0 | -1.00 |
+| Nutrient | Sugar (57g/serving) | – | x1.0 | -2.00 |
+| Nutrient | Saturated Fat (19.6g/serving) | – | x1.0 | -1.50 |
 | Addition | Milk Solids | 2 | x1.5 | +0.75 |
 
 - Sugars & Sweeteners: -1.20 + -2.00 = -3.20 → capped at **-2.50**
-- Oils & Fats: -0.70 + -1.00 = **-1.70** (within cap)
-- Subtotal: 5.0 - 4.20 + 0.75 = **1.55**
+- Oils & Fats: -0.70 + -1.50 = **-2.20** (within the -2.5 cap)
+- Protein Quality: **+0.75** (within the +2.0 cap)
+- No clean-label bonus: "Flavours" is a vague term, and the label is not specific
+  enough to verify the absence of anything.
+- Subtotal: 5.0 - 4.70 + 0.75 = **1.05**
 - Transparency: **x0.95** ("Flavours" is vague)
-- **Final: 1.55 × 0.95 = 1.5 (F)**
+- **Final: 1.05 × 0.95 = 0.9975 → clamped to 1.0 (F)**
+
+### What changed vs. the June engine
+
+| Area | Before | Now |
+|---|---|---|
+| Ingredient rules | 14 keywords | **69 rules** covering all of spec §3.1–3.10 and §4.1–4.8 |
+| Positive caps | not applied — additions summed uncapped | spec §2.4 addition caps enforced |
+| Saturated fat | **non-monotonic**: 8g scored -2 but 15g scored -1 | monotonic sliding scale, -0.5 → -2.0 |
+| Sodium | ad-hoc mg cutoffs (>=400mg -2, >=200mg -1) | spec §3.7 %RDA bands |
+| Protein / fiber bonuses | per serving (>=8g +1, >=5g +1) | per 100g (>=10g +0.6, >=5g +0.5), plus <5g sugar +0.5 |
+| Matching | first rule in list order wins | longest-keyword-first; word boundaries for short codes |
+| Plain "salt" | -0.6 ingredient deduction | removed — sodium is scored from the %RDA bands instead, so it is no longer double-counted |
+
+Regression expectations updated accordingly in `test_scoring.py`: Snickers
+1.6 → **2.1** (peanuts are spec §4.1 "nuts & seeds" under the capped Protein
+Quality category rather than an uncapped "Healthy Fats" bonus, and 5.0g
+saturated fat now sits in the 3–6g band); Cadbury 1.5 → **1.0** (19.6g saturated
+fat now scores -1.5 on the corrected scale).
+
+**Two places the spec contradicts itself** — the normative tables were followed
+over the worked examples, and both are flagged for Chandrika:
+1. Example A applies x0.5 to positions 6–7, but table §2.3 defines 4th–8th as
+   x1.0. Following the table yields **1.0**, not the 1.4 printed in the example.
+2. Example B scores oats at +0.6, but §4.2 lists oats in the +0.7 whole-grain row.
+
+### Data coverage caveat
+
+**244 of the 252 curated products currently have no `ingredients_text`.** For
+those products the entire ingredient half of this engine is inert and the score
+comes from nutrition data alone — no ingredient deductions, no ingredient
+additions, no clean-label or whole-food bonuses, and a x1.0 transparency
+multiplier. Scores will shift once ingredient data is populated. `/product-count`
+and `/offline-products` can be used to audit coverage.
 
 ## Personalized Scoring
 
