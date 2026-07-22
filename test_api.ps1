@@ -128,6 +128,34 @@ function Invoke-Api {
     if ($Delay -gt 0) { Start-Sleep -Seconds $Delay }
 }
 
+# Admin request runner (Feature 3): like Invoke-Api but sends the X-Admin-Token
+# header instead of a bearer token.
+function Invoke-Admin {
+    param([string]$Method, [string]$Path, [string]$Data = $null,
+          [string]$AdminToken, [string]$Expect = '2')
+    $url = "$Base$Path"
+    Write-Host ">> $Method $url   [X-Admin-Token: <ADMIN_TOKEN>]" -ForegroundColor DarkGray
+    $headers = @{ 'X-Admin-Token' = $AdminToken }
+    $code = 0; $content = ''
+    try {
+        $params = @{ Uri = $url; Method = $Method; Headers = $headers; TimeoutSec = 60; UseBasicParsing = $true }
+        if ($Data) { $params['Body'] = $Data; $params['ContentType'] = 'application/json' }
+        $resp = Invoke-WebRequest @params
+        $code = [int]$resp.StatusCode; $content = $resp.Content
+    } catch {
+        $err = $_; $r = $err.Exception.Response
+        if ($r) { try { if ($r.StatusCode -is [System.Net.HttpStatusCode]) { $code = [int]$r.StatusCode } elseif ($null -ne $r.StatusCode.value__) { $code = [int]$r.StatusCode.value__ } } catch { $code = 0 } }
+        if ($err.ErrorDetails -and $err.ErrorDetails.Message) { $content = $err.ErrorDetails.Message } else { $content = $err.Exception.Message }
+    }
+    $col = 'Green'
+    if     ($code -ge 400 -and $code -lt 500) { $col = 'Yellow' }
+    elseif ($code -lt 200 -or  $code -ge 500) { $col = 'Red' }
+    Write-Host "HTTP $code" -ForegroundColor $col
+    Show-Json $content
+    if (("$code").StartsWith($Expect)) { $script:Pass++ } else { $script:Fail++ }
+    $script:LastBody = $content
+}
+
 # run a SQL query against swapify.db via python (no SQLite module needed).
 # The program is written to a temp .py file (ASCII, no BOM) and executed with
 # args — piping it via stdin would prepend a BOM that python rejects.
@@ -222,6 +250,45 @@ function Test-ImageUrl {
     }
 }
 
+# Tally a non-HTTP assertion (value equality) against the pass/fail counters.
+function Assert-Equal {
+    param([string]$Label, $Actual, $Expected)
+    if ("$Actual" -eq "$Expected") {
+        Write-Host "  PASS  $Label (got '$Actual')" -ForegroundColor Green
+        $script:Pass++
+    } else {
+        Write-Host "  FAIL  $Label (got '$Actual', expected '$Expected')" -ForegroundColor Red
+        $script:Fail++
+    }
+}
+
+# Number of items in the last response: a bare JSON array, or the `results`
+# array inside a ?meta=true envelope.
+function Get-ResultCount {
+    try { $o = $script:LastBody | ConvertFrom-Json } catch { return -1 }
+    if ($null -eq $o) { return -1 }
+    if ($o -is [System.Array]) { return $o.Count }
+    if ($o.PSObject.Properties.Name -contains 'results') { return @($o.results).Count }
+    return -1
+}
+
+# Assert the last /chat reply did not leak the attached product's context into an
+# answer that had nothing to do with that product.
+function Assert-NoProductLeak {
+    param([string]$Label)
+    try { $o = $script:LastBody | ConvertFrom-Json } catch { Write-Host "  FAIL  $Label (unparseable)" -ForegroundColor Red; $script:Fail++; return }
+    $r = ("" + $o.response).ToLower()
+    $leaked = @()
+    foreach ($w in @('coca', 'cola', 'score of', '/10')) { if ($r.Contains($w)) { $leaked += $w } }
+    if ($leaked.Count -gt 0) {
+        Write-Host "  FAIL  $Label - reply leaked product context: $($leaked -join ', ')" -ForegroundColor Red
+        $script:Fail++
+    } else {
+        Write-Host "  PASS  $Label - reply stays on topic" -ForegroundColor Green
+        $script:Pass++
+    }
+}
+
 # Generate throwaway test images: a valid 1x1 PNG, a text file with a .png name
 # (rejected on content), and a >2 MB file (rejected on size).
 function New-TestImages {
@@ -301,6 +368,7 @@ $Password = "Passw0rd!"
 
 # real barcodes present in swapify.db
 $BcUnhealthy = "8901491101837"   # Lay's Classic Salted
+$BcCola      = "8901058000532"   # Coca-Cola - the product that leaked into off-topic chat replies
 $BcHealthy   = "8908013479122"   # The Whole Truth protein bar
 $BcBar       = "8906127540016"   # Farmley Datebites (protein_bar -> has same-cat alternatives)
 $BcBar2      = "8904335602385"   # Yoga bar protein bar
@@ -410,6 +478,37 @@ try {
     Write-Section 23 "SEARCH  (GET /search?q=protein)"
     Invoke-Api GET "/search?q=protein" -Head 3
 
+    Write-Section "23a" "CATALOGUE COMPLETENESS  (GET /search?limit=300)  ->  every curated product"
+    Write-Host "# Regression guard: /search used to default to limit=10 and hard-cap at 50, so a" -ForegroundColor DarkGray
+    Write-Host "# client that did not paginate could only ever show the first page - which looked" -ForegroundColor DarkGray
+    Write-Host "# like 'most products are missing' even though the catalogue was complete." -ForegroundColor DarkGray
+    Invoke-Api GET "/product-count"
+    $curated = 0
+    try { $curated = ($script:LastBody | ConvertFrom-Json).curated_count } catch { $curated = -1 }
+    Invoke-Api GET "/search?limit=300" -Head 2
+    $searchAll = Get-ResultCount
+    Write-Host "curated_count = $curated   /search?limit=300 returned = $searchAll" -ForegroundColor Blue
+    Assert-Equal "/search?limit=300 returns the whole catalogue" $searchAll $curated
+
+    Invoke-Api GET "/search" -Head 2
+    $searchDef = Get-ResultCount
+    Write-Host "/search default page size = $searchDef  (expected 50, was 10)" -ForegroundColor Blue
+    Assert-Equal "/search default limit is 50" $searchDef 50
+
+    Write-Section "23b" "SEARCH PAGINATION METADATA  (GET /search?meta=true)  ->  total / has_more"
+    Write-Host "# meta=true returns an envelope so the client can tell 'this is everything' apart" -ForegroundColor DarkGray
+    Write-Host "# from 'this is page 1 of N'." -ForegroundColor DarkGray
+    Invoke-Api GET "/search?meta=true&limit=25" -Head 2
+    try {
+        $m = $script:LastBody | ConvertFrom-Json
+        Write-Host "total=$($m.total) count=$($m.count) has_more=$($m.has_more)" -ForegroundColor Blue
+        Assert-Equal "meta total matches curated_count" $m.total   $curated
+        Assert-Equal "meta count honours limit=25"      $m.count   25
+        Assert-Equal "meta has_more is true"            $m.has_more $true
+    } catch {
+        Write-Host "  FAIL  meta envelope unparseable" -ForegroundColor Red; $script:Fail++
+    }
+
     Write-Section 24 "REPORT MISSING PRODUCT  (POST /report-missing)  [auth]  ->  writes missing_reports"
     $rmBody = @{ barcode = "0000000000000"; product_name = "Mystery Snack"; comment = "Not in DB, please add" } | ConvertTo-Json -Compress
     Invoke-Api POST "/report-missing" $rmBody -Auth
@@ -442,6 +541,65 @@ try {
 
     Write-Section "27c" "AI CHAT - top picks by category (Task 4)  (POST /chat 'best chocolates')"
     Invoke-Api POST "/chat" (@{ question = "what are the best chocolates" } | ConvertTo-Json -Compress)
+
+    Write-Section "27d" "AI CHAT - app/commerce question  ('can we buy products from this website?')"
+    Write-Host "# Regression guard for the reported bug: the client attaches the last-scanned" -ForegroundColor DarkGray
+    Write-Host "# barcode to EVERY message, and the prompt told the model to ground every claim in" -ForegroundColor DarkGray
+    Write-Host "# that product - so this question was answered with the attached cola's score." -ForegroundColor DarkGray
+    Write-Host "# Expect source=fast-path, a sub-second reply, and no product talk." -ForegroundColor DarkGray
+    $buyBody = @{ question = "can we buy products from this website?"; barcode = $BcCola } | ConvertTo-Json -Compress
+    Invoke-Api POST "/chat" $buyBody
+    try { $buySrc = ($script:LastBody | ConvertFrom-Json).source } catch { $buySrc = '' }
+    Assert-Equal "commerce question is fast-pathed" $buySrc "fast-path"
+    Assert-NoProductLeak "commerce answer"
+
+    Write-Section "27e" "AI CHAT - out-of-scope guardrail  ('what is the capital of France?')"
+    Write-Host "# A general-knowledge question must be declined politely rather than answered, and" -ForegroundColor DarkGray
+    Write-Host "# must NOT be answered by talking about the attached product either." -ForegroundColor DarkGray
+    $offBody = @{ question = "what is the capital of France?"; barcode = $BcCola } | ConvertTo-Json -Compress
+    Invoke-Api POST "/chat" $offBody
+    try { $offResp = ("" + ($script:LastBody | ConvertFrom-Json).response).ToLower() } catch { $offResp = '' }
+    if ($offResp.Contains('paris')) {
+        Write-Host "  FAIL  model answered the trivia question (said 'Paris')" -ForegroundColor Red
+        $script:Fail++
+    } else {
+        Write-Host "  PASS  model declined the out-of-scope question" -ForegroundColor Green
+        $script:Pass++
+    }
+    Write-Host "  NOTE  needs a live AI key; with no key this is the rule-based fallback." -ForegroundColor DarkGray
+
+    Write-Section "27f" "AI CHAT - commerce keywords must not hijack real questions"
+    Write-Host "# The fast-path matches single keywords on word boundaries, so 'ship' inside" -ForegroundColor DarkGray
+    Write-Host "# 'relationship', 'order' inside 'in order to' and 'cart' inside 'carton' must NOT" -ForegroundColor DarkGray
+    Write-Host "# divert a genuine nutrition question into the canned shopping answer." -ForegroundColor DarkGray
+    Invoke-Api POST "/chat" (@{ question = "what is the relationship between sugar and diabetes?" } | ConvertTo-Json -Compress)
+    try { $relSrc = ($script:LastBody | ConvertFrom-Json).source } catch { $relSrc = '' }
+    Write-Host "source = $relSrc  (must NOT be fast-path)" -ForegroundColor Blue
+    if ($relSrc -eq 'fast-path') {
+        Write-Host "  FAIL  nutrition question was wrongly fast-pathed" -ForegroundColor Red
+        $script:Fail++
+    } else {
+        Write-Host "  PASS  nutrition question reached the AI/fallback path" -ForegroundColor Green
+        $script:Pass++
+    }
+
+    Write-Section "27g" "AI CHAT - latency budget  (POST /chat, real question)"
+    Write-Host "# The whole provider failover chain shares one wall-clock budget (CHAT_BUDGET," -ForegroundColor DarkGray
+    Write-Host "# default 12s). Without it the chain could stack to ~48s, which is what produced" -ForegroundColor DarkGray
+    Write-Host "# the reported 15-20s replies. Measure the round-trip below." -ForegroundColor DarkGray
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $latBody = @{ question = "is this high in sugar?"; barcode = $BcUnhealthy } | ConvertTo-Json -Compress
+    Invoke-Api POST "/chat" $latBody
+    $sw.Stop()
+    $ms = [int]$sw.Elapsed.TotalMilliseconds
+    Write-Host "/chat round-trip = $ms ms" -ForegroundColor Blue
+    if ($ms -le 20000) {
+        Write-Host "  PASS  within the 20s ceiling (budget 12s + network/cold start)" -ForegroundColor Green
+        $script:Pass++
+    } else {
+        Write-Host "  FAIL  exceeded 20s - check CHAT_BUDGET and provider timeouts" -ForegroundColor Red
+        $script:Fail++
+    }
 
     # =========================================================================
     #  TASK 1 - CROWDSOURCED PRODUCT RATINGS
@@ -744,6 +902,86 @@ try {
     # Expected status depends on whether the Tesseract engine is installed on this host.
     $ocrExpect = if ($ocrAvailable) { '2' } else { '5' }
     Invoke-Upload "/ocr/scan-label" $BcUnhealthy (Join-Path $script:ImgDir 'valid.png') "image/png" -Expect $ocrExpect
+
+    # =========================================================================
+    Write-Banner "22 JULY - FIXES & NEW FEATURES"
+
+    Write-Section 96 "FIX 1 - NUTRITION PER 100g  (GET /product/{barcode})  <- response carries nutrition_per_100g"
+    Write-Host "# Frooti has a 200 ml serving, so per-100g sugar should be HALF the per-serving 31.2g (~15.6g)" -ForegroundColor DarkGray
+    Invoke-Api GET "/product/8902579100025"
+    Write-Host "nutrition_per_100g.sugar should be ~15.6 (per-serving sugar_g_per_serving is 31.2)" -ForegroundColor Blue
+
+    Write-Section 97 "FIX 2 - SCORE CONSISTENCY  (GET /score + GET /v2/score for the same product)  <- one engine"
+    Invoke-Api GET "/score/$BcHealthy"
+    Invoke-Api GET "/v2/score/$BcHealthy"
+
+    Write-Section 98 "FIX 3 - AI CHAT PRODUCT LOOKUP BY NAME  (POST /chat {question:'Frooti score'})  <- product_in_database:true"
+    Invoke-Api POST "/chat" '{"question":"Frooti score"}'
+    Write-Host "response should be structured Markdown; product_in_database = true, resolved_by = name" -ForegroundColor Blue
+
+    Write-Section "98b" "FIX 3 - AI CHAT UNKNOWN PRODUCT -> scan guidance  (POST /chat {question:'score of ZZZ mystery bar'})"
+    Invoke-Api POST "/chat" '{"question":"what is the score of ZZZ mystery bar"}'
+    Write-Host "response should guide the user to scan the barcode; product_in_database = false" -ForegroundColor Blue
+
+    Write-Section 99 "FEATURE 1 - AVAILABLE PREFERENCES  (GET /preferences/available)  <- lists scoring + clean-label prefs"
+    Invoke-Api GET "/preferences/available"
+
+    Write-Section "99b" "FEATURE 1 - CLEAN-LABEL FILTER  (GET /search?q=lay&no_palm_oil=true)  <- palm-oil products removed"
+    Invoke-Api GET "/search?q=lay&no_palm_oil=true&limit=10" -Head 10
+    Write-Host "'Lay's Classic Salted' (palm oil in its ingredients) must be filtered OUT vs the same query without the flag" -ForegroundColor Blue
+
+    Write-Section "99c" "FEATURE 1 - SAVE NEW PREFERENCES  (POST /preferences {clean_label:true})  [auth]"
+    Invoke-Api POST "/preferences" '{"preferences":{"clean_label":true,"no_palm_oil":true}}' -Auth
+
+    Write-Section 100 "FEATURE 2 - BETTER FOR YOU BADGE  (GET /product/{barcode})  <- is_better_for_you flag"
+    Invoke-Api GET "/product/$BcHealthy"
+    Write-Host "response carries is_better_for_you (true when score >= 7) and better_for_you_badge" -ForegroundColor Blue
+
+    Write-Section 101 "FEATURE 4 - LIST CATEGORIES  (GET /products/categories)  <- category + count list"
+    Invoke-Api GET "/products/categories"
+
+    Write-Section "101b" "FEATURE 4 - PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
+    Invoke-Api GET "/products/by-category/protein_bar?limit=3"
+
+    Write-Section 102 "FEATURE 3 - WEEKLY DIGEST PREVIEW  (GET /weekly-digest/{user_id})  <- data + rendered email"
+    Invoke-Api GET "/weekly-digest/$($script:UserId)" -Auth
+
+    Write-Section "102b" "FEATURE 3 - EMAIL PREFERENCES  (GET/POST /email-preferences)  [auth]"
+    Invoke-Api GET "/email-preferences" -Auth
+    Invoke-Api POST "/email-preferences" '{"weekly_digest":true}' -Auth
+
+    Write-Section "102c" "FEATURE 3 - SEND WEEKLY DIGEST NOW  (POST /weekly-digest/{user_id}/send)  <- writes to outbox by default"
+    Invoke-Api POST "/weekly-digest/$($script:UserId)/send" -Auth
+
+    Write-Section "102d" "FEATURE 3 - ADMIN BATCH SEND  (POST /admin/send-weekly-digests)  <- requires X-Admin-Token"
+    $adminToken = if ($env:ADMIN_TOKEN) { $env:ADMIN_TOKEN } else { 'swapify-admin-dev' }
+    Invoke-Admin POST "/admin/send-weekly-digests?limit=2" -AdminToken $adminToken
+
+    Write-Section "102e" "FEATURE 3 - ADMIN BATCH WITHOUT TOKEN -> 403  (POST /admin/send-weekly-digests)"
+    Invoke-Api POST "/admin/send-weekly-digests" -Expect '4'
+
+    Write-Section "102f" "FEATURE 3 - UNSUBSCRIBE BAD TOKEN -> 400  (GET /unsubscribe?token=garbage)"
+    Invoke-Api GET "/unsubscribe?token=garbage" -Expect '4'
+
+    Write-Section 103 "SCORING SPEC COMPLIANCE  (python test_scoring_spec.py)  <- engine matches ScoringLogic_Swapify.md"
+    $specScript = Join-Path $ServerDir 'test_scoring_spec.py'
+    Write-Host ">> $Py test_scoring_spec.py" -ForegroundColor DarkGray
+    $specOut = & $Py $specScript 2>&1
+    $specOk  = ($LASTEXITCODE -eq 0)
+    ($specOut | Select-Object -Last 3) | ForEach-Object { Write-Host "   $_" }
+    if ($specOk) {
+        Write-Host "Scoring engine matches ScoringLogic_Swapify.md (all assertions passed)." -ForegroundColor Green
+        $script:Pass++
+    } else {
+        Write-Host "Spec compliance FAILED." -ForegroundColor Red
+        $script:Fail++
+    }
+
+    Write-Section "103b" "SCORING SPEC - Example A over HTTP  (GET /score/{Maggi})  <- noodles ingredients -> very low score"
+    Write-Host "# Maggi's stored ingredients ARE spec section 6 Example A (maida, palm oil, MSG, TBHQ, ...) -> expect grade F" -ForegroundColor DarkGray
+    Invoke-Api GET "/score/8901058005783"
+    try { $specGrade = ($script:LastBody | ConvertFrom-Json).grade } catch { $specGrade = '?' }
+    Write-Host "Example A grade = $specGrade  (spec: very low, D/F)" -ForegroundColor Blue
 
     # =========================================================================
     Write-Banner "DATABASE VERIFICATION  (proving the writes actually persisted)"
