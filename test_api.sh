@@ -109,12 +109,51 @@ request() {
   return 0
 }
 
+# admin request runner (Feature 3): like `request` but sends the X-Admin-Token
+# header instead of a bearer token.
+#   request_admin <METHOD> <PATH> <DATA|""> <admin-token> [expectPrefix]
+request_admin() {
+  local method="$1" path="$2" data="$3" admtok="$4" expect="${5:-2}"
+  local url="$BASE$path"
+  local -a args=(-s -S -X "$method" -m 60 -w $'\n__HTTP__%{http_code}' -H "X-Admin-Token: $admtok")
+  echo "${DIM}\$ curl -X $method '$url' -H 'X-Admin-Token: <ADMIN_TOKEN>'${RESET}"
+  if [ -n "$data" ]; then
+    args+=(-H "Content-Type: application/json" -d "$data")
+  fi
+  local raw; raw="$(curl "${args[@]}" "$url")"
+  LAST_CODE="${raw##*__HTTP__}"
+  LAST_BODY="${raw%$'\n'__HTTP__*}"
+  local col="$GREEN"; case "$LAST_CODE" in 2*) col="$GREEN";; 4*) col="$YELLOW";; *) col="$RED";; esac
+  echo "${col}${BOLD}HTTP $LAST_CODE${RESET}"
+  show_json "$LAST_BODY"
+  case "$LAST_CODE" in ${expect}*) PASS=$((PASS+1)) ;; *) FAIL=$((FAIL+1)) ;; esac
+  return 0
+}
+
 json_get() {  # json_get <field> <<< body   -> extract top-level string/number
   local field="$1"
   "$PY" -c "import sys,json;
 d=json.load(sys.stdin);
 v=d.get('$field') if isinstance(d,dict) else None;
 print('' if v is None else v)"
+}
+
+json_len() {  # json_len <<< body   -> number of items in a top-level JSON array
+  "$PY" -c "import sys,json;
+d=json.load(sys.stdin);
+print(len(d) if isinstance(d,list) else len(d.get('results',[])) if isinstance(d,dict) else 0)"
+}
+
+# check <label> <actual> <expected>  -> tally a non-HTTP assertion
+check() {
+  local label="$1" actual="$2" expected="$3"
+  if [ "$actual" = "$expected" ]; then
+    echo "${GREEN}${BOLD}  PASS${RESET} $label ${DIM}(got '$actual')${RESET}"
+    PASS=$((PASS+1))
+  else
+    echo "${RED}${BOLD}  FAIL${RESET} $label ${DIM}(got '$actual', expected '$expected')${RESET}"
+    FAIL=$((FAIL+1))
+  fi
 }
 
 # multipart/form-data upload runner (Task 2C — image upload). The generic
@@ -275,6 +314,7 @@ PASSWORD="Passw0rd!"
 
 # real barcodes present in swapify.db
 BC_UNHEALTHY="8901491101837"   # Lay's Classic Salted
+BC_COLA="8901058000532"        # Coca-Cola — the product that leaked into off-topic chat replies
 BC_HEALTHY="8908013479122"     # The Whole Truth protein bar
 BC_BAR="8906127540016"         # Farmley Datebites (protein_bar -> has same-cat alternatives)
 BC_BAR2="8904335602385"        # Yoga bar protein bar
@@ -375,6 +415,35 @@ request GET "/offline-products" "" noauth 2
 section 23 "SEARCH  (GET /search?q=protein)"
 request GET "/search?q=protein" "" noauth 3
 
+section "23a" "CATALOGUE COMPLETENESS  (GET /search?limit=300)  ->  every curated product"
+echo "${DIM}Regression guard: /search used to default to limit=10 and hard-cap at 50, so a client${RESET}"
+echo "${DIM}that did not paginate could only ever show the first page — which looked like 'most${RESET}"
+echo "${DIM}products are missing' even though the catalogue was complete. The count returned here${RESET}"
+echo "${DIM}must equal curated_count from /product-count.${RESET}"
+request GET "/product-count" "" noauth 0
+CURATED="$(printf '%s' "$LAST_BODY" | json_get curated_count)"
+request GET "/search?limit=300" "" noauth 0
+SEARCH_ALL="$(printf '%s' "$LAST_BODY" | json_len)"
+echo "${BLUE}curated_count = $CURATED   /search?limit=300 returned = $SEARCH_ALL${RESET}"
+check "/search?limit=300 returns the whole catalogue" "$SEARCH_ALL" "$CURATED"
+
+request GET "/search" "" noauth 0
+SEARCH_DEF="$(printf '%s' "$LAST_BODY" | json_len)"
+echo "${BLUE}/search default page size = $SEARCH_DEF  (expected 50, was 10)${RESET}"
+check "/search default limit is 50" "$SEARCH_DEF" "50"
+
+section "23b" "SEARCH PAGINATION METADATA  (GET /search?meta=true)  ->  total / has_more"
+echo "${DIM}meta=true returns an envelope so the client can tell 'this is everything' apart from${RESET}"
+echo "${DIM}'this is page 1 of N'.${RESET}"
+request GET "/search?meta=true&limit=25" "" noauth 0
+META_TOTAL="$(printf '%s' "$LAST_BODY" | json_get total)"
+META_COUNT="$(printf '%s' "$LAST_BODY" | json_get count)"
+META_MORE="$(printf '%s' "$LAST_BODY" | json_get has_more)"
+echo "${BLUE}total=$META_TOTAL count=$META_COUNT has_more=$META_MORE${RESET}"
+check "meta total matches curated_count" "$META_TOTAL" "$CURATED"
+check "meta count honours limit=25"      "$META_COUNT" "25"
+check "meta has_more is True"            "$META_MORE"  "True"
+
 section 24 "REPORT MISSING PRODUCT  (POST /report-missing)  [auth]  ->  writes missing_reports"
 request POST "/report-missing" '{"barcode":"0000000000000","product_name":"Mystery Snack","comment":"Not in DB, please add"}' auth
 
@@ -402,6 +471,63 @@ request POST "/chat" '{"question":"what are the top picks from all products"}' n
 
 section "27c" "AI CHAT — top picks by category (Task 4)  (POST /chat 'best chocolates')"
 request POST "/chat" '{"question":"what are the best chocolates"}' noauth
+
+section "27d" "AI CHAT — app/commerce question  ('can we buy products from this website?')"
+echo "${DIM}Regression guard for the reported bug: the client attaches the last-scanned barcode to${RESET}"
+echo "${DIM}EVERY message, and the prompt told the model to ground every claim in that product —${RESET}"
+echo "${DIM}so this question was answered with an explanation of the attached cola's score.${RESET}"
+echo "${DIM}Expect source=fast-path, a sub-second reply, and no product talk.${RESET}"
+request POST "/chat" "{\"question\":\"can we buy products from this website?\",\"barcode\":\"$BC_COLA\"}" noauth 0
+BUY_SOURCE="$(printf '%s' "$LAST_BODY" | json_get source)"
+check "commerce question is fast-pathed" "$BUY_SOURCE" "fast-path"
+printf '%s' "$LAST_BODY" | "$PY" -c "
+import sys, json
+r = json.load(sys.stdin).get('response','').lower()
+leaked = [w for w in ('coca','cola','score of','/10') if w in r]
+print(('  PASS  reply stays on topic' if not leaked
+       else '  FAIL  reply leaked product context: %s' % leaked))
+"
+
+section "27e" "AI CHAT — out-of-scope guardrail  ('what is the capital of France?')"
+echo "${DIM}A general-knowledge question must be declined politely rather than answered, and must${RESET}"
+echo "${DIM}NOT be answered by talking about the attached product either.${RESET}"
+request POST "/chat" "{\"question\":\"what is the capital of France?\",\"barcode\":\"$BC_COLA\"}" noauth 0
+printf '%s' "$LAST_BODY" | "$PY" -c "
+import sys, json
+r = json.load(sys.stdin).get('response','').lower()
+answered = 'paris' in r
+print(('  FAIL  model answered the trivia question (said \'Paris\')' if answered
+       else '  PASS  model declined the out-of-scope question'))
+print('  NOTE  needs a live AI key; with no key this is the rule-based fallback.')
+"
+
+section "27f" "AI CHAT — commerce keywords must not hijack real questions"
+echo "${DIM}The fast-path matches single keywords on word boundaries, so 'ship' inside${RESET}"
+echo "${DIM}'relationship', 'order' inside 'in order to' and 'cart' inside 'carton' must NOT${RESET}"
+echo "${DIM}divert a genuine nutrition question into the canned shopping answer.${RESET}"
+request POST "/chat" '{"question":"what is the relationship between sugar and diabetes?"}' noauth 0
+REL_SOURCE="$(printf '%s' "$LAST_BODY" | json_get source)"
+echo "${BLUE}source = $REL_SOURCE  (must NOT be fast-path)${RESET}"
+if [ "$REL_SOURCE" = "fast-path" ]; then
+  echo "${RED}${BOLD}  FAIL${RESET} nutrition question was wrongly fast-pathed"; FAIL=$((FAIL+1))
+else
+  echo "${GREEN}${BOLD}  PASS${RESET} nutrition question reached the AI/fallback path"; PASS=$((PASS+1))
+fi
+
+section "27g" "AI CHAT — latency budget  (POST /chat, real question)"
+echo "${DIM}The whole provider failover chain shares one wall-clock budget (CHAT_BUDGET, default${RESET}"
+echo "${DIM}12s). Without it the chain could stack to ~48s, which is what produced the reported${RESET}"
+echo "${DIM}15-20s replies. Measure the round-trip below.${RESET}"
+CHAT_T0=$(date +%s%N)
+request POST "/chat" "{\"question\":\"is this high in sugar?\",\"barcode\":\"$BC_UNHEALTHY\"}" noauth 0
+CHAT_T1=$(date +%s%N)
+CHAT_MS=$(( (CHAT_T1 - CHAT_T0) / 1000000 ))
+echo "${BLUE}/chat round-trip = ${CHAT_MS} ms${RESET}"
+if [ "$CHAT_MS" -le 20000 ]; then
+  echo "${GREEN}${BOLD}  PASS${RESET} within the 20s ceiling (budget 12s + network/cold start)"; PASS=$((PASS+1))
+else
+  echo "${RED}${BOLD}  FAIL${RESET} exceeded 20s — check CHAT_BUDGET and provider timeouts"; FAIL=$((FAIL+1))
+fi
 
 # =============================================================================
 #  TASK 1 — CROWDSOURCED PRODUCT RATINGS
@@ -690,6 +816,86 @@ section 95 "OCR SCAN LABEL  (POST /ocr/scan-label)  <- extracts text/ingredients
 # Expected status depends on whether the Tesseract engine is installed on this host.
 if [ "$OCR_AVAILABLE" = "True" ]; then OCR_EXPECT=2; else OCR_EXPECT=5; fi
 request_upload "/ocr/scan-label" "$BC_UNHEALTHY" "$IMG_DIR/valid.png" "image/png" noauth "$OCR_EXPECT"
+
+# =============================================================================
+banner "22 JULY — FIXES & NEW FEATURES"
+
+section 96 "FIX 1 — NUTRITION PER 100g  (GET /product/{barcode})  <- response carries nutrition_per_100g"
+echo "${DIM}# Frooti has a 200 ml serving, so per-100g sugar should be HALF the per-serving 31.2g (~15.6g)${RESET}"
+request GET "/product/8902579100025" "" noauth
+echo "${BLUE}nutrition_per_100g.sugar should be ~15.6 (per-serving sugar_g_per_serving is 31.2)${RESET}"
+
+section 97 "FIX 2 — SCORE CONSISTENCY  (GET /score + GET /v2/score for the same product)  <- one engine"
+echo "${DIM}# Both must report the same score for The Whole Truth protein bar${RESET}"
+request GET "/score/$BC_HEALTHY" "" noauth
+request GET "/v2/score/$BC_HEALTHY" "" noauth
+
+section 98 "FIX 3 — AI CHAT PRODUCT LOOKUP BY NAME  (POST /chat {question:'Frooti score'})  <- product_in_database:true"
+request POST "/chat" "{\"question\":\"Frooti score\"}" noauth
+echo "${BLUE}response should be structured Markdown; product_in_database = true, resolved_by = name${RESET}"
+
+section "98b" "FIX 3 — AI CHAT UNKNOWN PRODUCT -> scan guidance  (POST /chat {question:'score of ZZZ mystery bar'})"
+request POST "/chat" "{\"question\":\"what is the score of ZZZ mystery bar\"}" noauth
+echo "${BLUE}response should guide the user to scan the barcode; product_in_database = false${RESET}"
+
+section 99 "FEATURE 1 — AVAILABLE PREFERENCES  (GET /preferences/available)  <- lists scoring + clean-label prefs"
+request GET "/preferences/available" "" noauth
+
+section "99b" "FEATURE 1 — CLEAN-LABEL FILTER  (GET /search?q=lay&no_palm_oil=true)  <- palm-oil products removed"
+request GET "/search?q=lay&no_palm_oil=true&limit=10" "" noauth 10
+echo "${BLUE}'Lay's Classic Salted' (palm oil in its ingredients) must be filtered OUT vs the same query without the flag${RESET}"
+
+section "99c" "FEATURE 1 — SAVE NEW PREFERENCES  (POST /preferences {clean_label:true})  [auth]"
+request POST "/preferences" "{\"preferences\":{\"clean_label\":true,\"no_palm_oil\":true}}" auth
+
+section 100 "FEATURE 2 — BETTER FOR YOU BADGE  (GET /product/{barcode})  <- is_better_for_you flag"
+request GET "/product/$BC_HEALTHY" "" noauth
+echo "${BLUE}response carries is_better_for_you (true when score >= 7) and better_for_you_badge${RESET}"
+
+section 101 "FEATURE 4 — LIST CATEGORIES  (GET /products/categories)  <- category + count list"
+request GET "/products/categories" "" noauth
+
+section "101b" "FEATURE 4 — PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
+request GET "/products/by-category/protein_bar?limit=3" "" noauth
+
+section 102 "FEATURE 3 — WEEKLY DIGEST PREVIEW  (GET /weekly-digest/{user_id})  <- data + rendered email"
+request GET "/weekly-digest/${USER_ID:-1}" "" auth
+
+section "102b" "FEATURE 3 — EMAIL PREFERENCES  (GET/POST /email-preferences)  [auth]"
+request GET "/email-preferences" "" auth
+request POST "/email-preferences" "{\"weekly_digest\":true}" auth
+
+section "102c" "FEATURE 3 — SEND WEEKLY DIGEST NOW  (POST /weekly-digest/{user_id}/send)  <- writes to outbox by default"
+request POST "/weekly-digest/${USER_ID:-1}/send" "" auth
+
+section "102d" "FEATURE 3 — ADMIN BATCH SEND  (POST /admin/send-weekly-digests)  <- requires X-Admin-Token"
+ADMIN_TOKEN_VALUE="${ADMIN_TOKEN:-swapify-admin-dev}"
+request_admin POST "/admin/send-weekly-digests?limit=2" "" "$ADMIN_TOKEN_VALUE"
+
+section "102e" "FEATURE 3 — ADMIN BATCH WITHOUT TOKEN -> 403  (POST /admin/send-weekly-digests)"
+request POST "/admin/send-weekly-digests" "" noauth 4
+
+section "102f" "FEATURE 3 — UNSUBSCRIBE BAD TOKEN -> 400  (GET /unsubscribe?token=garbage)"
+request GET "/unsubscribe?token=garbage" "" noauth 4
+
+section 103 "SCORING SPEC COMPLIANCE  (python test_scoring_spec.py)  <- engine matches ScoringLogic_Swapify.md"
+echo "${DIM}\$ $PY test_scoring_spec.py${RESET}"
+if "$PY" "$SERVER_DIR/test_scoring_spec.py" > "$SERVER_DIR/.spec_check.log" 2>&1; then
+  tail -3 "$SERVER_DIR/.spec_check.log"
+  echo "${GREEN}${BOLD}Scoring engine matches ScoringLogic_Swapify.md (all assertions passed).${RESET}"
+  PASS=$((PASS+1))
+else
+  tail -8 "$SERVER_DIR/.spec_check.log"
+  echo "${RED}${BOLD}Spec compliance FAILED — see .spec_check.log${RESET}"
+  FAIL=$((FAIL+1))
+fi
+rm -f "$SERVER_DIR/.spec_check.log"
+
+section "103b" "SCORING SPEC — Example A over HTTP  (GET /score/{Maggi})  <- noodles ingredients -> very low score"
+echo "${DIM}# Maggi's stored ingredients ARE spec §6 Example A (maida, palm oil, MSG, TBHQ, ...) -> expect grade F${RESET}"
+request GET "/score/8901058005783" "" noauth
+SPEC_A_GRADE="$(printf '%s' "$LAST_BODY" | json_get grade)"
+echo "${BLUE}Example A grade = ${SPEC_A_GRADE:-?}  (spec: very low, D/F)${RESET}"
 
 # =============================================================================
 banner "DATABASE VERIFICATION  (proving the writes actually persisted)"
