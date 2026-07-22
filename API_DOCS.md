@@ -1,5 +1,51 @@
 # Swapify Backend Documentation
 
+## 22 July Update — Fixes & New Features
+
+This release ships four fixes and four features. Details are in the linked
+sections; this is the summary.
+
+**Fixes**
+
+1. **Nutrition now shown per 100g (not per serving).** Product responses carry a
+   new `nutrition_per_100g` block — each nutrient scaled by `100 / serving_size_g`
+   so a 200 ml drink no longer reports its full-serving numbers under a "per 100g"
+   label. Per-serving fields are retained for backward compatibility.
+   See [Get Product Details](#1-get-product-details-api).
+2. **CSV ↔ scanner score consistency.** All backend endpoints already score
+   through one engine (`calculate_health_score_v2`, which implements
+   [`ScoringLogic_Swapify.md`](ScoringLogic_Swapify.md) — verified by
+   [`test_scoring_spec.py`](test_scoring_spec.py)); the frontend's own client-side
+   scorer was rewritten to mirror it exactly (per-serving penalties, per-100g
+   bonuses, category caps, transparency, 1–10 clamp), and the client catalogue CSV
+   is regenerated from the database via [`export_products.py`](export_products.py)
+   so both sides read identical data. A product now scores the same in a CSV list
+   and when scanned. See [Health Scoring Logic](#health-scoring-logic-v2).
+3. **AI chat: structured + product-aware.** Replies are now structured Markdown
+   (headline, **Key Highlights**, **Why it scored…**, **Healthier Alternative**),
+   and a product named in the question ("Frooti score", "is Maggi healthy?") is
+   looked up from the catalogue even with nothing scanned; if it isn't found the
+   bot tells the user to scan the barcode. See [AI Nutritionist Chatbot](#13-ai-nutritionist-chatbot-api).
+4. **All products load.** The client catalogue CSV drifted to a ~101-row subset;
+   it is regenerated from the full 252-product database so every product (e.g.
+   *Slurrp Farm Ragi, Almond & Banana Cereals*) is scannable.
+
+**Features**
+
+1. **New dietary preferences** — `no_preservatives`, `no_artificial_colors`,
+   `no_artificial_flavors`, `no_palm_oil`, and `clean_label` (all four at once).
+   These *filter* products (search / recommendations respect them) rather than
+   re-weighting the score. See [Dietary Preferences](#12-dietary-preferences-api)
+   and [`GET /preferences/available`](#12a-available-preferences-api).
+2. **"Better For You" badge** — product responses and list items carry
+   `is_better_for_you` (`true` when score ≥ 7). See [Better For You Badge](#27a-better-for-you-badge-feature-2).
+3. **Weekly digest email** — templated HTML/text digest (week's scans, favourites,
+   challenge progress) with pluggable delivery (SendGrid / SMTP / dry-run outbox),
+   a one-click signed unsubscribe link, and a cron runner
+   ([`cron_weekly_digest.py`](cron_weekly_digest.py)). See [Weekly Digest Email](#22a-weekly-digest-email-api-feature-3).
+4. **Product categories** — `GET /products/categories` and
+   `GET /products/by-category/{category}` (paginated, scored). See [Product Categories](#31-product-categories-api-feature-4).
+
 ## Live Deployment
 
 - **Live base URL:** `https://swapify-3.onrender.com`
@@ -185,9 +231,32 @@ curl http://127.0.0.1:8000/product/8901058005783   # Maggi noodles
     {"name": "sodium benzoate", "risk": "Medium"},
     {"name": "tartrazine", "risk": "High"}
   ],
+  "is_better_for_you": false,
+  "better_for_you_badge": {"is_better_for_you": false, "label": null, "threshold": 7.0, "score": 1.0},
+  "nutrition_per_100g": {
+    "basis": "per_100g",
+    "serving_size_g": 75.0,
+    "calories": 384.0,
+    "sugar": 2.0,
+    "saturated_fat": 9.1,
+    "sodium": 1000.0,
+    "protein": 8.3,
+    "fiber": 3.3
+  },
   "image_url": "/product-images/_placeholder.svg"
 }
 ```
+
+> **`nutrition_per_100g` (Fix 1):** the catalogue stores nutrition *per serving*,
+> and a serving is often not 100 g/ml. This block normalises every nutrient to a
+> per-100g basis (`value × 100 / serving_size_g`) so figures are comparable across
+> products and the UI can label them honestly. When `serving_size_g` is missing the
+> `basis` is `"per_serving_unknown"` and the per-serving values pass through
+> unchanged. The raw `*_g_per_serving` fields are still included.
+>
+> **`is_better_for_you` (Feature 2):** `true` when `score ≥ 7`. `better_for_you_badge`
+> carries the label and threshold. This is a lighter flag than the stricter
+> [Swapify Recommended badge](#27-swapify-recommended-badge-api).
 
 **Expected Error Response (404 Not Found):**
 ```json
@@ -684,30 +753,22 @@ searches return the shape below.
   - `category`: filter by category (`LIKE`), e.g. `?category=chips`.
   - `min_score` / `max_score`: keep only products within this health-score range.
   - `grade`: keep only products with this letter grade (`A`–`F`).
+  - `no_preservatives` / `no_artificial_colors` / `no_artificial_flavors` /
+    `no_palm_oil` / `clean_label` (booleans, Feature 1): clean-label filters. A
+    product is dropped only when the avoided additive is positively detected in its
+    ingredient list; `clean_label=true` applies all four. When the request is
+    authenticated, the user's **saved** clean-label preferences apply too (the
+    query flags add to them).
   - `sort`: `score_desc` (default, healthiest first), `score_asc`, or `name`.
-  - `limit`: 1–500 results per page (**default 50**).
+  - `limit`: 1–500 results per page (default 50).
   - `offset`: number of ranked results to skip, for pagination (default 0).
-  - `meta`: when `true`, return a pagination envelope instead of a bare array.
 
-> **Changed:** `limit` used to default to 10 and was hard-capped at 50, so a
-> client that did not paginate could only ever display the first 10 of the ~250
-> curated products — which looked like "most products are missing" even though
-> the catalogue was complete. The default is now 50 and the cap is 500, so
-> `?limit=300` returns the whole catalogue in one call. Use `meta=true` to tell
-> "this is everything" apart from "this is page 1".
+Each result item also carries `is_better_for_you` (Feature 2 — `true` when
+`score ≥ 7`).
 
 **Pagination:** results are scored, filtered and ranked, then the page is sliced
-as `results[offset : offset + limit]`. For example `?limit=50&offset=0` is page 1
-and `?limit=50&offset=50` is page 2.
-
-With `?meta=true` the response is an object instead of an array:
-
-```json
-{ "total": 252, "count": 50, "limit": 50, "offset": 0, "has_more": true,
-  "results": [ ... ] }
-```
-
-Each result includes an `image_url` — the
+as `results[offset : offset + limit]`. For example `?limit=10&offset=0` is page 1
+and `?limit=10&offset=10` is page 2. Each result includes an `image_url` — the
 product's own uploaded image, or the shared placeholder
 (`/product-images/_placeholder.svg`) when it has none (see
 [Product Images](#28-product-image-upload-api)).
@@ -720,14 +781,8 @@ curl "http://127.0.0.1:8000/search?q=lays"
 # Filter: grade-A products in the "chips" category, cheapest-scoring first
 curl "http://127.0.0.1:8000/search?category=chips&min_score=3&sort=score_desc&limit=5"
 
-# Pagination — second page of 50
-curl "http://127.0.0.1:8000/search?q=&sort=name&limit=50&offset=50"
-
-# The entire curated catalogue in one call
-curl "http://127.0.0.1:8000/search?limit=300"
-
-# With pagination metadata
-curl "http://127.0.0.1:8000/search?meta=true&limit=50"
+# Pagination — second page of 10
+curl "http://127.0.0.1:8000/search?q=&sort=name&limit=10&offset=10"
 ```
 
 **Expected JSON Response (200 OK):**
@@ -780,7 +835,10 @@ preference-aware [Better Alternatives](#5-similar-products-api-better-alternativ
 ranking. Requires authentication. Preferences are stored in the
 `user_preferences` table (one row per user, JSON of boolean flags).
 
-**Recognised preference flags** (all optional booleans, default `false`):
+There are two kinds of preference. **Scoring** preferences re-weight the health
+score; **clean-label** preferences (Feature 1) *filter* products out of results.
+
+**Scoring preferences** (all optional booleans, default `false`):
 
 | Flag | Effect |
 |------|--------|
@@ -790,6 +848,23 @@ ranking. Requires authentication. Preferences are stored in the
 | `high_protein` | Protein bonus weighted **×2.5**; higher-protein alternatives ranked first. |
 | `high_fiber` | Fiber bonus weighted **×2.5**; higher-fiber alternatives ranked first. |
 | `vegan` | Cancels dairy "Protein Quality" bonuses; non-vegan alternatives filtered out of `/similar`. |
+
+**Clean-label preferences (Feature 1)** — these *filter* products in `/search`,
+`/recommendations` and the home feed. A product is dropped only when the avoided
+additive is **positively detected** in its ingredient list; a product with no
+ingredient list is kept (absence of data is not proof of a violation).
+
+| Flag | Effect |
+|------|--------|
+| `no_preservatives` | Hide products with chemical preservatives (BHA, TBHQ, benzoates, INS 2xx …). |
+| `no_artificial_colors` | Hide products with synthetic colours (tartrazine, sunset yellow, INS 1xx …). |
+| `no_artificial_flavors` | Hide products listing artificial / synthetic flavourings. |
+| `no_palm_oil` | Hide products containing palm oil / palmolein / palm fat. |
+| `clean_label` | All four clean-label filters at once. |
+
+Clean-label preferences can also be passed as query flags directly to
+[`/search`](#11-search-products-api) (e.g. `?clean_label=true`), which is the
+easiest way to demo them without saving preferences first.
 
 #### Get Preferences
 - **URL:** `/preferences`
@@ -807,7 +882,12 @@ stable shape (defaulting to `false`).
     "low_fat": false,
     "high_protein": true,
     "high_fiber": false,
-    "vegan": false
+    "vegan": false,
+    "no_preservatives": false,
+    "no_artificial_colors": false,
+    "no_artificial_flavors": false,
+    "no_palm_oil": false,
+    "clean_label": false
   }
 }
 ```
@@ -828,21 +908,8 @@ curl -X POST http://127.0.0.1:8000/preferences \
 -d '{"preferences": {"low_sugar": true, "high_protein": true}}'
 ```
 
-**Expected JSON Response (200 OK):**
-```json
-{
-  "status": "preferences saved",
-  "user_id": 2,
-  "preferences": {
-    "low_sugar": true,
-    "low_sodium": false,
-    "low_fat": false,
-    "high_protein": true,
-    "high_fiber": false,
-    "vegan": false
-  }
-}
-```
+**Expected JSON Response (200 OK):** all recognised flags are echoed back. Saving
+`{"clean_label": true}` alone, for example, returns it among the full set.
 
 #### Update Preferences (legacy alias)
 `POST /update-preferences` is kept for backwards compatibility and now **persists**
@@ -850,6 +917,32 @@ preferences (previously a no-op). It accepts either a flat body
 (`{"low_sugar": true}`) or a wrapped body (`{"preferences": {...}}`) and returns
 `{"status": "preferences updated", "preferences": {...}}`. New clients should use
 `POST /preferences`.
+
+### 12a. Available Preferences API
+Lists every preference the app supports, with labels, types and descriptions, so a
+client can render the toggles without hard-coding them (Feature 1). **No auth.**
+
+- **URL:** `/preferences/available`
+- **Method:** `GET`
+
+**Example using `curl`:**
+```bash
+curl http://127.0.0.1:8000/preferences/available
+```
+
+**Expected JSON Response (200 OK):**
+```json
+{
+  "count": 11,
+  "preferences": [
+    {"key": "low_sugar", "label": "Low Sugar", "type": "scoring", "description": "…"},
+    {"key": "no_palm_oil", "label": "No Palm Oil", "type": "clean_label", "description": "…"},
+    {"key": "clean_label", "label": "Clean Label", "type": "clean_label", "description": "…"}
+  ],
+  "scoring_preferences": ["low_sugar", "low_sodium", "low_fat", "high_protein", "high_fiber", "vegan"],
+  "clean_label_preferences": ["no_preservatives", "no_artificial_colors", "no_artificial_flavors", "no_palm_oil", "clean_label"]
+}
+```
 
 ### 13. AI Nutritionist Chatbot API
 A **real LLM-powered** nutritionist (not rule-based) that answers free-text
@@ -876,122 +969,37 @@ When a `barcode` is supplied, the product's nutrition, ingredients, health score
 flagged ingredients **and score breakdown** are passed to the model as grounding
 context.
 
+#### Structured formatting (Fix 3A)
+Replies are **structured Markdown**, not one plain block: a bold headline, then
+sections such as **Key Highlights**, **Why it scored this way** and **Healthier
+Alternative**, using bullet points and short sections. The frontend renders the
+Markdown (headers, lists, bold/italic) into styled HTML. This holds whether the
+answer comes from the LLM or, when no AI key is configured, from the deterministic
+rule-based fallback — the fallback now emits the same structured shape.
+
+#### Product lookup by name (Fix 3B)
+A product **named in the question** is resolved from the catalogue even with no
+barcode scanned:
+- *"Frooti score"*, *"is Maggi healthy?"* → the product is looked up by name/brand
+  and its score, ingredients and per-100g nutrition ground the answer. A named
+  product takes precedence over whatever was last scanned. The response then has
+  `product_in_database: true` and `resolved_by: "name"`.
+- If the question is clearly about a specific product but it **isn't** in the
+  database, the bot doesn't answer generically — it returns a short guidance reply
+  ("You can scan the barcode of this product using the scanner to get all the
+  details and score"), with `product_in_database: false` and `source:
+  "product-lookup"`.
+
 #### Greeting fast-path (performance)
 A bare greeting or smalltalk message (`"hi"`, `"hello"`, `"thanks"`, `"how are
 you"`, …) with no barcode is answered **instantly from a canned welcome — the LLM
 is never called**. This is what keeps a one-word "hi" at a few **milliseconds**
-instead of the multi-second round-trip a free-tier model + its failover chain
-would otherwise cost. Such a response has `source: "fast-path"`. The match is
-conservative: anything beyond a plain greeting (e.g. *"hi, is Maggi healthy?"*)
-still goes to the AI.
-
-#### App / commerce fast-path (scope)
-Questions about **Swapify itself** — *"can we buy products from this website?"*,
-*"is there delivery?"*, *"what is Swapify?"*, *"is it free?"* — are answered
-instantly with a correct canned reply (`source: "fast-path"`), because they have
-one right answer that does not depend on any product.
-
-This fixes a real misbehaviour: the client attaches the last-scanned barcode to
-**every** message, and the system prompt instructed the model to ground every
-claim in that product — so *"can we buy products from this website?"* was
-answered with an explanation of the attached cola's health score. Swapify is a
-scanner and comparison tool, **not a shop**: there is no cart, checkout, delivery
-or pricing.
-
-Matching uses word boundaries for single keywords and substrings for phrases, so
-a genuine nutrition question is not diverted — *"what's the relationship between
-sugar and diabetes?"* (contains "ship"), *"in order to lose weight…"* (contains
-"order"), *"how many cartons of juice?"* (contains "cart") and *"this delivers 5g
-of protein"* (contains "deliver") all still reach the LLM.
-
-#### Scope guardrail (out-of-scope questions)
-The system prompt now enforces a scope boundary:
-- **Product context is background, not the subject.** The model is told to ignore
-  the attached product unless the question is genuinely about it, and explicitly
-  not to answer an unrelated question by discussing that product's score.
-- **In scope:** food, drink, ingredients, nutrition, food labelling, and how
-  Swapify scores products.
-- **Out of scope** (general trivia, maths, coding, news, sport, politics): the
-  model declines in one friendly sentence — *even when it knows the answer* — and
-  offers what it can do instead, in ~40 words, without padding the reply with an
-  unrequested nutrition fact.
-
-#### Latency budget
-`/chat` is bounded by a **single wall-clock budget** (`CHAT_BUDGET`, default
-**12s**) shared across the entire provider failover chain, not just per-call
-timeouts. Each provider call receives `min(its timeout, budget remaining)` as its
-HTTP timeout, and a retry or a further provider is only attempted when enough
-budget remains to be worth it.
-
-Without this ceiling the chain could stack to roughly **48s** (2 OpenRouter
-models x 2 attempts x 12s, plus Gemini x 2) — which is what produced the observed
-15–20s+ replies. Beyond the budget, `/chat` degrades to the deterministic
-food-science answer (`source: "fallback"`) rather than making the user wait.
-
-Tunable via environment variables:
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `CHAT_BUDGET` | `12` | Whole-endpoint wall-clock ceiling, in seconds |
-| `OPENROUTER_TIMEOUT` | `8` | Per-call OpenRouter HTTP timeout (was 12) |
-| `GEMINI_TIMEOUT` | `8` | Per-call Gemini HTTP timeout (was 12) |
-| `LLM_MAX_TOKENS` | `400` | Reply cap (was 700; the prompt asks for <=150 words, and unused tokens are pure latency) |
-
-The scored-catalogue lookup behind **top picks** is also cached for 300s, so a
-*"best chocolates"* question no longer re-scores ~250 products on every request
-before the LLM call even begins.
-
-#### Retired model slugs — check this first when chat is slow
-Permanent provider errors (**400 / 401 / 403 / 404**) now skip to the next model
-**immediately, with no retry and no backoff**. Only transient failures (5xx,
-timeouts, connection errors) are retried.
-
-This was a live latency bug, not a hypothetical. Free model slugs get retired
-without notice, and the configured primary `openai/gpt-oss-120b:free` had started
-returning **404** ("unavailable for free"). Because the old code treated every
-non-429 error as transient, **every single `/chat` request** burned two full
-round trips plus a 0.4s backoff on a model that could never answer, before
-failing over to one that could.
-
-Probe results (2026-07-19) for the models that were configured:
-
-| Model | Status |
-|---|---|
-| `openai/gpt-oss-20b:free` | **200 — working**, now the primary |
-| `google/gemma-4-31b-it:free` | 429 rate-limited — kept as fallback |
-| `openai/gpt-oss-120b:free` | **404 retired** — was the default |
-| `meta-llama/llama-3.3-70b-instruct:free` | **404 retired** |
-| `qwen/qwen3-next-80b-a3b-instruct:free` | **404 retired** |
-
-The model chain is now pinned in `render.yaml` rather than left to dashboard
-values, so a retired slug is visible in git. **If `/chat` latency regresses,
-re-probe the configured slugs before tuning anything else** — a dead primary is
-the cheapest cause to rule out:
-
-```bash
-curl -s -o /dev/null -w "%{http_code}\n" -X POST https://openrouter.ai/api/v1/chat/completions \
-  -H "Authorization: Bearer $OPENROUTER_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"openai/gpt-oss-20b:free","messages":[{"role":"user","content":"hi"}],"max_tokens":5}'
-```
-
-#### Remaining latency is provider-side, not code
-With the structural waste removed, what is left is **free-tier queue time, which
-no code change fixes**. Six identical requests to the same model with the same
-token cap, measured 2026-07-19:
-
-```
-1825 ms · 3692 ms · 6094 ms · 6312 ms · 6699 ms · 15225 ms
-```
-
-An 8x spread on an identical request. Typical `/chat` round-trips now land
-around **5–14s**, against a measured floor of ~1.5–2s (network + time-to-first-
-token) — so the tail is the provider queueing, not Swapify.
-
-Two things would actually move it, both outside this endpoint's current design:
-1. **Stream the response** (SSE). The user would see the first words in ~1.5–2s
-   instead of waiting for the whole reply. This is by far the biggest
-   *perceived*-latency win, and needs a matching frontend change.
-2. **A paid model tier**, which removes the free-tier queue entirely.
+instead of the multi-second (previously ~25s) round-trip a free-tier model + its
+failover chain would otherwise cost. Such a response has `source: "fast-path"`.
+The match is conservative: anything beyond a plain greeting (e.g. *"hi, is Maggi
+healthy?"*) still goes to the AI. Provider HTTP timeouts are also lowered and
+configurable (`OPENROUTER_TIMEOUT` / `GEMINI_TIMEOUT`, default 12s) so a slow
+model fails over sooner.
 
 #### Structured top picks (7+ rule)
 When the question asks for the best/top/healthiest products (*"what are the top
@@ -1868,6 +1876,66 @@ curl "http://127.0.0.1:8000/digest/2?date=2026-07-04"
 { "detail": "date must be in YYYY-MM-DD format" }
 ```
 
+### 22a. Weekly Digest Email API (Feature 3)
+A once-a-week summary **email**: the week's scans (count, average score, best /
+worst pick), the user's favourites, their challenge progress and a couple of "try
+next" recommendations. Templating, delivery and unsubscribe live in the standalone
+[`weekly_digest.py`](weekly_digest.py) module; the cron runner is
+[`cron_weekly_digest.py`](cron_weekly_digest.py).
+
+**Delivery is pluggable and degrades gracefully:**
+- `SENDGRID_API_KEY` set → send via the SendGrid v3 HTTP API.
+- `SMTP_HOST` (+ optional `SMTP_USER` / `SMTP_PASSWORD`) → send via SMTP.
+- neither set → **dry-run**: the rendered `.eml` is written to `EMAIL_OUTBOX`
+  (default `./outbox/`) and logged, so the feature works with no credentials.
+
+**Subscription** state lives in the `email_preferences` table (default: subscribed).
+Every email carries a one-click unsubscribe link with a **signed** token
+(HMAC-SHA256 over the user id with `SECRET_KEY`), so it works from an email client
+with no login and cannot be forged for another user.
+
+#### Preview the digest (data + rendered email)
+- **URL:** `/weekly-digest/{user_id}` · **Method:** `GET`
+
+```bash
+curl http://127.0.0.1:8000/weekly-digest/2
+```
+Returns `{ "digest": {…scans, favourites, challenges, recommendations…}, "email":
+{ "subject", "html", "text", "provider" }, "subscribed", "unsubscribe_url" }`.
+Nothing is sent.
+
+#### Send this user's digest now
+- **URL:** `/weekly-digest/{user_id}/send` · **Method:** `POST`
+
+Honours the unsubscribe flag (an opted-out user is not emailed). Returns
+`{ "sent": true, "provider": "outbox", "to": "…", "detail": "…" }`.
+
+#### Send to all subscribers (the cron target)
+- **URL:** `/admin/send-weekly-digests` · **Method:** `POST`
+- **Headers:** `X-Admin-Token: <ADMIN_TOKEN>` (403 without it)
+- **Query:** `limit` (optional, cap the batch — handy for testing).
+
+```bash
+curl -X POST "http://127.0.0.1:8000/admin/send-weekly-digests" \
+  -H "X-Admin-Token: $ADMIN_TOKEN"
+# -> {"sent": 12, "skipped": 3, "failed": 0, "provider": "outbox", "total_users": 15, ...}
+```
+Schedule it weekly (crontab or Windows Task Scheduler — see
+[`cron_weekly_digest.py`](cron_weekly_digest.py)):
+```cron
+0 8 * * 1  cd /path/to/swapify && python cron_weekly_digest.py >> digest.log 2>&1
+```
+
+#### Email subscription preferences (auth)
+- `GET /email-preferences` → `{ "user_id", "weekly_digest": true|false }`
+- `POST /email-preferences` with `{"weekly_digest": false}` → toggle off/on.
+
+#### Unsubscribe (one-click, no login)
+- **URL:** `/unsubscribe?token=<signed-token>` · **Method:** `GET`
+
+Returns a small HTML confirmation page and flips the user's subscription off. An
+invalid/forged token is rejected (`400`) without changing anything.
+
 ### 23. Weekly Challenges & Leaderboard API
 
 A **gamification** layer: users join **weekly challenges** and see where they
@@ -2438,6 +2506,24 @@ curl "http://127.0.0.1:8000/product/8908013479122/badge"
 When a product **does** qualify, `is_recommended` is `true`, `badge` is
 `"Swapify Recommended"` and `failing_criteria` is empty.
 
+### 27a. "Better For You" Badge (Feature 2)
+A lighter, purely score-driven badge — distinct from the stricter *Swapify
+Recommended* badge above (which also requires no high-risk ingredients and no
+artificial colours). **Any product scoring 7 or higher** earns it.
+
+There is no separate endpoint: the flag is attached to product and list responses
+so cards and detail pages can render it directly:
+- **Product detail** (`GET /product/{barcode}`, `GET /score/{barcode}`):
+  `is_better_for_you` (bool) and `better_for_you_badge`
+  (`{ "is_better_for_you", "label", "threshold": 7.0, "score" }`).
+- **Lists** (`/search`, `/products/by-category/{category}`, `/recommendations`,
+  `/home-feed` recently-scanned): each item carries `is_better_for_you`.
+
+```json
+{ "is_better_for_you": true,
+  "better_for_you_badge": {"is_better_for_you": true, "label": "Better For You", "threshold": 7.0, "score": 7.5} }
+```
+
 ---
 
 ### 28. Product Image Upload API
@@ -2813,10 +2899,82 @@ curl -H "X-Admin-Token: $ADMIN_TOKEN" "$BASE/experiment/analytics"
 > Export anything you need to keep (`GET /experiment/logs?limit=500`) before
 > redeploying. See [`DEPLOYMENT.md`](DEPLOYMENT.md) §11.
 
+### 31. Product Categories API (Feature 4)
+Backend support for the frontend categories page. Every product carries a
+consistent `category` (derived by the shared
+[`category_taxonomy.guess_category`](src/category_taxonomy.py) at seed time). **No
+auth.**
+
+#### List categories
+- **URL:** `/products/categories` · **Method:** `GET`
+
+```bash
+curl http://127.0.0.1:8000/products/categories
+```
+```json
+{
+  "count": 23,
+  "total_products": 252,
+  "categories": [
+    {"category": "chocolate", "label": "Chocolate", "count": 48},
+    {"category": "chips", "label": "Chips", "count": 34},
+    {"category": "soft_drink", "label": "Soft Drink", "count": 30}
+  ]
+}
+```
+Ordered by product count (largest first). `label` is a display-friendly form of
+the category id (`soft_drink` → `Soft Drink`).
+
+#### Products in a category (paginated, scored)
+- **URL:** `/products/by-category/{category}` · **Method:** `GET`
+- **Query Parameters:**
+  - `sort`: `score_desc` (default, healthiest first), `score_asc`, or `name`.
+  - `limit`: 1–500 per page (default 50). · `offset`: skip N for pagination.
+
+```bash
+curl "http://127.0.0.1:8000/products/by-category/protein_bar?limit=2"
+```
+```json
+{
+  "category": "protein_bar",
+  "label": "Protein Bar",
+  "total": 10,
+  "count": 2,
+  "limit": 2,
+  "offset": 0,
+  "has_more": true,
+  "products": [
+    {"barcode": "8908013479122", "product_name": "The whole truth food protein bar",
+     "brand": "The whole truth", "category": "protein_bar", "score": 6.1, "grade": "C",
+     "recommended": false, "is_better_for_you": false,
+     "nutrition_per_100g": {"basis": "per_100g", "serving_size_g": 52.0, "sugar": 0.0, "protein": 25.0, "fiber": 8.5, "…": "…"},
+     "image_url": "/product-images/_placeholder.svg"}
+  ]
+}
+```
+An unknown/empty category returns `total: 0` and an empty `products` array.
+
 ## Health Scoring Logic (V2)
 
 The `/v2/score/{barcode}` API uses a rule-based scoring system to evaluate product
 health on a scale of 1.0 to 10.0.
+
+> **Spec compliance.** This engine implements
+> [`ScoringLogic_Swapify.md`](ScoringLogic_Swapify.md) (Chandrika's two-sided
+> ingredient risk/benefit framework). Every value below — the base score, position
+> multipliers, category caps, transparency multipliers, all §3 ingredient
+> deductions, all §4 additions, the §3.7 sodium %RDA bands and the §4.1/4.2/4.4
+> per-100g stacking bonuses — matches that document. This is enforced by
+> [`test_scoring_spec.py`](test_scoring_spec.py) (100 assertions, incl. the spec's
+> two §6 worked examples): run `python test_scoring_spec.py`.
+>
+> **One documented extension:** the spec's negative sections are ingredient-based,
+> but ~96% of the catalogue has a nutrition panel and **no** ingredient list — a
+> purely ingredient-driven score would leave every sugary drink at the neutral 5.0
+> baseline. So the engine adds nutrient-panel **sugar** and **saturated-fat**
+> penalties (alongside the spec's own §3.7 sodium %RDA penalty). They pool into the
+> spec's *Sugars & Sweeteners* / *Oils & Fats* categories and share the spec 2.4
+> caps, so they never exceed what the spec allows.
 
 ### Formula
 
@@ -2826,108 +2984,84 @@ Final Score = (5.0 - Negative Deductions + Positive Additions) x Transparency Mu
 
 The result is clamped to the range **1.0 – 10.0**.
 
-> **Source of truth:** this implements `ScoringLogic_Swapify.md` (Chandrika's
-> spec). Section numbers below map to that document. It supersedes the
-> 24th-June review numbers — see [What changed](#what-changed-vs-the-june-engine).
+**Worked examples (spec §6), reproduced by the engine:**
 
-### 1. Nutrient Penalties & Bonuses
+| Product | Ingredients | Engine score | Spec |
+|---------|-------------|--------------|------|
+| Instant noodles | Maida, Palm oil, Salt, MSG, TBHQ, Sodium benzoate, Tartrazine | **1.0 (F)** | ~1.4 |
+| Protein multigrain biscuit | Whole wheat flour, Oats, Pea protein isolate, Jaggery, Cold-pressed oil | **9.1 (A)** | ~8.4 |
 
-**Penalties (per serving):**
-- **Sugar:** >=10g (-2), 5–10g (-1)
-- **Sodium** (spec §3.7, % of the 2000mg daily value): >30% RDA / >600mg (-1.0),
-  15–30% RDA / 300–600mg (-0.6)
-- **Saturated Fat** (monotonic sliding scale): >=20g (-2.0), 10–20g (-1.5),
-  6–10g (-1.0), 3–6g (-0.5)
+The two sit far apart — the spec's core credibility claim. (Small differences from
+the spec's hand-worked figures come from the engine following the §2.3 position
+table exactly and applying the §4.5/4.8 clean-label / whole-food bonuses; the
+spread and grades match.)
 
-**Bonuses (per 100g — the "bonus, stacks" rows in spec §4.1 / §4.2 / §4.4):**
-- **Protein:** >=10g (+0.6)
-- **Fiber:** >=5g (+0.5)
-- **Sugar:** <5g (+0.5)
+> **One engine, both sides (Fix 2).** Every backend endpoint scores through a
+> single function (`calculate_health_score_v2`), and the frontend's client-side
+> scorer (used for offline / CSV-driven cards) was rewritten to mirror it exactly —
+> same thresholds, per-100g bonuses, caps, transparency and 1–10 clamp — so a
+> product scores identically in a CSV list and when scanned. The client catalogue
+> CSV is regenerated from the database ([`export_products.py`](export_products.py))
+> so both sides read the same data. (Products with an ingredient list are always
+> resolved through the backend on scan, since the full 86-rule ingredient engine is
+> authoritative.)
 
-Per-serving figures are normalised to per-100g using `serving_size_g`; products
-without a serving size are skipped rather than guessed at.
+#### 1. Nutrient Penalties (per serving)
+- **Sugar:** ≥10g (−2), 5–10g (−1)
+- **Sodium** (%RDA of 2000 mg): >30% i.e. >600mg (−1.0), 15–30% i.e. 300–600mg (−0.6)
+- **Saturated Fat** (sliding scale): ≥20g (−2.0), 10–20g (−1.5), 6–10g (−1.0), 3–6g (−0.5)
 
-Nutrient penalties and bonuses are pooled into the same categories as
-ingredients (Sugars & Sweeteners, Oils & Fats, Sodium, Protein Quality, Fiber,
-Natural Sweeteners) and share their caps (see step 3).
+#### 1b. Nutrient Bonuses (per 100g)
+Normalised via `serving_size_g` before the threshold is checked:
+- **Protein:** ≥10g per 100g (+0.6)
+- **Fiber:** ≥5g per 100g (+0.5)
+- **Sugar:** <5g per 100g (+0.5)
 
-### 2. Ingredient Deductions & Additions
+Sugar, saturated-fat and sodium nutrient penalties are pooled into the same
+categories as ingredients (Sugars & Sweeteners, Oils & Fats, Sodium) and share
+their caps (see step 3).
 
-Each matched ingredient is multiplied by its position in the list (spec §2.3 —
-FSSAI requires descending order by weight, so position proxies quantity):
+> **Display basis (Fix 1).** Scoring reads the stored *per-serving* nutrition, but
+> product responses also expose a `nutrition_per_100g` block and the UI displays
+> nutrition **per 100g**, so a 200 ml drink no longer shows its full-serving
+> numbers under a "per 100g" heading. See [Get Product Details](#1-get-product-details-api).
+
+### 2. Ingredient Penalties & Position Multipliers
+Each ingredient keyword is penalized (or rewarded) and multiplied by its position
+in the list:
 - **Top 3 ingredients:** x1.5
 - **Middle (4th–8th):** x1.0
 - **9th onward / trace (index >= 8):** x0.5
 
-**Matching is longest-keyword-first**, so the most specific rule wins: "invert
-sugar syrup" (-0.6) beats "sugar" (-0.8), and "rice bran oil" (a healthy fat,
-+0.4) beats "rice bran" (fiber, +0.6). Short keywords (<=4 chars, e.g. `msg`,
-`bha`, `e102`) match on word boundaries so they cannot fire inside an unrelated
-word.
+**Ingredient penalties (base, before multiplier):**
+- **Oils & Fats:** palm oil (-0.6), fractionated fat (-0.7)
+- **Refined Carbohydrates:** maida / refined wheat flour (-0.5)
+- **Sodium:** salt (-0.6)
+- **Flavor Enhancers:** msg (-0.5)
+- **Preservatives:** tbhq (-0.8), sodium benzoate (-0.6)
+- **Artificial Colors:** tartrazine (-0.7)
+- **Sugars & Sweeteners:** sugar (-0.8), corn syrup (-0.6)
 
-**Negative ingredients (spec §3.1–3.10)** — base points before multiplier:
-
-| Category | Examples (base deduction) |
-|---|---|
-| Oils & Fats | partially hydrogenated / vanaspati (-1.2), reused frying oil (-1.0), interesterified (-0.7), fractionated fat (-0.7), palm oil / palmolein (-0.6), cottonseed oil (-0.3) |
-| Sugars & Sweeteners | HFCS (-1.0), refined sugar (-0.8), corn syrup (-0.6), invert sugar syrup (-0.6), aspartame (-0.6), acesulfame-K (-0.4), maltodextrin (-0.4), sucralose (-0.3) |
-| Preservatives | sodium nitrite/nitrate (-1.2), BHA (-1.0), TBHQ (-0.8), sulphites (-0.6), sodium benzoate (-0.6), BHT (-0.5), potassium sorbate (-0.2) |
-| Artificial Colors | tartrazine (-0.7), sunset yellow (-0.7), carmoisine (-0.6), allura red (-0.6), erythrosine (-0.5), caramel colour IV (-0.5) |
-| Flavor Enhancers | MSG / yeast extract (-0.5), disodium inosinate / guanylate (-0.3), unspecified artificial flavouring (-0.3) |
-| Emulsifiers & Stabilizers | polysorbate 80 (-0.5), carboxymethyl cellulose (-0.5), sodium stearoyl lactylate (-0.2) |
-| Sodium | disodium phosphate (-0.3) |
-| Refined Carbohydrates | maida / refined wheat flour (-0.5), modified starch (-0.3) |
-| Caffeine & Stimulants | caffeine (-0.6, escalating to -1.0 for `energy_drink`), taurine (-0.6) |
-| Other Additives | potassium bromate (-1.2), titanium dioxide (-0.7), propylene glycol (-0.3), undisclosed natural flavours (-0.2) |
-
-**Positive ingredients (spec §4.1–4.8)** — base points before multiplier:
-
-| Category | Examples (base addition) |
-|---|---|
-| Protein Quality | whey protein (+0.8), pea / soy protein isolate (+0.7), milk solids / paneer / curd (+0.5), lentil / chickpea / besan (+0.5), nuts & seeds (+0.4), egg (+0.4) |
-| Fiber | whole grain / oats / atta / millet (+0.7), oat or wheat bran (+0.6), psyllium husk (+0.4), inulin / chicory (+0.4) |
-| Healthy Fats & Oils | cold-pressed / virgin oils (+0.5), olive or rice-bran oil (+0.4), omega-3 source (+0.4) |
-| Natural Sweeteners | no added sugar (+0.7), jaggery / date paste / honey (+0.4), stevia (+0.3), monk fruit (+0.3) |
-| Natural Preservation | tocopherols (+0.3), rosemary extract (+0.3), clean-label bonus (+0.6, conditional — see below) |
-| Micronutrients | iron + folic acid (+0.4), vitamin D (+0.4), vitamin B12 (+0.3), calcium (+0.2), zinc (+0.2) |
-| Probiotics | named strain e.g. *Lactobacillus* (+0.5), live active cultures (+0.4), prebiotic fiber (+0.2) |
-| Whole-Food | short ingredient list, <=5 items (+0.6) |
-
-**Conditional clean-label bonus.** Spec §4.5 marks its "no artificial
-preservatives / colours / MSG" rows *(verified)*. Absence is only treated as
-verification when the label is specific: the +0.6 requires an ingredient list
-that (a) triggers no deduction in any additive category and (b) uses no vague
-catch-all terms. A label reading "permitted preservative" or "spices" earns
-nothing — it hides exactly the additives the bonus would be crediting its
-absence of. Products with **no** ingredient list never earn it.
+**Positive additions (base, before multiplier):**
+- **Healthy Fats:** peanuts (+0.4)
+- **Protein Quality:** skimmed milk (+0.5), milk solids (+0.5)
 
 Detected harmful ingredients are returned in the `ingredient_flags` list.
 
-### 3. Category Caps (spec §2.4)
+### 3. Category Caps (maximum deduction per category)
+Caps apply to the **combined** ingredient + nutrient penalty for each category:
+- Oils & Fats: -2.5
+- Sugars & Sweeteners: -2.5
+- Preservatives: -2.0
+- Artificial Colors: -2.0
+- Sodium: -2.0
+- Caffeine & Stimulants: -2.0
+- Flavor Enhancers: -1.5
+- Emulsifiers & Stabilizers: -1.5
+- Other Additives: -1.5
+- Refined Carbohydrates: -1.0
 
-**Deduction caps** apply to the **combined** ingredient + nutrient penalty per category:
-
-| Category | Cap | Category | Cap |
-|---|---|---|---|
-| Oils & Fats | -2.5 | Flavor Enhancers | -1.5 |
-| Sugars & Sweeteners | -2.5 | Emulsifiers & Stabilizers | -1.5 |
-| Preservatives | -2.0 | Other Additives | -1.5 |
-| Artificial Colors | -2.0 | Refined Carbohydrates | -1.0 |
-| Sodium | -2.0 | Caffeine & Stimulants | -2.0 |
-
-**Addition caps** apply the same way to the positive side, so a product cannot
-inflate its score by listing many minor "good" ingredients:
-
-| Category | Cap | Category | Cap |
-|---|---|---|---|
-| Protein Quality | +2.0 | Natural Preservation | +1.0 |
-| Fiber | +1.5 | Micronutrients | +1.0 |
-| Healthy Fats & Oils | +1.0 | Whole-Food | +1.0 |
-| Natural Sweeteners | +1.0 | Probiotics | +0.75 |
-
-Both sides are reported in the score breakdown as `category_totals` (deductions)
-and `addition_totals` (additions), each with `raw`, `cap`, `applied` and
-`capped` fields.
+Positive additions are **not** capped.
 
 ### 4. Transparency Multiplier
 Applied to the subtotal before the final clamp:
@@ -2945,58 +3079,19 @@ The clamped score (1.0 – 10.0) maps to a grade:
 
 ### Worked example — Cadbury Dairy Milk (`7622300441937`)
 
-Ingredients: *Sugar, Milk Solids (23%), Cocoa Butter, Cocoa Solids, Fractionated
-Fat, Emulsifiers (442, 476), Flavours*
-
 | Source | Item | Position | Mult | Points |
 |--------|------|----------|------|--------|
 | Ingredient | Sugar | 1 | x1.5 | -1.20 |
 | Ingredient | Fractionated Fat | 5 | x1.0 | -0.70 |
-| Nutrient | Sugar (57g/serving) | – | x1.0 | -2.00 |
-| Nutrient | Saturated Fat (19.6g/serving) | – | x1.0 | -1.50 |
+| Nutrient | Sugar (57g) | – | x1.0 | -2.00 |
+| Nutrient | Saturated Fat (19.6g) | – | x1.0 | -1.00 |
 | Addition | Milk Solids | 2 | x1.5 | +0.75 |
 
 - Sugars & Sweeteners: -1.20 + -2.00 = -3.20 → capped at **-2.50**
-- Oils & Fats: -0.70 + -1.50 = **-2.20** (within the -2.5 cap)
-- Protein Quality: **+0.75** (within the +2.0 cap)
-- No clean-label bonus: "Flavours" is a vague term, and the label is not specific
-  enough to verify the absence of anything.
-- Subtotal: 5.0 - 4.70 + 0.75 = **1.05**
+- Oils & Fats: -0.70 + -1.00 = **-1.70** (within cap)
+- Subtotal: 5.0 - 4.20 + 0.75 = **1.55**
 - Transparency: **x0.95** ("Flavours" is vague)
-- **Final: 1.05 × 0.95 = 0.9975 → clamped to 1.0 (F)**
-
-### What changed vs. the June engine
-
-| Area | Before | Now |
-|---|---|---|
-| Ingredient rules | 14 keywords | **69 rules** covering all of spec §3.1–3.10 and §4.1–4.8 |
-| Positive caps | not applied — additions summed uncapped | spec §2.4 addition caps enforced |
-| Saturated fat | **non-monotonic**: 8g scored -2 but 15g scored -1 | monotonic sliding scale, -0.5 → -2.0 |
-| Sodium | ad-hoc mg cutoffs (>=400mg -2, >=200mg -1) | spec §3.7 %RDA bands |
-| Protein / fiber bonuses | per serving (>=8g +1, >=5g +1) | per 100g (>=10g +0.6, >=5g +0.5), plus <5g sugar +0.5 |
-| Matching | first rule in list order wins | longest-keyword-first; word boundaries for short codes |
-| Plain "salt" | -0.6 ingredient deduction | removed — sodium is scored from the %RDA bands instead, so it is no longer double-counted |
-
-Regression expectations updated accordingly in `test_scoring.py`: Snickers
-1.6 → **2.1** (peanuts are spec §4.1 "nuts & seeds" under the capped Protein
-Quality category rather than an uncapped "Healthy Fats" bonus, and 5.0g
-saturated fat now sits in the 3–6g band); Cadbury 1.5 → **1.0** (19.6g saturated
-fat now scores -1.5 on the corrected scale).
-
-**Two places the spec contradicts itself** — the normative tables were followed
-over the worked examples, and both are flagged for Chandrika:
-1. Example A applies x0.5 to positions 6–7, but table §2.3 defines 4th–8th as
-   x1.0. Following the table yields **1.0**, not the 1.4 printed in the example.
-2. Example B scores oats at +0.6, but §4.2 lists oats in the +0.7 whole-grain row.
-
-### Data coverage caveat
-
-**244 of the 252 curated products currently have no `ingredients_text`.** For
-those products the entire ingredient half of this engine is inert and the score
-comes from nutrition data alone — no ingredient deductions, no ingredient
-additions, no clean-label or whole-food bonuses, and a x1.0 transparency
-multiplier. Scores will shift once ingredient data is populated. `/product-count`
-and `/offline-products` can be used to audit coverage.
+- **Final: 1.55 × 0.95 = 1.5 (F)**
 
 ## Personalized Scoring
 
