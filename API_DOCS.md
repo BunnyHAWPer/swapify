@@ -172,8 +172,25 @@ ingredient together with its **risk level** (`Low` / `Medium` / `High` / `Severe
 Risk levels are stored in the database (`ingredient_rules.risk_level`) — see
 [Ingredient Risk Levels](#ingredient-risk-levels) below.
 
-If the product is not in the local database, it is fetched and scored from
-**Open Food Facts** on the fly (the response then also includes `"source": "openfoodfacts"`).
+**Resolution is database-FIRST (auto-fill pipeline).** The barcode is resolved
+against **our database first**; only if a core nutrient is missing does it fall
+back — in strict priority order — to **Open Food Facts → USDA FoodData Central →
+IFCT 2017 → a Google/AI safety net**. Whatever a fallback fills is normalised to
+per-100g and **written back to our database**, so the next scan of that product is
+served locally with no network call. The `source` field names the primary origin
+(`database`, `openfoodfacts`, `usda`, `ifct2017`, `google`), and a `resolution`
+object records the full audit trail (`sources_tried`, `enriched_by`,
+`filled_fields`, `matched_on`, `estimated`). If every source fails the product is
+flagged for manual review and a `404` is returned. See
+[Auto-Fill Missing-Data Pipeline](#auto-fill-missing-data-pipeline) for details.
+
+Every product carries a **`confidence`** rating derived from how *complete* its
+data is — never a blanket "High". The five levels are **Very High** (all six
+nutrients + ingredients), **High** (most data, ≥5 nutrients), **Medium** (some
+data), **Low** (only ingredients), **Very Low** (no data). The `confidence_meta`
+object shows the evidence (`data_availability`, `nutrients_present`,
+`missing_fields`, `completeness`). Data filled by the estimating Google/AI net is
+capped at **Medium**. See [Data Confidence](#data-confidence).
 
 The response always includes an **`image_url`** — the product's contributed image
 or the shared placeholder (`/product-images/_placeholder.svg`) when it has none
@@ -210,32 +227,45 @@ curl http://127.0.0.1:8000/product/8901058005783   # Maggi noodles
   "product_name": "Maggi noodles",
   "brand": "Maggi",
   "category": "noodles",
-  "serving_size_g": 75.0,
-  "sugar_g_per_serving": 1.5,
-  "saturated_fat_g_per_serving": 6.8,
-  "sodium_mg_per_serving": 750.0,
-  "protein_g_per_serving": 6.2,
-  "fiber_g_per_serving": 2.5,
-  "calories_kcal_per_serving": 288.0,
+  "serving_size_g": 100.0,
+  "sugar_g_per_serving": 2.0,
+  "saturated_fat_g_per_serving": 9.07,
+  "sodium_mg_per_serving": 1000.0,
+  "protein_g_per_serving": 8.27,
+  "fiber_g_per_serving": 3.33,
+  "calories_kcal_per_serving": 384.0,
   "ingredients_text": "Maida (Refined wheat flour), Palm oil, Salt, MSG, TBHQ, Sodium benzoate, Tartrazine",
   "score": 1.0,
   "grade": "F",
   "rule_version": 1,
+  "source": "database",
+  "data_source": "database",
   "breakdown": { "...": "see Health Scoring Logic section" },
   "ingredient_flags": [
     {"name": "maida", "risk": "High"},
     {"name": "palm oil", "risk": "Medium"},
-    {"name": "salt", "risk": "Medium"},
-    {"name": "msg", "risk": "Medium"},
     {"name": "tbhq", "risk": "Severe"},
-    {"name": "sodium benzoate", "risk": "Medium"},
     {"name": "tartrazine", "risk": "High"}
   ],
   "is_better_for_you": false,
   "better_for_you_badge": {"is_better_for_you": false, "label": null, "threshold": 7.0, "score": 1.0},
+  "confidence": "Very High",
+  "confidence_meta": {
+    "level": "Very High",
+    "class": "confidence-very-high",
+    "completeness": 1.0,
+    "nutrients_present": 6,
+    "nutrients_total": 6,
+    "has_ingredients": true,
+    "data_availability": {
+      "calories": true, "sugar": true, "protein": true,
+      "sodium": true, "fiber": true, "saturated_fat": true, "ingredients": true
+    },
+    "missing_fields": []
+  },
   "nutrition_per_100g": {
     "basis": "per_100g",
-    "serving_size_g": 75.0,
+    "serving_size_g": 100.0,
     "calories": 384.0,
     "sugar": 2.0,
     "saturated_fat": 9.1,
@@ -243,16 +273,29 @@ curl http://127.0.0.1:8000/product/8901058005783   # Maggi noodles
     "protein": 8.3,
     "fiber": 3.3
   },
+  "resolution": {
+    "source": "database",
+    "sources_tried": ["database"],
+    "enriched_by": [],
+    "filled_fields": [],
+    "matched_on": "barcode",
+    "estimated": false
+  },
   "image_url": "/product-images/_placeholder.svg"
 }
 ```
 
-> **`nutrition_per_100g` (Fix 1):** the catalogue stores nutrition *per serving*,
-> and a serving is often not 100 g/ml. This block normalises every nutrient to a
-> per-100g basis (`value × 100 / serving_size_g`) so figures are comparable across
-> products and the UI can label them honestly. When `serving_size_g` is missing the
-> `basis` is `"per_serving_unknown"` and the per-serving values pass through
-> unchanged. The raw `*_g_per_serving` fields are still included.
+> **`serving_size_g` is always `100`.** The entire catalogue is stored per-100g so
+> scores are directly comparable — a 44 g product can no longer out-score an
+> identical 100 g one. The `nutrition_per_100g` block reports the same 100g basis
+> for display; when a row's `serving_size_g` is genuinely unknown the `basis` is
+> `"per_serving_unknown"` and values pass through unchanged.
+>
+> **`confidence` (Tasks 2 & 7):** rates data completeness on five levels; see
+> [Data Confidence](#data-confidence). `confidence_meta` carries the evidence.
+>
+> **`source` / `data_source` / `resolution`:** where the data came from and the
+> auto-fill audit trail; see [Auto-Fill Missing-Data Pipeline](#auto-fill-missing-data-pipeline).
 >
 > **`is_better_for_you` (Feature 2):** `true` when `score ≥ 7`. `better_for_you_badge`
 > carries the label and threshold. This is a lighter flag than the stricter
@@ -264,6 +307,83 @@ curl http://127.0.0.1:8000/product/8901058005783   # Maggi noodles
   "error": "Product not found"
 }
 ```
+
+<a name="data-confidence"></a>
+### 1a. Data Confidence  (Tasks 2 & 7)
+
+Every scored product carries a **`confidence`** string that reflects **how complete
+its data is** — it is *not* a fixed "High". This replaces the old behaviour where a
+product with no nutrition still showed "High" confidence.
+
+| Data available | `confidence` |
+|---|---|
+| All six nutrients **and** ingredients | **Very High** |
+| Most data present (≥ 5 of 6 nutrients) | **High** |
+| Some data present (1–4 nutrients) | **Medium** |
+| Only ingredients present (no nutrients) | **Low** |
+| No data present | **Very Low** |
+
+The six nutrients counted are calories, sugar, protein, sodium, fibre and saturated
+fat. A genuine `0` counts as present (it is data); only `null`/blank is missing.
+`confidence_meta` exposes the evidence:
+
+```json
+"confidence_meta": {
+  "level": "Medium",
+  "class": "confidence-medium",
+  "completeness": 0.571,
+  "nutrients_present": 4,
+  "nutrients_total": 6,
+  "has_ingredients": false,
+  "data_availability": {"calories": true, "sugar": true, "protein": true,
+                         "sodium": true, "fiber": false, "saturated_fat": false,
+                         "ingredients": false},
+  "missing_fields": ["fiber", "saturated_fat", "ingredients"]
+}
+```
+
+Data filled by the estimating Google/AI safety net is **capped at Medium** (with
+`"capped_reason": "estimated_source"`) so a best-effort guess can never present as
+"Very High".
+
+<a name="auto-fill-missing-data-pipeline"></a>
+### 1b. Auto-Fill Missing-Data Pipeline  (database-first)
+
+Product resolution checks **our database first** and only reaches out when a core
+nutrient is actually missing, in strict priority order:
+
+| # | Source | Provides |
+|---|---|---|
+| 1 | **Swapify database** (CSV-seeded) | our curated data — **always checked first** |
+| 2 | **Open Food Facts** | barcode lookup, nutrition, ingredients |
+| 3 | **USDA FoodData Central** | 600k foods, detailed nutrition (`USDA_API_KEY`, defaults to `DEMO_KEY`) |
+| 4 | **IFCT 2017** (Indian Foods) | 528 NIN Hyderabad foods (optional local `data/ifct2017.json`) |
+| 5 | **Google / AI safety net** | last resort — SerpApi (`SERPAPI_KEY`) or an AI estimate |
+
+The chain stops as soon as the six core nutrients are present. Anything a fallback
+fills is **normalised to per-100g** and **written back to our database**, so the
+next scan of that product is served locally with no network call. If every source
+fails, the product is flagged for manual review (`missing_reports`) and the endpoint
+returns `404`.
+
+Each `/product` response reports the outcome:
+
+```json
+"source": "database",
+"data_source": "database",
+"resolution": {
+  "source": "openfoodfacts",
+  "sources_tried": ["database", "openfoodfacts", "usda"],
+  "enriched_by": ["usda"],
+  "filled_fields": ["fiber_g_per_serving"],
+  "matched_on": "barcode",
+  "estimated": false
+}
+```
+
+**Config (all optional, safe defaults):** `SWAPIFY_AUTOFILL` (on), `SWAPIFY_GOOGLE_FALLBACK`
+(on), `SWAPIFY_SOURCE_TIMEOUT` (6s), `USDA_API_KEY`, `SERPAPI_KEY`, `IFCT_DATA_PATH`.
+Complete database products (the whole 252-row catalogue) make **zero** network calls.
 
 ### 2. Get Product Health Score API
 This endpoint returns only the health score and the corresponding grade for a given product by its barcode.
