@@ -898,6 +898,76 @@ SPEC_A_GRADE="$(printf '%s' "$LAST_BODY" | json_get grade)"
 echo "${BLUE}Example A grade = ${SPEC_A_GRADE:-?}  (spec: very low, D/F)${RESET}"
 
 # =============================================================================
+banner "REVIEWER FEEDBACK VERIFICATION  (the 'What Needs to be Fixed' checklist)"
+# Named products the reviewer reported as "Product Not Found". In our catalogue
+# they carry slightly different names, so we assert by *barcode* (a scan) — which
+# is exactly how the app resolves them.
+BC_RAGABITES="8908002984590"   # "Tata Soulful Ragi Bite"  == Soulfull Ragabites choco
+BC_SLURRP_RAGI="8908006217465" # "Slurrp Farm Ragi & Banana Cereal"
+BC_KULFI="8901262176477"       # Amul mava malai kulfi   (reviewer said 50g)
+BC_CHOCOBAR="8901262176224"    # Amul Chocobar           (reviewer said 44g)
+BC_WT_CRANBERRY="8906123100028" # Whole Truth cranberry bar (reviewer said 52g)
+BC_PARLEG="8901719113345"      # Parle G
+BC_CHANNA="8906161390719"      # Let's Try roasted channa (scores 7+ -> Better For You)
+
+section "104a" "FIX #1 — ALL PRODUCTS LOADED  (named 'not found' products are scannable)"
+for bc in "$BC_RAGABITES" "$BC_SLURRP_RAGI"; do
+  request GET "/product/$bc" "" noauth
+  NAME="$(printf '%s' "$LAST_BODY" | json_get product_name)"
+  check "product $bc resolves (status)" "$LAST_CODE" "200"
+  [ -n "$NAME" ] && check "product $bc has a name" "yes" "yes" || check "product $bc has a name" "no" "yes"
+  echo "${BLUE}  -> $NAME${RESET}"
+done
+
+section "104b" "FIX #2 — NUTRITION NORMALIZED TO 100g  (serving_size_g == 100 for the reported products)"
+for bc in "$BC_KULFI" "$BC_CHOCOBAR" "$BC_WT_CRANBERRY"; do
+  request GET "/product/$bc" "" noauth
+  SERV="$(printf '%s' "$LAST_BODY" | json_get serving_size_g)"
+  BASIS="$("$PY" -c "import sys,json;print((json.load(sys.stdin).get('nutrition_per_100g') or {}).get('basis',''))" <<< "$LAST_BODY")"
+  check "serving_size_g==100 for $bc" "$SERV" "100.0"
+  check "nutrition basis is per_100g for $bc" "$BASIS" "per_100g"
+done
+
+section "104c" "FIX #4 — PER-100g SCORING + CONFIDENCE  (Parle G: complete data -> Very High confidence)"
+request GET "/product/$BC_PARLEG" "" noauth
+CONF="$(printf '%s' "$LAST_BODY" | json_get confidence)"
+SRC="$(printf '%s' "$LAST_BODY" | json_get source)"
+check "Parle G resolves from our DATABASE first (Fix #1)" "$SRC" "database"
+check "Parle G confidence == Very High"                    "$CONF" "Very High"
+
+section "104d" "FIX #5 — BETTER FOR YOU BADGE  (a product scores 7+ and is flagged)"
+request GET "/product/$BC_CHANNA" "" noauth
+CH_SCORE="$(printf '%s' "$LAST_BODY" | json_get score)"
+CH_BFY="$(printf '%s' "$LAST_BODY" | json_get is_better_for_you)"
+echo "${BLUE}  roasted channa score=$CH_SCORE  is_better_for_you=$CH_BFY${RESET}"
+check "roasted channa is_better_for_you == True" "$CH_BFY" "True"
+SCORE_GE7="$("$PY" -c "import sys,json;print('yes' if (json.load(sys.stdin).get('score') or 0) >= 7 else 'no')" <<< "$LAST_BODY")"
+check "roasted channa score >= 7" "$SCORE_GE7" "yes"
+
+section "104e" "FIX #3 — AI CHAT IS FAST  (deterministic fast-path, expected < 5s)"
+for Q in "Hi" "What is the score of Frooti?"; do
+  START_MS=$("$PY" -c "import time;print(int(time.time()*1000))")
+  request POST "/chat" "{\"question\":\"$Q\"}" noauth
+  END_MS=$("$PY" -c "import time;print(int(time.time()*1000))")
+  ELAPSED=$((END_MS-START_MS))
+  CH_SRC="$(printf '%s' "$LAST_BODY" | json_get source)"
+  echo "${BLUE}  chat '$Q' -> ${ELAPSED}ms  source=$CH_SRC${RESET}"
+  check "chat '$Q' status" "$LAST_CODE" "200"
+  UNDER5="$([ "$ELAPSED" -lt 5000 ] && echo yes || echo no)"
+  check "chat '$Q' under 5s" "$UNDER5" "yes"
+done
+
+section "104f" "FIX #10 — AUTOCOMPLETE IS FAST  (single-letter query returns instantly)"
+for Q in "L" "Li"; do
+  START_MS=$("$PY" -c "import time;print(int(time.time()*1000))")
+  request GET "/search/autocomplete?q=$Q&limit=8" "" noauth
+  END_MS=$("$PY" -c "import time;print(int(time.time()*1000))")
+  ELAPSED=$((END_MS-START_MS))
+  echo "${BLUE}  autocomplete '$Q' -> ${ELAPSED}ms${RESET}"
+  check "autocomplete '$Q' status" "$LAST_CODE" "200"
+done
+
+# =============================================================================
 banner "DATABASE VERIFICATION  (proving the writes actually persisted)"
 
 echo
