@@ -263,6 +263,13 @@ CHAT_BUDGET_S = float(os.environ.get("CHAT_BUDGET", "12"))
 # Don't start another provider call unless at least this much budget is left.
 CHAT_MIN_CALL_S = 2.5
 
+# Fix 3: answer plain product score/health/nutrition questions ("score of Frooti",
+# "is Maggi healthy", "sugar in X") deterministically from our own scored data
+# instead of the LLM. Every fact is already in the product dict, so this turns an
+# 18-22s provider round-trip into a sub-second reply. Set CHAT_FAST_PRODUCT_ANSWERS=0
+# to force those through the LLM (e.g. for prose-quality A/B testing).
+CHAT_FAST_PRODUCT_ANSWERS = os.environ.get("CHAT_FAST_PRODUCT_ANSWERS", "1") != "0"
+
 # Cap the reply length. The system prompt asks for <=150 words, so 700 tokens was
 # far more headroom than needed and every unused token is latency: free-tier
 # models stream slowly, and time-to-last-token scales with what's generated.
@@ -517,6 +524,55 @@ _cache_stats = {"product_hits": 0, "product_misses": 0,
 LEADERBOARD_CACHE_TTL = 60  # seconds
 _leaderboard_cache = TTLCache(maxsize=32, ttl=LEADERBOARD_CACHE_TTL)
 
+# --- Search autocomplete cache (Fix 7: recommendations/typeahead were slow) ---
+# The catalogue is ~250 rows and changes rarely, but the old typeahead opened a
+# fresh DB connection and ran LIKE scans on *every* keystroke, so latency was
+# dominated by per-request connection + query overhead rather than the tiny data
+# set. We fix this two ways:
+#   1. A lowercased in-memory *index* of (barcode, name, brand), built once and
+#      reused, so matching happens in Python with zero DB round-trips.
+#   2. A short-TTL result cache keyed by (normalized query, limit), so repeated
+#      keystrokes ("l" -> "li" -> "lin") and many users typing the same prefixes
+#      are served straight from memory.
+# Both refresh on their TTL and are invalidated immediately when a product
+# changes (see invalidate_product_cache).
+AUTOCOMPLETE_INDEX_TTL = 300  # 5 min — catalogue changes are rare
+AUTOCOMPLETE_RESULT_TTL = 60  # seconds
+_autocomplete_index_cache = TTLCache(maxsize=1, ttl=AUTOCOMPLETE_INDEX_TTL)
+_autocomplete_result_cache = TTLCache(maxsize=512, ttl=AUTOCOMPLETE_RESULT_TTL)
+_cache_stats_autocomplete = {"hits": 0, "misses": 0, "index_builds": 0}
+
+
+def get_autocomplete_index():
+    """Return the cached lowercased catalogue index for typeahead, rebuilding it
+    (one small SELECT) at most once per ``AUTOCOMPLETE_INDEX_TTL``.
+
+    Each entry is ``(barcode, product_name, brand, name_lower, brand_lower)`` so
+    the endpoint can word-match without touching the DB or re-lowercasing."""
+    idx = _autocomplete_index_cache.get("index")
+    if idx is not None:
+        return idx
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            "SELECT barcode, product_name, brand FROM products"
+        ).fetchall()
+    finally:
+        conn.close()
+    idx = [
+        (
+            r["barcode"],
+            r["product_name"],
+            r["brand"],
+            (r["product_name"] or "").lower(),
+            (r["brand"] or "").lower(),
+        )
+        for r in rows
+    ]
+    _autocomplete_index_cache["index"] = idx
+    _cache_stats_autocomplete["index_builds"] += 1
+    return idx
+
 
 def cache_get_product(barcode):
     """Return a cached generic scored product for ``barcode`` (or None)."""
@@ -542,6 +598,10 @@ def invalidate_product_cache(barcode=None):
     else:
         _product_cache.pop(barcode, None)
     _popular_cache.clear()
+    # The typeahead index/result caches derive from the catalogue, so any product
+    # change must drop them too or new/renamed products won't appear in search.
+    _autocomplete_index_cache.clear()
+    _autocomplete_result_cache.clear()
     _cache_stats["invalidations"] += 1
 
 
@@ -583,6 +643,16 @@ def cache_stats():
             "entries": len(_leaderboard_cache),
             "maxsize": _leaderboard_cache.maxsize,
             "ttl_seconds": LEADERBOARD_CACHE_TTL,
+        },
+        "autocomplete_cache": {
+            "hits": _cache_stats_autocomplete["hits"],
+            "misses": _cache_stats_autocomplete["misses"],
+            "hit_rate": _hit_rate(_cache_stats_autocomplete["hits"],
+                                  _cache_stats_autocomplete["misses"]),
+            "index_builds": _cache_stats_autocomplete["index_builds"],
+            "result_entries": len(_autocomplete_result_cache),
+            "index_ttl_seconds": AUTOCOMPLETE_INDEX_TTL,
+            "result_ttl_seconds": AUTOCOMPLETE_RESULT_TTL,
         },
         "invalidations": s["invalidations"],
         "ttl_seconds": PRODUCT_CACHE_TTL,
@@ -965,92 +1035,760 @@ def attach_nutrition_per_100g(product: dict) -> dict:
     return product
 
 
-def get_scored_product(barcode: str, preferences: dict = None):
-    """Return a fully scored product dict for a barcode (local DB first, then
-    Open Food Facts), or None if it cannot be found anywhere. Used as shared
-    product-context loader for /product, /chat and /compare-multiple. Does not
-    record scans. When ``preferences`` are supplied the score is personalized.
+# ==============================================================================
+# Data confidence  (Tasks 2 & 7 — confidence reflects data completeness)
+# ==============================================================================
+# Confidence must express HOW COMPLETE a product's data is — never a blanket
+# "High". A product scanned with no nutrition is Very Low confidence even though
+# we can still return a default 5/10 score. The five levels below map directly
+# onto the reviewer's spec table:
+#
+#   Very High   all six nutrients AND ingredients present   (all data present)
+#   High        most data present (>= 5 of 6 nutrients)
+#   Medium      some data present (1-4 nutrients)
+#   Low         only ingredients present (no nutrients)
+#   Very Low    no data present at all
 
-    The generic (non-personalized) result is served from a 1-hour cache; a
-    personalized request always scores fresh (see ``generic_scored_product``).
+# The six nutrient signals used for completeness, in display order.
+CONFIDENCE_NUTRIENT_FIELDS = (
+    ("calories", "calories_kcal_per_serving"),
+    ("sugar", "sugar_g_per_serving"),
+    ("protein", "protein_g_per_serving"),
+    ("sodium", "sodium_mg_per_serving"),
+    ("fiber", "fiber_g_per_serving"),
+    ("saturated_fat", "saturated_fat_g_per_serving"),
+)
+
+CONFIDENCE_ORDER = ["Very Low", "Low", "Medium", "High", "Very High"]
+CONFIDENCE_CLASS = {
+    "Very High": "confidence-very-high",
+    "High": "confidence-high",
+    "Medium": "confidence-medium",
+    "Low": "confidence-low",
+    "Very Low": "confidence-very-low",
+}
+
+
+def _field_present(value) -> bool:
+    """True when a nutrient/ingredient value is genuinely present.
+
+    ``None`` and blank strings are absent. A real ``0`` (0 g sugar) IS present —
+    it is data, not a gap — so only null/blank count as missing.
     """
-    if not preferences:
-        return generic_scored_product(barcode)
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
 
+
+def compute_confidence(product: dict) -> dict:
+    """Rate a product's data completeness on the five-level scale (Tasks 2 & 7).
+
+    Returns ``{"level", "class", "completeness", "nutrients_present",
+    "nutrients_total", "has_ingredients", "data_availability", "missing_fields"}``.
+    ``level`` is the human string the UI shows; the rest is the evidence behind it
+    so the rating is auditable rather than a magic word.
+    """
+    availability = {}
+    present = 0
+    missing = []
+    for key, field in CONFIDENCE_NUTRIENT_FIELDS:
+        ok = _field_present(product.get(field))
+        availability[key] = ok
+        if ok:
+            present += 1
+        else:
+            missing.append(key)
+
+    has_ing = _field_present(product.get("ingredients_text"))
+    availability["ingredients"] = has_ing
+    if not has_ing:
+        missing.append("ingredients")
+
+    total = len(CONFIDENCE_NUTRIENT_FIELDS)
+    if present == 0 and not has_ing:
+        level = "Very Low"           # no data present
+    elif present == 0:
+        level = "Low"                # only ingredients present
+    elif present == total and has_ing:
+        level = "Very High"          # all data present
+    elif present >= 5:
+        level = "High"               # most data present
+    else:
+        level = "Medium"             # some data present
+
+    completeness = round((present + (1 if has_ing else 0)) / (total + 1), 3)
+    return {
+        "level": level,
+        "class": CONFIDENCE_CLASS[level],
+        "completeness": completeness,
+        "nutrients_present": present,
+        "nutrients_total": total,
+        "has_ingredients": has_ing,
+        "data_availability": availability,
+        "missing_fields": missing,
+    }
+
+
+def _cap_confidence(meta: dict, ceiling: str) -> dict:
+    """Lower a confidence rating to at most ``ceiling`` (never raise it).
+
+    Data from an *estimated* source (the AI/Google safety net) can look complete
+    yet be a best-effort guess, so its confidence is capped here — a guess must
+    never present as "Very High"."""
+    if CONFIDENCE_ORDER.index(meta["level"]) > CONFIDENCE_ORDER.index(ceiling):
+        meta = dict(meta)
+        meta["level"] = ceiling
+        meta["class"] = CONFIDENCE_CLASS[ceiling]
+        meta["capped_reason"] = "estimated_source"
+    return meta
+
+
+def attach_confidence(product: dict) -> dict:
+    """Attach the confidence rating to a scored product dict in place (Task 2/7).
+
+    Sets ``confidence`` (the level string the UI reads) and ``confidence_meta``
+    (the full evidence dict). Estimated-source data is capped at Medium."""
+    if product is None:
+        return product
+    meta = compute_confidence(product)
+    if product.get("data_estimated"):
+        meta = _cap_confidence(meta, "Medium")
+    product["confidence"] = meta["level"]
+    product["confidence_meta"] = meta
+    return product
+
+
+# ==============================================================================
+# Auto-fill missing-data pipeline  (Tasks 1, 3, 4, 6)
+# ==============================================================================
+# Goal: ZERO products with missing data. Resolution always checks OUR database
+# FIRST (Task 1) and only falls back — in strict priority order — to external
+# sources when a nutrient is actually missing:
+#
+#   1  Swapify database (CSV-seeded)   our curated data          <- ALWAYS first
+#   2  Open Food Facts                 barcode lookup
+#   3  USDA FoodData Central           600k foods, detailed nutrition
+#   4  IFCT 2017 (Indian foods)        528 NIN Hyderabad foods
+#   5  Google / AI safety net          find anything online
+#
+# Whatever a fallback fills is normalized to per-100g (Task 6) and written back
+# to our database, so the next scan of the same product is served straight from
+# step 1 with no network call. If every source fails the barcode is flagged for
+# manual review (Chandrika).
+
+AUTOFILL_ENABLED = os.environ.get("SWAPIFY_AUTOFILL", "1") not in ("0", "false", "False", "")
+GOOGLE_FALLBACK_ENABLED = os.environ.get("SWAPIFY_GOOGLE_FALLBACK", "1") not in ("0", "false", "False", "")
+USDA_API_KEY = os.environ.get("USDA_API_KEY", "DEMO_KEY").strip()
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "").strip()
+EXTERNAL_SOURCE_TIMEOUT_S = float(os.environ.get("SWAPIFY_SOURCE_TIMEOUT", "6"))
+
+# The nutrient columns an auto-fill can populate (ingredients handled alongside).
+CORE_NUTRIENT_FIELDS = (
+    "calories_kcal_per_serving",
+    "sugar_g_per_serving",
+    "protein_g_per_serving",
+    "sodium_mg_per_serving",
+    "fiber_g_per_serving",
+    "saturated_fat_g_per_serving",
+)
+# Every column an external source may contribute to a stored row.
+FILLABLE_FIELDS = CORE_NUTRIENT_FIELDS + ("ingredients_text", "category", "brand", "image_url")
+# Sources whose data is a best-effort estimate rather than a measured value.
+ESTIMATED_SOURCES = {"google"}
+
+
+def _has_missing_nutrition(product: dict) -> bool:
+    """True when any of the six core nutrients is absent.
+
+    Ingredients being absent does NOT trigger a network fetch — most catalogue
+    rows legitimately lack an ingredients list and external sources rarely have
+    one either, so gating on ingredients would make every scan hit the network
+    for nothing. Nutrition gaps are what this pipeline exists to fill."""
+    if product is None:
+        return True
+    return any(not _field_present(product.get(f)) for f in CORE_NUTRIENT_FIELDS)
+
+
+def _normalize_to_100g(product: dict) -> dict:
+    """Rescale a product's nutrients to a per-100g basis, serving = 100 (Task 6).
+
+    Our DB is already per-100g (serving_size_g == 100 -> factor 1.0, a no-op);
+    this makes any freshly fetched row consistent with it regardless of the
+    serving size it arrived in, so scoring and display always compare like-for-
+    like on 100g. Mutates and returns ``product``."""
+    if product is None:
+        return product
+    try:
+        serving = float(product.get("serving_size_g") or 0)
+    except (TypeError, ValueError):
+        serving = 0.0
+    if serving > 0 and serving != 100.0:
+        factor = 100.0 / serving
+        for field in CORE_NUTRIENT_FIELDS:
+            val = product.get(field)
+            if val is not None:
+                try:
+                    product[field] = round(float(val) * factor, 2)
+                except (TypeError, ValueError):
+                    pass
+    product["serving_size_g"] = 100.0
+    return product
+
+
+def _name_hint(product: dict) -> str:
+    """A human product name to query name-based sources (USDA/IFCT/Google) with."""
+    if not product:
+        return ""
+    parts = [product.get("brand") or "", product.get("product_name") or ""]
+    return " ".join(p.strip() for p in parts if p and p.strip()).strip()
+
+
+def _present_nutrient_fields(product: dict) -> list:
+    """List of fillable fields ``product`` actually has (for the audit trail)."""
+    return [f for f in FILLABLE_FIELDS if _field_present(product.get(f))]
+
+
+def _fill_missing_fields(base: dict, extra: dict) -> list:
+    """Copy any field from ``extra`` into ``base`` that ``base`` is missing.
+
+    Never overwrites data our DB already has — the database stays the source of
+    truth for what it knows; a fallback only fills the gaps. Returns the list of
+    field names that were filled."""
+    filled = []
+    for field in FILLABLE_FIELDS:
+        if not _field_present(base.get(field)) and _field_present(extra.get(field)):
+            base[field] = extra[field]
+            filled.append(field)
+    return filled
+
+
+# --- Source 2: Open Food Facts ------------------------------------------------
+def _source_openfoodfacts(barcode: str, name: str):
+    """Barcode lookup against Open Food Facts (already per-100g)."""
+    return fetch_off_product(barcode)
+
+
+# --- Source 3: USDA FoodData Central ------------------------------------------
+def _source_usda(barcode: str, name: str):
+    """USDA FoodData Central: search by barcode (GTIN/UPC), then by name.
+
+    Returns a per-100g product dict or None. Best-effort: a missing key, network
+    error or unparseable payload all degrade to None so the pipeline moves on."""
+    barcode = (barcode or "").strip()
+    name = (name or "").strip()
+    query = barcode or name
+    if not USDA_API_KEY or not query:
+        return None
+
+    def _search(q):
+        try:
+            r = requests.get(
+                "https://api.nal.usda.gov/fdc/v1/foods/search",
+                params={"query": q, "api_key": USDA_API_KEY, "pageSize": 1},
+                timeout=EXTERNAL_SOURCE_TIMEOUT_S,
+            )
+            if r.status_code != 200:
+                return None
+            return ((r.json() or {}).get("foods") or [None])[0]
+        except (requests.RequestException, ValueError):
+            return None
+
+    food = _search(query)
+    if not food and name and query != name:
+        food = _search(name)          # barcode missed -> retry on the name
+    if not food:
+        return None
+
+    nutrients = food.get("foodNutrients", []) or []
+
+    def _num(*needles):
+        for n in nutrients:
+            nm = (n.get("nutrientName") or "").lower()
+            if any(nd in nm for nd in needles):
+                v = n.get("value")
+                if v not in (None, ""):
+                    try:
+                        return float(v)
+                    except (TypeError, ValueError):
+                        continue
+        return None
+
+    def _energy_kcal():
+        kcal = kj = None
+        for n in nutrients:
+            if "energy" in (n.get("nutrientName") or "").lower():
+                unit = (n.get("unitName") or "").upper()
+                try:
+                    v = float(n.get("value"))
+                except (TypeError, ValueError):
+                    continue
+                if unit == "KCAL":
+                    kcal = v
+                elif unit == "KJ":
+                    kj = v
+        if kcal is not None:
+            return kcal
+        return round(kj / 4.184, 1) if kj is not None else None
+
+    return {
+        "barcode": barcode,
+        "product_name": food.get("description") or name or "Unknown Product",
+        "brand": food.get("brandOwner") or food.get("brandName") or "",
+        "serving_size_g": 100.0,
+        "calories_kcal_per_serving": _energy_kcal(),
+        "sugar_g_per_serving": _num("sugars, total", "total sugars", "sugars"),
+        "protein_g_per_serving": _num("protein"),
+        "sodium_mg_per_serving": _num("sodium"),
+        "fiber_g_per_serving": _num("fiber", "fibre"),
+        "saturated_fat_g_per_serving": _num("fatty acids, total saturated", "saturated"),
+        "ingredients_text": food.get("ingredients") or "",
+    }
+
+
+# --- Source 4: IFCT 2017 (Indian Foods) ---------------------------------------
+_IFCT_INDEX = None
+
+
+def _load_ifct_index():
+    """Lazy-load the optional IFCT 2017 dataset (528 Indian foods, NIN Hyderabad).
+
+    Looks for a JSON list at ``IFCT_DATA_PATH`` (env) or ``data/ifct2017.json``
+    beside the repo root. The dataset is not bundled — when the file is absent
+    this source is simply skipped, so the pipeline still runs. Each record:
+    ``{"name","brand","calories","sugar","protein","sodium","fiber",
+    "saturated_fat","ingredients"}`` per 100g."""
+    global _IFCT_INDEX
+    if _IFCT_INDEX is not None:
+        return _IFCT_INDEX
+    path = os.environ.get("IFCT_DATA_PATH") or os.path.join(_REPO_ROOT, "data", "ifct2017.json")
+    index = []
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as fh:
+                index = json.load(fh) or []
+    except (OSError, ValueError) as exc:
+        logger.warning("IFCT dataset load failed (%s): %s", path, exc)
+        index = []
+    _IFCT_INDEX = index
+    return index
+
+
+def _source_ifct(barcode: str, name: str):
+    """IFCT 2017 Indian-foods table, matched by name (per 100g)."""
+    name = (name or "").strip().lower()
+    if not name:
+        return None
+    records = _load_ifct_index()
+    if not records:
+        return None
+    match = None
+    for rec in records:
+        rname = (rec.get("name") or "").strip().lower()
+        if rname and (rname in name or name in rname):
+            match = rec
+            break
+    if not match:
+        return None
+    return {
+        "barcode": barcode,
+        "product_name": match.get("name") or name,
+        "brand": match.get("brand") or "",
+        "serving_size_g": 100.0,
+        "calories_kcal_per_serving": match.get("calories"),
+        "sugar_g_per_serving": match.get("sugar"),
+        "protein_g_per_serving": match.get("protein"),
+        "sodium_mg_per_serving": match.get("sodium"),
+        "fiber_g_per_serving": match.get("fiber"),
+        "saturated_fat_g_per_serving": match.get("saturated_fat"),
+        "ingredients_text": match.get("ingredients") or "",
+    }
+
+
+# --- Source 5: Google / AI safety net -----------------------------------------
+_NUTRI_PATTERNS = {
+    "calories_kcal_per_serving": r"(?:energy|calories|calorie)[^\d]{0,20}?(\d+(?:\.\d+)?)\s*k?cal",
+    "sugar_g_per_serving": r"sugars?\b[^\d]{0,20}?(\d+(?:\.\d+)?)\s*g",
+    "protein_g_per_serving": r"protein[^\d]{0,20}?(\d+(?:\.\d+)?)\s*g",
+    "fiber_g_per_serving": r"(?:fibre|fiber)[^\d]{0,20}?(\d+(?:\.\d+)?)\s*g",
+    "saturated_fat_g_per_serving": r"saturated[^\d]{0,25}?(\d+(?:\.\d+)?)\s*g",
+    "sodium_mg_per_serving": r"sodium[^\d]{0,20}?(\d+(?:\.\d+)?)\s*(mg|g)",
+}
+
+
+def _parse_nutrition_text(text: str):
+    """Pull per-100g nutrient numbers out of free-text search snippets."""
+    if not text:
+        return None
+    text_l = text.lower()
+    out = {}
+    for field, pat in _NUTRI_PATTERNS.items():
+        m = re.search(pat, text_l)
+        if not m:
+            continue
+        try:
+            val = float(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        if field == "sodium_mg_per_serving" and m.lastindex and m.group(m.lastindex) == "g":
+            val *= 1000.0             # snippet reported sodium in grams
+        out[field] = val
+    return out or None
+
+
+def _serpapi_nutrition(query: str, barcode: str):
+    """Structured Google results via SerpApi; parse nutrition from the snippets."""
+    try:
+        r = requests.get(
+            "https://serpapi.com/search.json",
+            params={
+                "engine": "google",
+                "q": f"{query} {barcode} nutrition facts per 100g".strip(),
+                "api_key": SERPAPI_KEY,
+                "num": 5,
+            },
+            timeout=EXTERNAL_SOURCE_TIMEOUT_S,
+        )
+        if r.status_code != 200:
+            return None
+        data = r.json() or {}
+    except (requests.RequestException, ValueError):
+        return None
+    blobs = []
+    ab = data.get("answer_box")
+    if isinstance(ab, dict):
+        blobs.append(json.dumps(ab))
+    for res in (data.get("organic_results") or [])[:5]:
+        blobs.append(res.get("snippet") or "")
+    parsed = _parse_nutrition_text(" ".join(b for b in blobs if b))
+    if not parsed:
+        return None
+    parsed.update({"barcode": barcode, "product_name": query, "serving_size_g": 100.0})
+    return parsed
+
+
+def _extract_json_object(text: str):
+    """Pull the first JSON object out of an LLM reply (tolerating fences/prose)."""
+    if not text:
+        return None
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except ValueError:
+        return None
+
+
+def _ai_estimate_nutrition(query: str, barcode: str):
+    """Ask the LLM for a product's per-100g nutrition as strict JSON (an estimate)."""
+    if not AI_ENABLED:
+        return None
+    question = (
+        f'Give typical nutrition facts per 100g for the packaged food product '
+        f'"{query}" (barcode {barcode or "unknown"}). Respond with ONLY a compact '
+        f'JSON object, no prose, using exactly these keys and numeric values in '
+        f'these units: {{"calories_kcal": number, "sugar_g": number, '
+        f'"protein_g": number, "sodium_mg": number, "fiber_g": number, '
+        f'"saturated_fat_g": number}}. Use null for any value you genuinely do not know.'
+    )
+    try:
+        text, _provider, _model = call_llm(question, context="")
+    except Exception as exc:
+        logger.warning("AI nutrition estimate failed for %r: %s", query, exc)
+        return None
+    data = _extract_json_object(text)
+    if not data:
+        return None
+
+    def _n(key):
+        v = data.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    fetched = {
+        "barcode": barcode,
+        "product_name": query,
+        "serving_size_g": 100.0,
+        "calories_kcal_per_serving": _n("calories_kcal"),
+        "sugar_g_per_serving": _n("sugar_g"),
+        "protein_g_per_serving": _n("protein_g"),
+        "sodium_mg_per_serving": _n("sodium_mg"),
+        "fiber_g_per_serving": _n("fiber_g"),
+        "saturated_fat_g_per_serving": _n("saturated_fat_g"),
+    }
+    if all(fetched[f] is None for f in CORE_NUTRIENT_FIELDS):
+        return None                  # LLM had nothing — don't fabricate an empty row
+    return fetched
+
+
+def _source_google(barcode: str, name: str):
+    """Last-resort safety net (Task 4): SerpApi Google results when a key is set,
+    otherwise an AI estimate. Name-gated (never asks about a bare barcode) and
+    flagged as an estimate so its confidence is capped downstream."""
+    if not GOOGLE_FALLBACK_ENABLED:
+        return None
+    query = (name or "").strip()
+    if not query:                    # no product name -> nothing meaningful to search
+        return None
+    if SERPAPI_KEY:
+        got = _serpapi_nutrition(query, barcode)
+        if got:
+            return got
+    return _ai_estimate_nutrition(query, barcode)
+
+
+# Priority-ordered fallback chain (step 1, our DB, is handled in the resolver).
+FALLBACK_SOURCES = (
+    ("openfoodfacts", _source_openfoodfacts),
+    ("usda", _source_usda),
+    ("ifct2017", _source_ifct),
+    ("google", _source_google),
+)
+
+
+def _run_autofill_chain(barcode: str, product: dict, audit: dict):
+    """Fill missing nutrition from external sources in strict priority order.
+
+    Stops as soon as the six core nutrients are all present. Returns the
+    (possibly newly created / enriched) product and the updated audit."""
+    for src_name, src_fn in FALLBACK_SOURCES:
+        if product is not None and not _has_missing_nutrition(product):
+            break
+        try:
+            fetched = src_fn(barcode, _name_hint(product))
+        except Exception as exc:     # one bad source must never break resolution
+            logger.warning("auto-fill source %s errored for %s: %s", src_name, barcode, exc)
+            fetched = None
+        audit["sources_tried"].append(src_name)
+        if not fetched:
+            continue
+        _normalize_to_100g(fetched)
+        if product is None:
+            product = fetched
+            audit["source"] = src_name
+            audit["filled_fields"] = _present_nutrient_fields(fetched)
+            contributed = True
+        else:
+            filled = _fill_missing_fields(product, fetched)
+            audit["filled_fields"].extend(filled)
+            if filled:
+                audit["enriched_by"].append(src_name)
+            contributed = bool(filled)
+        if contributed and src_name in ESTIMATED_SOURCES:
+            audit["estimated"] = True
+    return product, audit
+
+
+def _store_resolved_product(product: dict, audit: dict):
+    """UPSERT a resolved/enriched product into our DB so the next scan is local.
+
+    Writes only the catalogue columns, never overwrites a value our DB already
+    holds (COALESCE keeps the existing one — the DB stays source of truth), tags
+    the row with the source and a timestamp, and invalidates the product cache.
+    Best-effort: a write failure is logged, never raised."""
+    barcode = product.get("barcode")
+    if not barcode:
+        return
+    label = audit.get("source") or "unknown"
+    if audit.get("enriched_by"):
+        label = label + "+" + "+".join(audit["enriched_by"])
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO products (
+                barcode, product_name, brand, category, serving_size_g,
+                sugar_g_per_serving, saturated_fat_g_per_serving, sodium_mg_per_serving,
+                protein_g_per_serving, fiber_g_per_serving, calories_kcal_per_serving,
+                ingredients_text, image_url, data_source, data_updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(barcode) DO UPDATE SET
+                product_name = COALESCE(products.product_name, excluded.product_name),
+                brand        = COALESCE(NULLIF(products.brand, ''), excluded.brand),
+                category     = COALESCE(products.category, excluded.category),
+                serving_size_g = 100.0,
+                sugar_g_per_serving         = COALESCE(products.sugar_g_per_serving, excluded.sugar_g_per_serving),
+                saturated_fat_g_per_serving = COALESCE(products.saturated_fat_g_per_serving, excluded.saturated_fat_g_per_serving),
+                sodium_mg_per_serving       = COALESCE(products.sodium_mg_per_serving, excluded.sodium_mg_per_serving),
+                protein_g_per_serving       = COALESCE(products.protein_g_per_serving, excluded.protein_g_per_serving),
+                fiber_g_per_serving         = COALESCE(products.fiber_g_per_serving, excluded.fiber_g_per_serving),
+                calories_kcal_per_serving   = COALESCE(products.calories_kcal_per_serving, excluded.calories_kcal_per_serving),
+                ingredients_text = COALESCE(NULLIF(products.ingredients_text, ''), excluded.ingredients_text),
+                image_url    = COALESCE(products.image_url, excluded.image_url),
+                data_source  = excluded.data_source,
+                data_updated_at = excluded.data_updated_at
+            """,
+            (
+                barcode, product.get("product_name"), product.get("brand") or "",
+                product.get("category"), 100.0,
+                product.get("sugar_g_per_serving"), product.get("saturated_fat_g_per_serving"),
+                product.get("sodium_mg_per_serving"), product.get("protein_g_per_serving"),
+                product.get("fiber_g_per_serving"), product.get("calories_kcal_per_serving"),
+                product.get("ingredients_text") or "", product.get("image_url"),
+                label, datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            ),
+        )
+        conn.commit()
+        conn.close()
+        invalidate_product_cache(barcode)
+        logger.info("auto-fill stored %s from %s (filled: %s)", barcode, label,
+                    ",".join(audit.get("filled_fields") or []) or "new-row")
+    except sqlite3.Error as exc:
+        logger.warning("auto-fill store failed for %s: %s", barcode, exc)
+
+
+def _flag_for_manual_review(barcode: str, audit: dict):
+    """Record a not-found product for manual review (Chandrika) — the last resort
+    when every source fails (Task 4). De-duplicated so repeat scans don't pile up."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM missing_reports WHERE barcode = ? LIMIT 1", (barcode,))
+        if cur.fetchone() is None:
+            tried = ", ".join(audit.get("sources_tried") or []) or "db"
+            cur.execute(
+                "INSERT INTO missing_reports (barcode, product_name, user_comment) VALUES (?, ?, ?)",
+                (barcode, None, f"auto: not found in any source ({tried}) — needs manual data"),
+            )
+            conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("could not flag %s for manual review: %s", barcode, exc)
+
+
+def resolve_raw_product(barcode: str, enrich: bool = None):
+    """Resolve a barcode to a raw (unscored) per-100g product dict, DB FIRST (Task 1).
+
+    Order: our database (exact, then GS1-payload) -> Open Food Facts -> USDA ->
+    IFCT 2017 -> Google/AI safety net. External sources run only when a nutrient
+    is missing; anything they fill is normalized to per-100g (Task 6) and written
+    back to our DB so the next scan is local. Returns ``(product, source, audit)``;
+    ``product`` is None only when every source failed (then the barcode is flagged
+    for manual review)."""
+    if enrich is None:
+        enrich = AUTOFILL_ENABLED
+    audit = {
+        "scanned_barcode": barcode,
+        "canonical_barcode": barcode,
+        "source": None,
+        "sources_tried": [],
+        "enriched_by": [],
+        "filled_fields": [],
+        "estimated": False,
+        "matched_on": "barcode",
+        "flagged_for_review": False,
+    }
+
+    # --- Step 1: OUR DATABASE, FIRST (Task 1) --------------------------------
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM products WHERE barcode = ?", (barcode,))
     row = cursor.fetchone()
+    if row is None:
+        row = lookup_by_gs1_payload(cursor, barcode)
+        if row is not None:
+            audit["matched_on"] = "gs1_payload"
     conn.close()
 
-    source = "database"
-    if row:
-        p_dict = dict(row)
-    else:
-        p_dict = fetch_off_product(barcode)
-        source = "openfoodfacts"
-    if not p_dict:
-        return None
+    product = dict(row) if row else None
+    if product is not None:
+        audit["source"] = "database"
+        audit["sources_tried"].append("database")
+        audit["canonical_barcode"] = product.get("barcode") or barcode
 
-    score, grade, rule_version, breakdown = calculate_health_score_v2(p_dict, 1, preferences)
-    p_dict['score'] = score
-    p_dict['grade'] = grade
-    p_dict['rule_version'] = rule_version
-    p_dict['breakdown'] = breakdown
-    p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
-    p_dict['preferences_applied'] = breakdown.get('preferences_applied', {})
-    p_dict['source'] = source
-    attach_better_for_you(p_dict)
-    attach_nutrition_per_100g(p_dict)
-    return p_dict
+    # --- Steps 2-5: fallback chain, only when data is actually missing --------
+    if enrich and _has_missing_nutrition(product):
+        product, audit = _run_autofill_chain(audit["canonical_barcode"], product, audit)
+        if product is not None and (audit["source"] != "database" or audit["filled_fields"]):
+            _store_resolved_product(product, audit)
+
+    if product is None:
+        _flag_for_manual_review(barcode, audit)
+        audit["flagged_for_review"] = True
+        return None, None, audit
+
+    _normalize_to_100g(product)
+    product["barcode"] = audit["canonical_barcode"]
+    product["data_source"] = audit["source"]
+    product["data_estimated"] = audit["estimated"]
+    product["resolution"] = {
+        "source": audit["source"],
+        "sources_tried": audit["sources_tried"],
+        "enriched_by": audit["enriched_by"],
+        "filled_fields": audit["filled_fields"],
+        "matched_on": audit["matched_on"],
+        "estimated": audit["estimated"],
+    }
+    return product, audit["source"], audit
+
+
+def _score_and_decorate(raw: dict, source: str, preferences: dict = None) -> dict:
+    """Score a resolved raw product and attach every response decoration.
+
+    One place that turns a raw per-100g product dict into the full API payload:
+    score/grade/breakdown, ingredient flags, the "Swapify Recommended" and
+    "Better For You" badges, per-100g nutrition (Fix 1) and the data-completeness
+    confidence rating (Tasks 2/7). Returns a fresh dict."""
+    p = dict(raw)
+    score, grade, rule_version, breakdown = calculate_health_score_v2(p, 1, preferences)
+    p['score'] = score
+    p['grade'] = grade
+    p['rule_version'] = rule_version
+    p['breakdown'] = breakdown
+    p['ingredient_flags'] = breakdown.get('ingredient_flags', [])
+    p['preferences_applied'] = breakdown.get('preferences_applied', {}) if preferences else {}
+    p['source'] = source
+    badge = evaluate_recommended_badge(p, breakdown, preferences)
+    p['is_recommended'] = badge['is_recommended']
+    p['recommended_badge'] = badge
+    attach_better_for_you(p)
+    attach_nutrition_per_100g(p)
+    attach_confidence(p)
+    return p
+
+
+def get_scored_product(barcode: str, preferences: dict = None):
+    """Return a fully scored product dict for a barcode (OUR DB first, then the
+    auto-fill fallback chain), or None if it cannot be found anywhere. Shared
+    product-context loader for /product, /chat and /compare-multiple. Does not
+    record scans. When ``preferences`` are supplied the score is personalized.
+
+    The generic (non-personalized) result is served from a 1-hour cache; a
+    personalized request always scores fresh."""
+    if not preferences:
+        return generic_scored_product(barcode)
+
+    raw, source, _audit = resolve_raw_product(barcode)
+    if raw is None:
+        return None
+    return _score_and_decorate(raw, source, preferences)
 
 
 def generic_scored_product(barcode: str):
     """Fully-scored *generic* (non-personalized) product payload, cached for
     ``PRODUCT_CACHE_TTL`` seconds (Task 1C).
 
-    Resolves the product from the local DB first, then Open Food Facts, scores it
-    with the generic ruleset and attaches the "Swapify Recommended" badge. The
-    result is cached by barcode so repeat detail lookups avoid the DB read,
-    scoring work and (for OFF fallbacks) the network round-trip. A fresh copy is
-    returned each call so callers can safely mutate it. Returns None when the
-    product cannot be found anywhere. Invalidated by ``invalidate_product_cache``
-    whenever the product changes (e.g. a new image upload)."""
+    Resolves the product from OUR database first, then the auto-fill fallback
+    chain (Open Food Facts -> USDA -> IFCT -> Google), scores it with the generic
+    ruleset and attaches all badges + confidence. The result is cached by barcode
+    so repeat detail lookups avoid the DB read, scoring work and (for fallbacks)
+    the network round-trip. A fresh copy is returned each call. Returns None when
+    the product cannot be found anywhere. Invalidated by
+    ``invalidate_product_cache`` whenever the product changes."""
     cached = cache_get_product(barcode)
     if cached is not None:
         return dict(cached)
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM products WHERE barcode = ?", (barcode,))
-    row = cursor.fetchone()
-    conn.close()
-
-    if row:
-        p_dict = dict(row)
-        source = "database"
-    else:
-        p_dict = fetch_off_product(barcode)
-        source = "openfoodfacts"
-    if not p_dict:
+    raw, source, _audit = resolve_raw_product(barcode)
+    if raw is None:
         return None
 
-    score, grade, rule_version, breakdown = calculate_health_score_v2(p_dict, 1, None)
-    p_dict['score'] = score
-    p_dict['grade'] = grade
-    p_dict['rule_version'] = rule_version
-    p_dict['breakdown'] = breakdown
-    p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
-    p_dict['preferences_applied'] = {}
-    p_dict['source'] = source
-    badge = evaluate_recommended_badge(p_dict, breakdown, None)
-    p_dict['is_recommended'] = badge['is_recommended']
-    p_dict['recommended_badge'] = badge
-    # "Better For You" badge (Feature 2): score >= 7.
-    attach_better_for_you(p_dict)
-    # Per-100g nutrition for display (Fix 1).
-    attach_nutrition_per_100g(p_dict)
-
+    p_dict = _score_and_decorate(raw, source, None)
     cache_set_product(barcode, p_dict)
     return dict(p_dict)
 
@@ -1199,130 +1937,87 @@ def get_product(barcode: str, device_id: Optional[str] = None,
     # Validate the barcode up front so we can attach a helpful correction hint to
     # the response (especially on a 404) without blocking the lookup itself.
     validation = validate_barcode(barcode)
-
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("SELECT * FROM products WHERE barcode = ?", (barcode,))
-    row = cursor.fetchone()
-
-    # The scan we were handed is check-digit-valid by construction, but the row it
-    # belongs to may have been transcribed with a bad one. Retry on the GS1 payload,
-    # then continue under the *stored* barcode so history, scoring and the cache all
-    # key off one canonical value.
     scanned_barcode = barcode
-    if row is None:
-        row = lookup_by_gs1_payload(cursor, barcode)
-        if row is not None:
-            barcode = row["barcode"]
 
-    if row and (device_id or user_id):
-        # Generic (unpersonalized) score, purely so badge metrics have a
-        # stable, comparable basis across users — the personalized score used
-        # for the response itself is computed separately below.
+    # Resolve DB-FIRST (Task 1), then auto-fill from OFF -> USDA -> IFCT -> Google
+    # only when a nutrient is missing (Tasks 3/4). The result is normalized to
+    # per-100g (Task 6) and any fetched data is written back to our DB.
+    raw, source, audit = resolve_raw_product(barcode)
+
+    if raw is None:
+        # Not found anywhere (already flagged for manual review by the resolver).
+        # Surface the validation hint so the client can retry with a correction.
+        content = {"error": "Product not found"}
+        if not validation["valid"]:
+            content["barcode_validation"] = validation
+        return JSONResponse(status_code=404, content=content)
+
+    # Continue under the canonical (stored) barcode so history, scoring and the
+    # cache all key off one value — this may differ from the scan when we matched
+    # on the GS1 payload past a bad stored check digit.
+    barcode = raw["barcode"]
+
+    if device_id or user_id:
+        # Generic (unpersonalized) score, purely so badge metrics have a stable,
+        # comparable basis across users — the personalized score used for the
+        # response itself is computed below.
         try:
-            _badge_score, _, _, _ = calculate_health_score_v2(dict(row), 1, None)
+            _badge_score, _, _, _ = calculate_health_score_v2(dict(raw), 1, None)
         except Exception:
             _badge_score = None
+        conn = get_db_connection()
+        cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO scan_history (device_id, user_id, barcode, product_name, health_score) "
             "VALUES (?, ?, ?, ?, ?)",
-            (device_id, user_id, barcode, row["product_name"], _badge_score)
+            (device_id, user_id, barcode, raw.get("product_name"), _badge_score)
         )
         conn.commit()
+        conn.close()
         # Best-effort activity log for logged-in scans (see /activity).
         if isinstance(user_id, int):
-            log_activity(user_id, "scan", barcode, {"device_id": device_id} if device_id else None)
+            log_activity(user_id, "scan", barcode,
+                         {"device_id": device_id} if device_id else {"source": source})
 
-    conn.close()
+    if barcode in recent_scans:
+        recent_scans.remove(barcode)
+    recent_scans.insert(0, barcode)
+    if len(recent_scans) > 5:
+        recent_scans.pop()
 
     # Personalize the score when the request is authenticated and the user has
-    # saved dietary preferences (otherwise this is the generic score).
+    # saved dietary preferences (otherwise this is the generic, cached score).
     preferences = load_user_preferences(user_id)
-
-    if row:
-        if barcode in recent_scans:
-            recent_scans.remove(barcode)
-        recent_scans.insert(0, barcode)
-        if len(recent_scans) > 5:
-            recent_scans.pop()
-
-        if preferences:
-            # Personalized score — always computed fresh (never cached).
-            p_dict = dict(row)
-            score, grade, rule_version, breakdown = calculate_health_score_v2(p_dict, 1, preferences)
-            p_dict['score'] = score
-            p_dict['grade'] = grade
-            p_dict['rule_version'] = rule_version
-            p_dict['breakdown'] = breakdown
-            p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
-            p_dict['preferences_applied'] = breakdown.get('preferences_applied', {})
-            # "Swapify Recommended" badge (Task 3): a clean, healthy pick.
-            badge = evaluate_recommended_badge(p_dict, breakdown, preferences)
-            p_dict['is_recommended'] = badge['is_recommended']
-            p_dict['recommended_badge'] = badge
-            # "Better For You" badge (Feature 2) + per-100g nutrition (Fix 1).
-            attach_better_for_you(p_dict)
-            attach_nutrition_per_100g(p_dict)
-        else:
-            # Generic score served from the 1-hour product cache (Task 1C).
-            p_dict = generic_scored_product(barcode)
-
-        # Always return an image reference — the product's own image or the
-        # shared placeholder — so the client never renders an empty box (Task 2).
-        p_dict['image_url'] = image_or_placeholder(p_dict.get('image_url'))
-        if not validation["valid"]:
-            p_dict['barcode_validation'] = validation
-        if scanned_barcode != barcode:
-            # Resolved on the GS1 payload, not an exact hit — say so, so a bad
-            # stored check digit shows up in testing instead of passing silently.
-            p_dict['barcode_matched_on'] = {
-                "scanned": scanned_barcode,
-                "stored": barcode,
-                "reason": "check_digit_mismatch",
-                "detail": (
-                    "The stored barcode's check digit does not match its GS1 payload; "
-                    "matched on the payload. The stored value needs re-verifying "
-                    "against the physical pack."
-                ),
-            }
-        return p_dict
-
-    # Fallback: fetch & score from Open Food Facts when not in the local DB.
     if preferences:
-        p_dict = fetch_off_product(barcode)
-        if p_dict:
-            score, grade, rule_version, breakdown = calculate_health_score_v2(p_dict, 1, preferences)
-            p_dict['score'] = score
-            p_dict['grade'] = grade
-            p_dict['rule_version'] = rule_version
-            p_dict['breakdown'] = breakdown
-            p_dict['ingredient_flags'] = breakdown.get('ingredient_flags', [])
-            p_dict['preferences_applied'] = breakdown.get('preferences_applied', {})
-            badge = evaluate_recommended_badge(p_dict, breakdown, preferences)
-            p_dict['is_recommended'] = badge['is_recommended']
-            p_dict['recommended_badge'] = badge
-            p_dict['source'] = 'openfoodfacts'
-            attach_better_for_you(p_dict)
-            attach_nutrition_per_100g(p_dict)
+        p_dict = _score_and_decorate(raw, source, preferences)
     else:
-        # Generic OFF lookup is cached (network round-trip included) (Task 1C).
-        p_dict = generic_scored_product(barcode)
+        cached = cache_get_product(barcode)
+        if cached is not None:
+            p_dict = dict(cached)
+        else:
+            p_dict = _score_and_decorate(raw, source, None)
+            cache_set_product(barcode, p_dict)
+            p_dict = dict(p_dict)
 
-    if p_dict:
-        p_dict['image_url'] = image_or_placeholder(p_dict.get('image_url'))
-        if isinstance(user_id, int):
-            log_activity(user_id, "scan", barcode, {"source": "openfoodfacts"})
-        if not validation["valid"]:
-            p_dict['barcode_validation'] = validation
-        return p_dict
-
-    # Not found anywhere. Surface the validation hint so the client can retry
-    # with the suggested correction when the barcode was malformed.
-    content = {"error": "Product not found"}
+    # Always return an image reference — the product's own image or the shared
+    # placeholder — so the client never renders an empty box (Task 2).
+    p_dict['image_url'] = image_or_placeholder(p_dict.get('image_url'))
     if not validation["valid"]:
-        content["barcode_validation"] = validation
-    return JSONResponse(status_code=404, content=content)
+        p_dict['barcode_validation'] = validation
+    if scanned_barcode != barcode:
+        # Resolved on the GS1 payload, not an exact hit — say so, so a bad stored
+        # check digit shows up in testing instead of passing silently.
+        p_dict['barcode_matched_on'] = {
+            "scanned": scanned_barcode,
+            "stored": barcode,
+            "reason": "check_digit_mismatch",
+            "detail": (
+                "The stored barcode's check digit does not match its GS1 payload; "
+                "matched on the payload. The stored value needs re-verifying "
+                "against the physical pack."
+            ),
+        }
+    return p_dict
 
 
 def calculate_health_score(product: dict):
@@ -1639,7 +2334,12 @@ SCORING_RULES = {
         "Natural Preservation": 1.0,
         "Micronutrients": 1.0,
         "Probiotics": 0.75,
-        "Whole-Food": 1.0
+        "Whole-Food": 1.0,
+        # Nutrient-panel extension (Fix 5, symmetric to the sugar/sat-fat penalty
+        # extension): a "low sodium" per-100g bonus for the ~96% of catalogue rows
+        # that have a nutrition panel but no ingredient list, so genuinely
+        # excellent products can be recognised. Capped so it only nudges.
+        "Low Sodium": 0.5,
     },
 
     "transparency_multiplier": {  # spec 5
@@ -1951,14 +2651,40 @@ def calculate_health_score_v2(product: dict, version: int = 1,
         "sodium": "Sodium"
     }
 
+    # --- Per-100g normalization (Fix 4) --------------------------------------
+    # Every nutrient threshold in SCORING_RULES (sugar >10g, sat-fat >20g, the
+    # sodium %RDA bands) is defined on a *per-100g* basis, but the catalogue
+    # stores nutrients *per serving*. Feeding per-serving values straight into
+    # per-100g thresholds is the core scoring bug: a 44g product and a 100g
+    # product with identical per-100g nutrition scored differently, and smaller
+    # servings always won. So we scale every nutrient by 100/serving_size_g and
+    # score on that. This is correct whether the row is stored per-serving OR
+    # already normalized to per-100g (serving_size_g == 100 -> factor 1.0).
+    try:
+        _serving_g = float(product.get("serving_size_g") or 0)
+    except (TypeError, ValueError):
+        _serving_g = 0.0
+    _per100_factor = (100.0 / _serving_g) if _serving_g > 0 else 1.0
+
+    def _per_100g(field):
+        """Per-100g value for a stored per-serving nutrient field, or None."""
+        raw = product.get(field)
+        if raw is None:
+            return None
+        try:
+            return float(raw) * _per100_factor
+        except (TypeError, ValueError):
+            return None
+
     # 1. Apply nutrient penalties & bonuses, re-weighted by user preferences.
     pen_mult = weights["nutrient_penalty_mult"]
     bonus_mult = weights["nutrient_bonus_mult"]
     for rule in scoring_rules_dict["rules"]:
         nutrient = rule["nutrient"]
-        val = product.get(f"{nutrient}_g_per_serving")
+        # Compare per-100g values against the per-100g thresholds (Fix 4).
+        val = _per_100g(f"{nutrient}_g_per_serving")
         if val is None and nutrient == "sodium":
-            val = product.get("sodium_mg_per_serving")
+            val = _per_100g("sodium_mg_per_serving")
         if val is None:
             continue
 
@@ -1988,30 +2714,45 @@ def calculate_health_score_v2(product: dict, version: int = 1,
                     })
                 break
 
-    # 1b. Per-100g "bonus, stacks" rows (spec 4.1 / 4.2 / 4.4). The catalogue
-    # stores nutrients per serving, so normalise via serving_size_g. Each lands in
-    # its spec category and is therefore subject to that category's addition cap.
+    # 1b. Per-100g "bonus, stacks" rows. Uses the same per-100g normalization as
+    # the penalties above (Fix 4) so bonuses and penalties are always on the same
+    # basis. Each lands in a category and is subject to that category's addition
+    # cap, so tiers stack but never exceed the cap.
+    #
+    # The first three rows are spec 4.1 / 4.2 / 4.4 exactly. The remaining rows are
+    # a nutrient-panel *extension* (Fix 5), symmetric to the sugar/sat-fat penalty
+    # extension: ~96% of the catalogue has a nutrition panel but no ingredient
+    # list, so the spec's ingredient-based additions (whole grains, whey, clean
+    # label...) can never fire for them and a genuinely excellent product — high
+    # protein, high fiber, low sugar, low sodium, low saturated fat per 100g —
+    # was capped at 6.6 and could never earn the "Better For You" badge (score
+    # >=7). These rows reward that nutritional density from the panel alone. They
+    # stay within the existing spec category caps (Protein Quality +2.0, Fiber
+    # +1.5, Healthy Fats & Oils +1.0) so they can only nudge, and low-sodium /
+    # low-sat-fat use the FSSAI/Codex "low" thresholds (<120mg, <1.5g per 100g).
     per_100g_bonuses = [
+        # spec 4.1 / 4.2 / 4.4
         ("protein", "protein_g_per_serving", 10.0, "ge", 0.6, "Protein Quality",
          ">=10g protein per 100g"),
         ("fiber", "fiber_g_per_serving", 5.0, "ge", 0.5, "Fiber",
          ">=5g fiber per 100g"),
         ("sugar", "sugar_g_per_serving", 5.0, "lt", 0.5, "Natural Sweeteners",
          "<5g sugar per 100g"),
+        # extension — higher tiers for exceptional density (stack under the cap)
+        ("protein", "protein_g_per_serving", 20.0, "ge", 0.8, "Protein Quality",
+         ">=20g protein per 100g (high)"),
+        ("fiber", "fiber_g_per_serving", 10.0, "ge", 0.5, "Fiber",
+         ">=10g fiber per 100g (high)"),
+        # extension — low sodium / low saturated fat (verified from the panel)
+        ("sodium", "sodium_mg_per_serving", 120.0, "lt", 0.5, "Low Sodium",
+         "<120mg sodium per 100g (low)"),
+        ("saturated_fat", "saturated_fat_g_per_serving", 1.5, "lt", 0.5,
+         "Healthy Fats & Oils", "<1.5g saturated fat per 100g (low)"),
     ]
-    try:
-        serving_g = float(product.get("serving_size_g") or 0)
-    except (TypeError, ValueError):
-        serving_g = 0.0
-
-    if serving_g > 0:
+    if _serving_g > 0:
         for nutrient, field, threshold, op, points, cat, label in per_100g_bonuses:
-            raw = product.get(field)
-            if raw is None:
-                continue
-            try:
-                per_100g = float(raw) * 100.0 / serving_g
-            except (TypeError, ValueError):
+            per_100g = _per_100g(field)
+            if per_100g is None:
                 continue
             qualifies = per_100g >= threshold if op == "ge" else per_100g < threshold
             if not qualifies:
@@ -3725,55 +4466,52 @@ def search_autocomplete(q: str, limit: int = 8):
     if not words:
         return {"query": raw_query, "count": 0, "suggestions": []}
 
-    prefix = f"{normalized}%"
-    like_pairs = []
-    and_params = []
-    for w in words:
-        like_pairs.append("(LOWER(product_name) LIKE ? OR LOWER(brand) LIKE ?)")
-        like_w = f"%{w}%"
-        and_params.extend([like_w, like_w])
-    and_where = " AND ".join(like_pairs)
+    # Result cache first — repeated keystrokes and shared prefixes across users
+    # are served straight from memory (Fix 7).
+    cache_key = (normalized, limit)
+    cached = _autocomplete_result_cache.get(cache_key)
+    if cached is not None:
+        _cache_stats_autocomplete["hits"] += 1
+        return {"query": raw_query, "count": len(cached), "suggestions": cached}
+    _cache_stats_autocomplete["misses"] += 1
 
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(f'''
-        SELECT barcode, product_name, brand,
-               CASE
-                   WHEN LOWER(product_name) LIKE ? THEN 0
-                   WHEN LOWER(brand) LIKE ? THEN 1
-                   ELSE 2
-               END AS match_rank
-        FROM products
-        WHERE {and_where}
-        ORDER BY match_rank, product_name
-        LIMIT ?
-    ''', [prefix, prefix] + and_params + [limit])
-    rows = cursor.fetchall()
+    # Match against the in-memory catalogue index — no DB round-trip (Fix 7).
+    # Primary pass: every query word must appear in the name or brand (order-
+    # independent), ranked by whether the name/brand *starts with* the full query.
+    index = get_autocomplete_index()
+    primary = []
+    for barcode, name, brand, name_l, brand_l in index:
+        if all((w in name_l or w in brand_l) for w in words):
+            if name_l.startswith(normalized):
+                rank = 0
+            elif brand_l.startswith(normalized):
+                rank = 1
+            else:
+                rank = 2
+            primary.append((rank, name or "", barcode, name, brand))
+    primary.sort(key=lambda t: (t[0], t[1]))
+    rows = primary
 
     if not rows and len(words) > 1:
-        # Nothing matched *every* word (a mis-heard word, an extra word the
-        # user said, different phrasing) — loosen to "at least one word
-        # matches" instead, ranked by how many of the query's words each
-        # result actually contains, so a close-but-imperfect query still
-        # surfaces the nearest catalog matches rather than nothing at all.
-        or_where = " OR ".join(like_pairs)
-        rank_expr = " + ".join(["(CASE WHEN LOWER(product_name) LIKE ? OR LOWER(brand) LIKE ? THEN 1 ELSE 0 END)" for _ in words])
-        cursor.execute(f'''
-            SELECT barcode, product_name, brand, ({rank_expr}) AS word_matches
-            FROM products
-            WHERE {or_where}
-            ORDER BY word_matches DESC, product_name
-            LIMIT ?
-        ''', and_params + and_params + [limit])
-        rows = cursor.fetchall()
-
-    conn.close()
+        # Nothing matched *every* word (a mis-heard word, an extra word, different
+        # phrasing) — loosen to "at least one word matches", ranked by how many of
+        # the query's words each result contains, so a close-but-imperfect query
+        # still surfaces the nearest catalog matches rather than nothing at all.
+        loose = []
+        for barcode, name, brand, name_l, brand_l in index:
+            matches = sum(1 for w in words if (w in name_l or w in brand_l))
+            if matches:
+                loose.append((-matches, name or "", barcode, name, brand))
+        loose.sort(key=lambda t: (t[0], t[1]))
+        rows = loose
 
     suggestions = [{
-        "product_name": r["product_name"],
-        "brand": r["brand"],
-        "barcode": r["barcode"],
-    } for r in rows]
+        "product_name": name,
+        "brand": brand,
+        "barcode": barcode,
+    } for _rank, _sort, barcode, name, brand in rows[:limit]]
+
+    _autocomplete_result_cache[cache_key] = suggestions
     return {"query": raw_query, "count": len(suggestions), "suggestions": suggestions}
 
 
@@ -5286,6 +6024,37 @@ def chat(req: ChatRequest):
             "product_found": False,
             "product_in_database": False,
             "source": "product-lookup",
+            "model": None,
+            "ai_enabled": AI_ENABLED,
+        }
+
+    # --- Fast-path: deterministic product score/nutrition answer (Fix 3) ------
+    # A plain "what is the score of Frooti?" / "is Maggi healthy?" / "sugar in X"
+    # is fully answerable from our own scored data — every fact is already in the
+    # product dict. Calling the LLM for it just added 18-22s of latency for an
+    # answer we can render in milliseconds. So when we have the product and the
+    # question is a straightforward score/health/nutrition query (and not an
+    # open-ended "alternative to X?" or "best snacks?" question that benefits from
+    # generation), answer directly and skip the provider chain entirely.
+    _q_lower = (req.question or "").lower()
+    _is_product_info_q = (
+        looks_like_product_query(req.question)
+        # Common "is <product> healthy / good / bad" phrasings the trigger list
+        # above doesn't catch verbatim. Safe here because we only reach this with
+        # a product already resolved from the question or the scanned barcode.
+        or re.search(r"\b(healthy|unhealthy|good|bad)\b", _q_lower) is not None
+    )
+    if (product is not None
+            and CHAT_FAST_PRODUCT_ANSWERS
+            and _is_product_info_q
+            and not find_substitution_targets(req.question)
+            and not is_top_picks_question(req.question)):
+        return {
+            "response": fallback_answer(req.question, product),
+            "barcode": (product.get("barcode") if product else None) or req.barcode,
+            "product_found": True,
+            "product_in_database": True,
+            "source": "fast-path-deterministic",
             "model": None,
             "ai_enabled": AI_ENABLED,
         }
@@ -7022,6 +7791,14 @@ def ensure_performance_and_image_schema():
         existing_cols = {r[1] for r in cur.execute("PRAGMA table_info(products)")}
         if "image_url" not in existing_cols:
             cur.execute("ALTER TABLE products ADD COLUMN image_url TEXT")
+
+        # --- Auto-fill pipeline provenance (Tasks 3/4): which source last filled a
+        # row and when, so a product enriched from OFF/USDA/IFCT/Google is written
+        # back to our DB with an audit trail and served locally on the next scan.
+        if "data_source" not in existing_cols:
+            cur.execute("ALTER TABLE products ADD COLUMN data_source TEXT")
+        if "data_updated_at" not in existing_cols:
+            cur.execute("ALTER TABLE products ADD COLUMN data_updated_at TEXT")
 
         # --- Bug fix: favorites of products that only exist in the bundled CSV
         # database or Open Food Facts (never our own `products` table) used to
