@@ -125,6 +125,7 @@ function Invoke-Api {
     # deliberately expect a client error pass -Expect '4'.
     if (("$code").StartsWith($Expect)) { $script:Pass++ } else { $script:Fail++ }
     $script:LastBody = $content
+    $script:LastCode = $code
     if ($Delay -gt 0) { Start-Sleep -Seconds $Delay }
 }
 
@@ -982,6 +983,72 @@ try {
     Invoke-Api GET "/score/8901058005783"
     try { $specGrade = ($script:LastBody | ConvertFrom-Json).grade } catch { $specGrade = '?' }
     Write-Host "Example A grade = $specGrade  (spec: very low, D/F)" -ForegroundColor Blue
+
+    # =========================================================================
+    Write-Banner "REVIEWER FEEDBACK VERIFICATION  (the 'What Needs to be Fixed' checklist)"
+
+    # Named products the reviewer reported as "Product Not Found" — resolved by
+    # barcode (a scan), which is how the app actually looks them up.
+    $BcRagabites   = "8908002984590"   # "Tata Soulful Ragi Bite" == Soulfull Ragabites choco
+    $BcSlurrpRagi  = "8908006217465"   # "Slurrp Farm Ragi & Banana Cereal"
+    $BcKulfi       = "8901262176477"   # Amul mava malai kulfi (reviewer said 50g)
+    $BcChocobar    = "8901262176224"   # Amul Chocobar (reviewer said 44g)
+    $BcWtCranberry = "8906123100028"   # Whole Truth cranberry bar (reviewer said 52g)
+    $BcParleG      = "8901719113345"   # Parle G (complete data)
+    $BcChanna      = "8906161390719"   # Let's Try roasted channa (scores 7+)
+
+    Write-Section "104a" "FIX #1 - ALL PRODUCTS LOADED  (named 'not found' products are scannable)"
+    foreach ($bc in @($BcRagabites, $BcSlurrpRagi)) {
+        Invoke-Api GET "/product/$bc"
+        try { $name = ($script:LastBody | ConvertFrom-Json).product_name } catch { $name = '' }
+        Assert-Equal "product $bc resolves (status 200)" $script:LastCode 200
+        Assert-Equal "product $bc has a name" ([bool]$name) $true
+        Write-Host "  -> $name" -ForegroundColor Blue
+    }
+
+    Write-Section "104b" "FIX #2 - NUTRITION NORMALIZED TO 100g  (serving_size_g == 100 for the reported products)"
+    foreach ($bc in @($BcKulfi, $BcChocobar, $BcWtCranberry)) {
+        Invoke-Api GET "/product/$bc"
+        try { $o = $script:LastBody | ConvertFrom-Json } catch { $o = $null }
+        $serv  = if ($o) { [double]$o.serving_size_g } else { -1 }
+        $basis = if ($o -and $o.nutrition_per_100g) { $o.nutrition_per_100g.basis } else { '' }
+        Assert-Equal "serving_size_g==100 for $bc" ([math]::Abs($serv - 100) -lt 0.01) $true
+        Assert-Equal "nutrition basis is per_100g for $bc" $basis 'per_100g'
+    }
+
+    Write-Section "104c" "FIX #4 - PER-100g SCORING + CONFIDENCE  (Parle G: DB-first, complete -> Very High)"
+    Invoke-Api GET "/product/$BcParleG"
+    try { $o = $script:LastBody | ConvertFrom-Json } catch { $o = $null }
+    Assert-Equal "Parle G resolves from our DATABASE first (Fix #1)" $(if ($o) { $o.source } else { '' }) 'database'
+    Assert-Equal "Parle G confidence == Very High"                   $(if ($o) { $o.confidence } else { '' }) 'Very High'
+
+    Write-Section "104d" "FIX #5 - BETTER FOR YOU BADGE  (a product scores 7+ and is flagged)"
+    Invoke-Api GET "/product/$BcChanna"
+    try { $o = $script:LastBody | ConvertFrom-Json } catch { $o = $null }
+    $chScore = if ($o) { [double]$o.score } else { 0 }
+    Write-Host "  roasted channa score=$chScore  is_better_for_you=$($o.is_better_for_you)" -ForegroundColor Blue
+    Assert-Equal "roasted channa is_better_for_you == True" $(if ($o) { [bool]$o.is_better_for_you } else { $false }) $true
+    Assert-Equal "roasted channa score >= 7" ($chScore -ge 7) $true
+
+    Write-Section "104e" "FIX #3 - AI CHAT IS FAST  (deterministic fast-path, expected < 5s)"
+    foreach ($q in @('Hi', 'What is the score of Frooti?')) {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-Api POST "/chat" (@{ question = $q } | ConvertTo-Json -Compress)
+        $sw.Stop()
+        try { $src = ($script:LastBody | ConvertFrom-Json).source } catch { $src = '?' }
+        Write-Host "  chat '$q' -> $($sw.ElapsedMilliseconds)ms  source=$src" -ForegroundColor Blue
+        Assert-Equal "chat '$q' status 200" $script:LastCode 200
+        Assert-Equal "chat '$q' under 5s"   ($sw.ElapsedMilliseconds -lt 5000) $true
+    }
+
+    Write-Section "104f" "FIX #10 - AUTOCOMPLETE IS FAST  (single-letter query returns instantly)"
+    foreach ($q in @('L', 'Li')) {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-Api GET "/search/autocomplete?q=$q&limit=8"
+        $sw.Stop()
+        Write-Host "  autocomplete '$q' -> $($sw.ElapsedMilliseconds)ms" -ForegroundColor Blue
+        Assert-Equal "autocomplete '$q' status 200" $script:LastCode 200
+    }
 
     # =========================================================================
     Write-Banner "DATABASE VERIFICATION  (proving the writes actually persisted)"
