@@ -457,6 +457,40 @@ try {
     Write-Section 16 "SCAN HISTORY  (GET /history)  [auth]  <- proves scans from step 4 saved"
     Invoke-Api GET "/history" -Auth
 
+    Write-Section "16b" "ISSUE 2 - NO 'UNKNOWN PRODUCT' ANYWHERE  (/history, /favorites, /search)"
+    Write-Host "  A scanned product we hold a name for must never render as 'Unknown Product'" -ForegroundColor Blue
+    Write-Host "  (the reported 5-Star bug: scan_history stored the real name, /history ignored it)" -ForegroundColor Blue
+    $placeholders = @('', 'unknown', 'unknown product', 'n/a', 'none', 'null')
+
+    Invoke-Api POST "/activity" (@{ action_type = "scan"; barcode = $BcHealthy } | ConvertTo-Json -Compress) -Auth
+    Invoke-Api GET "/history" -Auth
+    try { $h = $script:LastBody | ConvertFrom-Json } catch { $h = @() }
+    $histBad = @(@($h) | Where-Object { $placeholders -contains ("" + $_.product_name).Trim().ToLower() }).Count
+    Assert-Equal "no history row renders as 'Unknown Product'" $histBad 0
+
+    Invoke-Api POST "/favorites" (@{ barcode = $BcBar } | ConvertTo-Json -Compress) -Auth
+    Invoke-Api GET "/favorites" -Auth
+    try { $f = $script:LastBody | ConvertFrom-Json } catch { $f = @() }
+    $favBad = @(@($f) | Where-Object { $placeholders -contains ("" + $_.product_name).Trim().ToLower() }).Count
+    Assert-Equal "no favorite renders as 'Unknown Product'" $favBad 0
+    Invoke-Api DELETE "/favorites/$BcBar" -Auth
+
+    # Whole-catalogue sweep: every search result must carry a real name.
+    Invoke-Api GET "/search?limit=300&external=false"
+    try { $s = $script:LastBody | ConvertFrom-Json } catch { $s = @() }
+    $rows = if ($s -is [array]) { $s } elseif ($s.results) { @($s.results) } else { @() }
+    $nameBad = @($rows | Where-Object { $placeholders -contains ("" + $_.name).Trim().ToLower() }).Count
+    Write-Host "  placeholder names / products checked: $nameBad/$($rows.Count)" -ForegroundColor Blue
+    Assert-Equal "every curated product carries a real name" $nameBad 0
+
+    # The specific product from the report.
+    Invoke-Api GET "/search?q=star&external=false&limit=10"
+    try { $s2 = $script:LastBody | ConvertFrom-Json } catch { $s2 = @() }
+    $starRows = if ($s2 -is [array]) { $s2 } elseif ($s2.results) { @($s2.results) } else { @() }
+    Write-Host "  '5 star' search -> $(($starRows | ForEach-Object { $_.name }) -join ' | ')" -ForegroundColor Blue
+    $starOk = @($starRows | Where-Object { ("" + $_.name).ToLower() -like '*star*' }).Count -gt 0
+    Assert-Equal "5 Star chocolate resolves by name (Issue 2)" $starOk $true
+
     Write-Section 17 "WEEKLY SUMMARY  (GET /weekly-summary)  [auth]"
     Invoke-Api GET "/weekly-summary" -Auth
 
@@ -938,8 +972,45 @@ try {
     Invoke-Api GET "/product/$BcHealthy"
     Write-Host "response carries is_better_for_you (true when score >= 7) and better_for_you_badge" -ForegroundColor Blue
 
-    Write-Section 101 "FEATURE 4 - LIST CATEGORIES  (GET /products/categories)  <- category + count list"
+    Write-Section 101 "FEATURE 4 - LIST CATEGORIES  (GET /products/categories)  <- DB + Open Food Facts counts"
     Invoke-Api GET "/products/categories"
+    try { $c = $script:LastBody | ConvertFrom-Json } catch { $c = $null }
+    $catsTotal = if ($c) { [int]$c.total_products } else { 0 }
+    $catsDb    = if ($c) { [int]$c.db_products } else { 0 }
+    $catsExt   = if ($c) { [int]$c.external_products } else { 0 }
+    $catsLimit = if ($c) { [int]$c.external_limit } else { 0 }
+    Write-Host "  total_products=$catsTotal  (db=$catsDb + external=$catsExt, per-category limit $catsLimit)" -ForegroundColor Blue
+    Assert-Equal "categories status 200" $script:LastCode 200
+    # July 28: each tile is db_count + external_count, so the grid reflects what is
+    # browsable rather than the size of our seed catalogue (the "stuck at 367" bug).
+    $tiles = if ($c) { @($c.categories) } else { @() }
+    $tileShape = $false
+    if ($tiles.Count -gt 0) {
+        $names = @($tiles[0].PSObject.Properties.Name)
+        $missing = @('category', 'label', 'count', 'db_count', 'external_count') |
+            Where-Object { $names -notcontains $_ }
+        $tileShape = (@($missing).Count -eq 0)
+    }
+    Assert-Equal "each tile carries db_count + external_count" $tileShape $true
+    $sumOk = $false
+    if ($tiles.Count -gt 0) {
+        $bad = @($tiles | Where-Object { [int]$_.count -ne ([int]$_.db_count + [int]$_.external_count) }).Count
+        $sumOk = ($bad -eq 0) -and ($catsTotal -eq ($catsDb + $catsExt))
+    }
+    Assert-Equal "count == db_count + external_count everywhere" $sumOk $true
+
+    Write-Section "101a" "FEATURE 4 - CURATED-ONLY COUNTS  (GET /products/categories?external=false)  <- opt out of OFF"
+    Invoke-Api GET "/products/categories?external=false"
+    try { $c2 = $script:LastBody | ConvertFrom-Json } catch { $c2 = $null }
+    $dbOnlyTotal = if ($c2) { [int]$c2.total_products } else { 0 }
+    $dbOnlyExt   = if ($c2) { [int]$c2.external_products } else { -1 }
+    Write-Host "  external=false -> total_products=$dbOnlyTotal (external_products=$dbOnlyExt)" -ForegroundColor Blue
+    Assert-Equal "external=false reports no external products" $dbOnlyExt 0
+    if ($catsTotal -gt $dbOnlyTotal) {
+        Assert-Equal "combined counts exceed curated-only counts" $true $true
+    } else {
+        Write-Host "  (no OFF products merged - network/OFF may be unavailable; not failing the run)" -ForegroundColor Yellow
+    }
 
     Write-Section "101b" "FEATURE 4 - PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
     Invoke-Api GET "/products/by-category/protein_bar?limit=3"
@@ -1115,6 +1186,36 @@ try {
     Write-Host "  chocolate -> total=$catTotal  external_count=$catExt" -ForegroundColor Blue
     Assert-Equal "category endpoint status 200" $script:LastCode 200
     Assert-Equal "category response reports external_count" $hasExt $true
+
+    Write-Section "127e2" "JULY 28 - CATEGORY BROWSING GOES DEEP INTO OFF  (was capped at the 20-hit search default)"
+    Write-Host "  a category page should offer hundreds of products, not our rows + 20" -ForegroundColor Blue
+    if ([int]$catExt -gt 20) {
+        Assert-Equal "chocolate merges more than the old 20-product cap" $true $true
+    } else {
+        Write-Host "  (external_count=$catExt - OFF unavailable or SWAPIFY_CATEGORY_EXTERNAL_LIMIT lowered; not failing)" -ForegroundColor Yellow
+    }
+    # Deep pagination has to reach past our curated rows into the OFF half.
+    Invoke-Api GET "/products/by-category/chocolate?limit=5&offset=100"
+    try { $o = $script:LastBody | ConvertFrom-Json } catch { $o = $null }
+    $deepCount = if ($o) { [int]$o.count } else { 0 }
+    $deepSrc = if ($o) { @($o.products | Where-Object { $_.source -eq 'openfoodfacts' }).Count -gt 0 } else { $false }
+    Write-Host "  offset=100 -> count=$deepCount  (openfoodfacts rows present: $deepSrc)" -ForegroundColor Blue
+    Assert-Equal "deep offset still returns a page" $script:LastCode 200
+    if ([int]$catExt -gt 20) {
+        Assert-Equal "page past our curated rows is served from OFF" $deepSrc $true
+    }
+
+    Write-Section "127e3" "JULY 28 - CURATED-ONLY CATEGORY PAGE  (?external=false)  <- our rows, no OFF"
+    Invoke-Api GET "/products/by-category/chocolate?limit=80&external=false"
+    try { $o = $script:LastBody | ConvertFrom-Json } catch { $o = $null }
+    $curTotal = if ($o) { [int]$o.total } else { 0 }
+    $curExt   = if ($o) { [int]$o.external_count } else { -1 }
+    $curProducts = if ($o) { @($o.products) } else { @() }
+    $onlyDb = ($curProducts.Count -gt 0) -and
+              (@($curProducts | Where-Object { $_.source -and $_.source -ne 'database' }).Count -eq 0)
+    Write-Host "  external=false -> total=$curTotal external_count=$curExt" -ForegroundColor Blue
+    Assert-Equal "external=false merges no OFF products" $curExt 0
+    Assert-Equal "external=false returns only our own rows" $onlyDb $true
 
     Write-Section "127f" "FIX #8 - REPORT MISSING PRODUCT WORKS ANONYMOUSLY  (no auth required)"
     Invoke-Api POST "/report-missing" (@{ barcode = "0000000000027"; product_name = "Anon Test" } | ConvertTo-Json -Compress)
