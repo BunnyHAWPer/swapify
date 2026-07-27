@@ -17,6 +17,7 @@ import time
 import json
 import logging
 import threading
+import concurrent.futures
 
 # OCR label scanner POC (Task 6). The module itself has no hard dependency on the
 # OCR stack at import time (Tesseract/Pillow are looked up lazily), so this import
@@ -942,12 +943,6 @@ def _normalize_off_raw(p: dict, barcode: str):
         sodium_val = (salt_val / 2.5) if salt_val is not None else None
     sodium_mg = sodium_val * 1000 if sodium_val is not None else None
 
-    cats_raw = p.get('categories')
-    if isinstance(cats_raw, (list, tuple)):
-        cats_raw = cats_raw[0] if cats_raw else ""
-    category = (cats_raw or '').split(',')[0].strip().lower()
-    category = re.sub(r'^[a-z]{2}:', '', category) or None
-
     # OFF stores ingredients under several keys; fall back across them
     # and finally reconstruct from the structured ingredients list.
     off_ingredients = (
@@ -977,6 +972,26 @@ def _normalize_off_raw(p: dict, barcode: str):
     name = (name_raw or "").strip()
     if not name or name.lower() in ("unknown product", "unknown"):
         name = brand or None
+
+    # Classify with OUR taxonomy in preference to storing OFF's own label. An
+    # auto-filled row used to keep whatever OFF called it ("sweet snacks",
+    # "plant-based foods and beverages") — a category id nothing else in the DB
+    # uses, so the product vanished from its real category page into a tile of its
+    # own and "better alternatives" had no peers to compare it against.
+    off_category = p.get('categories')
+    if isinstance(off_category, (list, tuple)):
+        off_category = ", ".join(str(c) for c in off_category)
+    off_category = re.sub(r'^[a-z]{2}:', '',
+                          (off_category or '').split(',')[0].strip().lower())
+    category = guess_category(name, brand)
+    if category == "other":
+        # OFF's own category text is a good second hint when the name isn't one
+        # ("Nutella" says nothing about what it is; "Hazelnut spreads" does).
+        category = guess_category(off_category)
+    if category == "other":
+        # Still unclassified: keep OFF's label rather than drop the product into a
+        # bucket "better alternatives" is required to ignore.
+        category = off_category or None
 
     row = {
         "barcode": barcode or p.get("code") or "",
@@ -1267,6 +1282,28 @@ EXTERNAL_SEARCH_LIMIT = int(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_LIMIT", "20"
 EXTERNAL_SEARCH_TIMEOUT_S = float(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_TIMEOUT", "4"))
 _external_search_cache = TTLCache(maxsize=256, ttl=int(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_TTL", "300")))
 
+# Category *browsing* pulls a far deeper slice of OFF than a name search does.
+# Browsing a category is a "show me everything" gesture: capping it at the 20-hit
+# search default meant the categories page only ever showed our own rows plus a
+# token 20 per category, which is what made the section look frozen at the size of
+# our catalogue. One Search-a-licious request returns up to 250 products, so the
+# default below is a single round-trip; higher values page in parallel.
+CATEGORY_EXTERNAL_LIMIT = max(0, min(
+    int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_LIMIT", "200")), 1000))
+CATEGORY_EXTERNAL_TIMEOUT_S = float(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TIMEOUT", "8"))
+# Category pages get their own cache rather than sharing the name-search one: a
+# page is ~0.1 MB and costs a couple of seconds to build, so it must not be evicted
+# by a burst of ad-hoc searches, and OFF's catalogue for a whole category moves far
+# too slowly to be worth re-fetching every 5 minutes.
+_category_external_cache = TTLCache(
+    maxsize=64, ttl=int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TTL", "1800")))
+_OFF_MAX_PAGE_SIZE = 250  # Search-a-licious' per-request ceiling
+# OFF repeats the odd barcode across pages and some hits normalise away (no name,
+# no nutrition at all), so ask for more than we need — the categories listing
+# advertises CATEGORY_EXTERNAL_LIMIT as the browsable count and should be able to
+# deliver it.
+_OFF_CATEGORY_OVERFETCH = 1.25
+
 # Per-scan auto-fill deadline, shared with the individual source functions so each
 # network call is bounded by min(its own timeout, the budget left) — one slow
 # source can't blow the whole scan. Thread-local because sync FastAPI endpoints
@@ -1480,7 +1517,7 @@ def _off_search_by_name(name: str, limit: int = 6, timeout: float = None):
             headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
             params={
                 "q": name,
-                "page_size": max(1, min(limit, 25)),
+                "page_size": max(1, min(limit, _OFF_MAX_PAGE_SIZE)),
                 "fields": (
                     "code,product_name,product_name_en,brands,categories,"
                     "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en"
@@ -1577,26 +1614,8 @@ _OFF_CATEGORY_TAGS = {
 }
 
 
-def _off_category_products(category: str, limit: int = None):
-    """Scored Open Food Facts products for one of our categories (Issue 6).
-
-    Uses OFF's category facet when we have a tag mapping, otherwise a name search
-    on the human label. Returns ``(product, score, grade, breakdown)`` tuples;
-    cached and best-effort."""
-    category = (category or "").strip().lower()
-    if not category or not EXTERNAL_SEARCH_ENABLED:
-        return []
-    limit = limit or EXTERNAL_SEARCH_LIMIT
-    key = ("cat:" + category, limit)
-    cached = _external_search_cache.get(key)
-    if cached is not None:
-        return cached
-    tag = _OFF_CATEGORY_TAGS.get(category)
-    if not tag:
-        # No tag mapping — fall back to a plain label search (still per-category-ish).
-        return _external_search_results(category_label(category), limit)
-    # Search-a-licious with a categories filter (reliable JSON; the legacy
-    # search.pl facet endpoint returns rate-limit HTML — see _off_search_by_name).
+def _off_category_page(category: str, tag: str, page: int, page_size: int):
+    """One page of raw Open Food Facts hits for a category tag (never raises)."""
     try:
         resp = requests.get(
             "https://search.openfoodfacts.org/search",
@@ -1604,26 +1623,101 @@ def _off_category_products(category: str, limit: int = None):
             params={
                 "q": category_label(category),
                 "categories_tags": f"en:{tag}",
-                "page_size": max(1, min(limit, 50)),
+                "page": page,
+                "page_size": page_size,
                 "fields": (
                     "code,product_name,product_name_en,brands,categories,"
                     "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en"
                 ),
             },
-            timeout=EXTERNAL_SEARCH_TIMEOUT_S,
+            timeout=CATEGORY_EXTERNAL_TIMEOUT_S,
         )
-        data = resp.json() or {} if resp.status_code == 200 else {}
-        products = data.get("hits") or data.get("products") or []
+        if resp.status_code != 200:
+            logger.warning("OFF category fetch for %s page %s: HTTP %s",
+                           category, page, resp.status_code)
+            return []
+        data = resp.json() or {}
+        return data.get("hits") or data.get("products") or []
     except (requests.RequestException, ValueError) as exc:
-        logger.warning("OFF category fetch failed for %s: %s", category, exc)
-        products = []
-    cands = []
-    for p in products:
-        norm = _normalize_off_raw(p, p.get("code") or "")
-        if norm:
-            norm["category"] = category  # tag with OUR id so it groups correctly
-            cands.append(norm)
-    return _score_external_candidates(cands, key)
+        logger.warning("OFF category fetch failed for %s page %s: %s", category, page, exc)
+        return []
+
+
+def _off_category_products(category: str, limit: int = None):
+    """Scored Open Food Facts products for one of our categories (Issue 6).
+
+    Uses OFF's category facet when we have a tag mapping, otherwise a name search
+    on the human label. Returns up to ``limit`` ``(product, score, grade,
+    breakdown)`` tuples — paging through Search-a-licious (250 hits per request,
+    pages fetched in parallel) so a category page can offer OFF's catalogue rather
+    than a token handful. Cached per (category, limit) and best-effort."""
+    category = (category or "").strip().lower()
+    # "other" is the taxonomy's "no known peers" bucket, not a real category —
+    # searching OFF for "Other" would return noise, so it stays DB-only.
+    if not category or category == "other" or not EXTERNAL_SEARCH_ENABLED:
+        return []
+    limit = CATEGORY_EXTERNAL_LIMIT if limit is None else limit
+    if limit <= 0:
+        return []
+    key = (category, limit)
+    cached = _category_external_cache.get(key)
+    if cached is not None:
+        return cached
+    tag = _OFF_CATEGORY_TAGS.get(category)
+    if not tag:
+        # No tag mapping — fall back to a plain label search (still per-category-ish).
+        # Copy before tagging: those tuples are shared with the name-search cache.
+        tagged = [({**p, "category": category}, s, g, b)
+                  for p, s, g, b in _external_search_results(category_label(category), limit)]
+        _category_external_cache[key] = tagged
+        return tagged
+
+    # Search-a-licious with a categories filter (reliable JSON; the legacy
+    # search.pl facet endpoint returns rate-limit HTML — see _off_search_by_name).
+    want = min(int(limit * _OFF_CATEGORY_OVERFETCH) + 1, _OFF_MAX_PAGE_SIZE * 4)
+    page_size = min(want, _OFF_MAX_PAGE_SIZE)
+    n_pages = max(1, -(-want // page_size))  # ceil
+    if n_pages == 1:
+        pages = [_off_category_page(category, tag, 1, page_size)]
+    else:
+        # Sequential paging would multiply the timeout by the page count on a cold
+        # cache; these are independent GETs, so fan them out.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_pages, 4)) as pool:
+            pages = list(pool.map(
+                lambda pg: _off_category_page(category, tag, pg, page_size),
+                range(1, n_pages + 1),
+            ))
+
+    cands, seen = [], set()
+    for products in pages:
+        for p in products:
+            code = p.get("code") or ""
+            if code and code in seen:
+                continue  # OFF can repeat a barcode across pages
+            seen.add(code)
+            norm = _normalize_off_raw(p, code)
+            if norm:
+                norm["category"] = category  # tag with OUR id so it groups correctly
+                cands.append(norm)
+    scored = _score_external_candidates(cands, None)[:limit]
+    _category_external_cache[key] = scored
+    return scored
+
+
+def _off_category_count(category: str, limit: int = None) -> int:
+    """How many Open Food Facts products category browsing will actually serve.
+
+    Exact once that category's page is cached; until then the configured ceiling,
+    which is what ``/products/by-category`` fetches on demand. Deliberately does
+    NOT hit the network: the categories listing renders one tile per category and
+    must not fan out ~25 requests to draw a grid.
+    """
+    category = (category or "").strip().lower()
+    limit = CATEGORY_EXTERNAL_LIMIT if limit is None else limit
+    if not category or category == "other" or limit <= 0 or not EXTERNAL_SEARCH_ENABLED:
+        return 0
+    cached = _category_external_cache.get((category, limit))
+    return len(cached) if cached is not None else limit
 
 
 # --- Source 3: USDA FoodData Central ------------------------------------------
@@ -5188,31 +5282,65 @@ def category_label(category) -> str:
 
 
 @app.get("/products/categories")
-def list_product_categories():
+def list_product_categories(external: Optional[bool] = None):
     """List every product category with its product count (Feature 4).
 
-    Returns ``{"count", "total_products", "categories": [{"category", "label",
-    "count"}, ...]}`` ordered by product count (largest first). Powers the
-    frontend categories page's grid of category tiles.
+    Counts cover **both** halves of what a category page serves: our own
+    catalogue and Open Food Facts' (Issue 6). Each entry carries ``db_count``
+    (curated rows), ``external_count`` (how many OFF products browsing that
+    category will add) and ``count`` = the two combined — so the grid reflects
+    what is actually browsable rather than the size of our seed catalogue.
+
+    - ``external``: include the Open Food Facts half. Defaults to the
+      ``SWAPIFY_EXTERNAL_SEARCH`` setting; pass ``external=false`` for our
+      curated counts only.
+
+    Returns ``{"count", "total_products", "db_products", "external_products",
+    "external_limit", "categories": [...]}`` ordered by product count (largest
+    first). Powers the frontend categories page's grid of category tiles.
+
+    ``external_count`` is the ceiling ``/products/by-category`` fetches on demand
+    (``SWAPIFY_CATEGORY_EXTERNAL_LIMIT``); it becomes exact once that category has
+    been browsed and its OFF page is cached. Listing categories never itself calls
+    out to OFF, so this endpoint stays a single local query.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "SELECT COALESCE(NULLIF(TRIM(category), ''), 'other') AS category, "
-        "COUNT(*) AS count FROM products "
-        "GROUP BY category ORDER BY count DESC, category ASC"
+        "COUNT(*) AS count FROM products GROUP BY category"
     )
-    rows = cursor.fetchall()
+    db_counts = {r["category"]: r["count"] for r in cursor.fetchall()}
     conn.close()
 
-    categories = [
-        {"category": r["category"], "label": category_label(r["category"]),
-         "count": r["count"]}
-        for r in rows
-    ]
+    want_external = EXTERNAL_SEARCH_ENABLED if external is None else external
+    ext_limit = CATEGORY_EXTERNAL_LIMIT if want_external else 0
+
+    # Categories we can browse on OFF but happen to curate nothing for still get a
+    # tile — they are browsable, so hiding them would under-report the catalogue.
+    names = set(db_counts)
+    if ext_limit:
+        names |= set(_OFF_CATEGORY_TAGS)
+
+    categories = []
+    for name in names:
+        db_count = db_counts.get(name, 0)
+        external_count = _off_category_count(name, ext_limit)
+        categories.append({
+            "category": name,
+            "label": category_label(name),
+            "count": db_count + external_count,
+            "db_count": db_count,
+            "external_count": external_count,
+        })
+    categories.sort(key=lambda c: (-c["count"], c["category"]))
+
     return {
         "count": len(categories),
         "total_products": sum(c["count"] for c in categories),
+        "db_products": sum(c["db_count"] for c in categories),
+        "external_products": sum(c["external_count"] for c in categories),
+        "external_limit": ext_limit,
         "categories": categories,
     }
 
@@ -5232,7 +5360,9 @@ def products_by_category(
     - ``limit`` (1-500, default 50) / ``offset``: pagination.
     - ``external``: include Open Food Facts' global catalogue for this category
       (Issue 6). Defaults to the ``SWAPIFY_EXTERNAL_SEARCH`` setting; pass
-      ``external=false`` for our curated list only.
+      ``external=false`` for our curated list only. Up to
+      ``SWAPIFY_CATEGORY_EXTERNAL_LIMIT`` (default 200) OFF products are merged in,
+      matching the ``external_count`` advertised by ``/products/categories``.
 
     Each product carries its generic health ``score``/``grade``, the ``recommended``
     (7+) and ``is_better_for_you`` (Feature 2) flags, key nutrients and per-100g
@@ -5250,7 +5380,7 @@ def products_by_category(
     external_count = 0
     if want_external:
         seen = {p.get("barcode") for p in items if p.get("barcode")}
-        for p_dict, score, grade_val, breakdown in _off_category_products(cat):
+        for p_dict, score, grade_val, breakdown in _off_category_products(cat, CATEGORY_EXTERNAL_LIMIT):
             bc = p_dict.get("barcode")
             if not bc or bc in seen:
                 continue
@@ -6400,7 +6530,13 @@ def _score_catalogue(category=None):
 
     conn = get_db_connection()
     cursor = conn.cursor()
-    if category:
+    if category == "other":
+        # The categories listing buckets rows with no category under "other"; match
+        # that here or those products are counted in a tile but unreachable in it.
+        cursor.execute(
+            "SELECT * FROM products "
+            "WHERE COALESCE(NULLIF(TRIM(lower(category)), ''), 'other') = 'other'")
+    elif category:
         cursor.execute("SELECT * FROM products WHERE lower(category) = ?", (category,))
     else:
         cursor.execute("SELECT * FROM products")
