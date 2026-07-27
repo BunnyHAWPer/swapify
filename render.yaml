@@ -1,0 +1,76 @@
+# ==============================================================================
+# Render Blueprint for the Swapify backend
+# ==============================================================================
+# This file IS the deployment. Committing it to the repo means Render can create
+# and update the service from the repo alone - no personal terminal, no manual
+# dashboard clicking, no laptop that has to stay on. See DEPLOYMENT.md for the
+# one-time setup (connect repo -> "New Blueprint") and for the secrets you set in
+# the dashboard afterwards.
+#
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: swapify-backend
+    runtime: python
+    plan: free                      # free tier: sleeps after ~15 min idle (see uptime note)
+    region: singapore               # pick the region nearest your users
+    branch: main                    # the branch Render auto-deploys on push
+
+    buildCommand: pip install -r requirements.txt
+
+    # Run from the src/ dir so `app:app` resolves and the sibling modules
+    # (ocr_label_scanner, observability, category_taxonomy) import cleanly -
+    # exactly how `cd src && python app.py` runs locally. gunicorn manages the
+    # uvicorn workers; $PORT is injected by Render.
+    startCommand: gunicorn --chdir src app:app -k uvicorn.workers.UvicornWorker -w 2 --bind 0.0.0.0:$PORT --timeout 120
+
+    healthCheckPath: /health        # Render waits for this to return 200 before going live
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # --- Secrets: set these in the Render dashboard (sync:false = not in git) ---
+      - key: SECRET_KEY             # strong random JWT signing key (REQUIRED)
+        sync: false
+      - key: ADMIN_TOKEN           # strong admin-endpoint token (REQUIRED)
+        sync: false
+      - key: OPENROUTER_API_KEY    # AI chat (optional; fallback works without it)
+        sync: false
+      - key: GEMINI_API_KEY        # AI failover (optional)
+        sync: false
+      - key: USDA_API_KEY          # optional; DEMO_KEY used if unset
+        sync: false
+      - key: SERPAPI_KEY           # optional Google safety net
+        sync: false
+      # --- Non-secret config -----------------------------------------------------
+      - key: CORS_ORIGINS          # the deployed frontend origin(s), comma-separated
+        value: https://swapify-three.vercel.app
+      - key: SWAPIFY_DB_PATH       # point the DB at the persistent disk below
+        value: /var/data/swapify.db
+
+    # IMPORTANT: Render's default web filesystem is EPHEMERAL: every deploy/restart wipes
+    # runtime writes (new users, scans, uploaded images, auto-filled products).
+    # A persistent disk keeps swapify.db across deploys. It pins the service to a
+    # single instance and is a paid add-on - remove this block to run purely on
+    # the seeded, read-mostly free tier (see DEPLOYMENT.md section 5, "Data
+    # persistence", and KNOWN_ISSUES.md item 1).
+    disk:
+      name: swapify-data
+      mountPath: /var/data
+      sizeGB: 1
+
+# ------------------------------------------------------------------------------
+# Weekly-digest cron (Feature 3). Uncomment once email delivery is configured.
+# The free plan does not include cron jobs; this needs a paid instance OR an
+# external scheduler hitting POST /admin/send-weekly-digests with X-Admin-Token.
+# ------------------------------------------------------------------------------
+# - type: cron
+#   name: swapify-weekly-digest
+#   runtime: python
+#   schedule: "0 9 * * 1"          # Mondays 09:00 UTC
+#   buildCommand: pip install -r requirements.txt
+#   startCommand: python cron_weekly_digest.py
+#   envVars:
+#     - key: SWAPIFY_DB_PATH
+#       value: /var/data/swapify.db
+#     - fromGroup: swapify-secrets  # or repeat the sync:false keys above
