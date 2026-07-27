@@ -1,5 +1,43 @@
 # Swapify Backend Documentation
 
+## 27 July Update — Reviewer Fixes
+
+Nine reviewer-reported issues, all in [`src/app.py`](src/app.py) +
+[`static/script.js`](static/script.js). Verified via TestClient against a temp DB
+copy; `python test_scoring_spec.py` still passes 100/100.
+
+1. **Scanner too slow (20 s+ → < 5 s).** The whole external auto-fill chain is now
+   bounded by one wall-clock budget (`SWAPIFY_AUTOFILL_BUDGET`, 6 s), the slow AI
+   estimate is capped separately (4 s), OFF/USDA timeouts are lowered, unknown
+   barcodes are cached as misses (instant `404` on rescan), and a partially-filled
+   product isn't re-fetched every scan. In-DB **0.1 s**, cached **0.01 s**, first
+   external fetch **< 4.2 s**. See [Auto-Fill Pipeline](#1b-auto-fill-missing-data-pipeline-database-first).
+2. **"Unknown Product" name.** A product resolved from OFF/USDA now always gets a
+   real name (brand fallback), never the literal placeholder.
+3. **Auto-fill actually fills.** Added an **Open Food Facts name search** (so packs
+   not indexed by their scanned barcode still resolve) and a **relevance guard** that
+   rejects garbage fuzzy matches (USDA answering *"Amul Fruit N Nut"* with
+   *"McDonald's Fruit'n Yogurt Parfait"*).
+4. **Google/AI safety net** is bounded + logged, no longer hangs a scan.
+5. **AI chat uses the DB.** Fixed the name lookup (*"Kellogg's Multigrain Chocos"* →
+   **"Chocos cereal"**) and the fast-path reply now returns `product_name`/`score`/
+   `grade`/`ingredient_flags`. See [Product lookup by name](#product-lookup-by-name-fix-3b).
+6. **Categories include Open Food Facts.** [`/products/by-category`](#31-product-categories-api-feature-4)
+   merges OFF products (`external_count` in the response).
+7. **Search includes Open Food Facts.** [`/search`](#11-search-products-api) merges
+   OFF name-search results (*"Mother Dairy"* now returns products); each item has a
+   `source`.
+8. **Report-missing works.** [`/report-missing`](#9-report-missing-product-api) auth is
+   now optional (anonymous reports allowed) with robust error handling.
+9. **Sodium vs salt consistency.** The frontend no longer flags bare "Salt" as
+   harmful when the sodium panel reads 0 mg.
+
+> Open Food Facts integration (#3/#6/#7) uses OFF's
+> [Search-a-licious](https://search.openfoodfacts.org) API — the legacy
+> `cgi/search.pl` endpoint is rate-limited and returns 503 HTML, which is why name
+> search previously found nothing. All new behaviour is env-tunable and on by
+> default (`SWAPIFY_EXTERNAL_SEARCH`).
+
 ## 22 July Update — Fixes & New Features
 
 This release ships four fixes and four features. Details are in the linked
@@ -355,7 +393,7 @@ nutrient is actually missing, in strict priority order:
 | # | Source | Provides |
 |---|---|---|
 | 1 | **Swapify database** (CSV-seeded) | our curated data — **always checked first** |
-| 2 | **Open Food Facts** | barcode lookup, nutrition, ingredients |
+| 2 | **Open Food Facts** | barcode lookup **then a name search** (via [Search-a-licious](https://search.openfoodfacts.org)), nutrition, ingredients, image |
 | 3 | **USDA FoodData Central** | 600k foods, detailed nutrition (`USDA_API_KEY`, defaults to `DEMO_KEY`) |
 | 4 | **IFCT 2017** (Indian Foods) | 528 NIN Hyderabad foods (optional local `data/ifct2017.json`) |
 | 5 | **Google / AI safety net** | last resort — SerpApi (`SERPAPI_KEY`) or an AI estimate |
@@ -365,6 +403,26 @@ fills is **normalised to per-100g** and **written back to our database**, so the
 next scan of that product is served locally with no network call. If every source
 fails, the product is flagged for manual review (`missing_reports`) and the endpoint
 returns `404`.
+
+**Speed & data-quality guards (July 27):**
+
+- The whole fallback chain is bounded by a single wall-clock budget
+  (`SWAPIFY_AUTOFILL_BUDGET`, 6s) — each source only gets `min(its timeout, the
+  budget left)`, and the slow AI estimate is capped separately
+  (`SWAPIFY_AI_ESTIMATE_TIMEOUT`, 4s) — so a scan can never hang for 20s+ on a
+  slow/unresponsive source.
+- A barcode that resolves to **nothing anywhere** is cached as a miss for
+  `SWAPIFY_NEGATIVE_TTL` (600s) so repeat scans return an instant `404` instead of
+  re-running the chain; a product that resolves but stays *partially* incomplete
+  is not re-fetched for `SWAPIFY_ENRICH_COOLDOWN` (600s).
+- Name-based matches (USDA search, OFF name search) must be **relevant** — at least
+  half of the query's identifying words must appear in the candidate — so a loose
+  fuzzy match (e.g. USDA answering "Amul Fruit N Nut" with "McDonald's Fruit'n
+  Yogurt Parfait") can't inject an unrelated product's nutrition. A barcode/GTIN
+  match is exact and skips this check.
+- `product_name` is guaranteed non-placeholder: a product resolved from OFF/USDA
+  that has no name (or the literal "Unknown Product") falls back to its brand, so
+  the client always shows a real label.
 
 Each `/product` response reports the outcome:
 
@@ -382,8 +440,11 @@ Each `/product` response reports the outcome:
 ```
 
 **Config (all optional, safe defaults):** `SWAPIFY_AUTOFILL` (on), `SWAPIFY_GOOGLE_FALLBACK`
-(on), `SWAPIFY_SOURCE_TIMEOUT` (6s), `USDA_API_KEY`, `SERPAPI_KEY`, `IFCT_DATA_PATH`.
-Complete database products (the whole 252-row catalogue) make **zero** network calls.
+(on), `SWAPIFY_SOURCE_TIMEOUT` (5s), `SWAPIFY_AUTOFILL_BUDGET` (6s),
+`SWAPIFY_AI_ESTIMATE_TIMEOUT` (4s), `SWAPIFY_OFF_TIMEOUT` (5s),
+`SWAPIFY_NEGATIVE_TTL` (600s), `SWAPIFY_ENRICH_COOLDOWN` (600s), `USDA_API_KEY`,
+`SERPAPI_KEY`, `IFCT_DATA_PATH`. Complete database products (the whole 252-row
+catalogue) make **zero** network calls.
 
 ### 2. Get Product Health Score API
 This endpoint returns only the health score and the corresponding grade for a given product by its barcode.
@@ -796,17 +857,25 @@ curl -H "Authorization: Bearer <YOUR_TOKEN>" "http://127.0.0.1:8000/history"
 ```
 
 ### 9. Report Missing Product API
-This endpoint allows users to report a product that was not found in the database. Requires authentication.
+This endpoint allows users to report a product that was not found in the database.
+
+**Authentication is optional (July 27).** A shopper who scans an unknown pack can
+report it whether or not they are signed in — requiring a valid token here was what
+surfaced in the app as *"Backend Unreachable — could not submit the report."* When a
+valid `Authorization` header is sent the report is credited to that user (an
+`activity` log entry) and `authenticated` is `true` in the response. Reports are
+**de-duplicated per barcode**, and a transient DB error returns a clean `503`
+(never a dropped connection or a `500`).
 
 - **URL:** `/report-missing`
 - **Method:** `POST`
-- **Headers:** `Authorization: Bearer <token>`
+- **Headers:** `Authorization: Bearer <token>` *(optional)*
 - **Request Body (JSON):**
   - `barcode` (required, string): The scanned barcode.
   - `product_name` (optional, string): The name of the product.
   - `comment` (optional, string): User's comment or additional info.
 
-**Example using `curl`:**
+**Example using `curl` (anonymous):**
 ```bash
 curl -X POST http://127.0.0.1:8000/report-missing \
 -H "Content-Type: application/json" \
@@ -816,9 +885,15 @@ curl -X POST http://127.0.0.1:8000/report-missing \
 **Expected JSON Response (200 OK):**
 ```json
 {
-  "status": "reported"
+  "status": "reported",
+  "barcode": "123456789",
+  "already_reported": false,
+  "authenticated": false
 }
 ```
+
+**Errors:** `400` when `barcode` is empty; `503` if the report can't be saved
+(retryable).
 
 ### 10. Offline Products API
 This endpoint returns the entire product database in a lightweight JSON response for offline caching.
@@ -882,9 +957,24 @@ searches return the shape below.
   - `sort`: `score_desc` (default, healthiest first), `score_asc`, or `name`.
   - `limit`: 1–500 results per page (default 50).
   - `offset`: number of ranked results to skip, for pagination (default 0).
+  - `external` (boolean, July 27): include Open Food Facts' global catalogue in
+    text searches. Defaults to the `SWAPIFY_EXTERNAL_SEARCH` setting (on); pass
+    `external=false` to search **only** our curated catalogue.
 
 Each result item also carries `is_better_for_you` (Feature 2 — `true` when
-`score ≥ 7`).
+`score ≥ 7`) and a **`source`** field — `"database"` for our curated catalogue or
+`"openfoodfacts"` for a global-catalogue hit.
+
+**Global catalogue (Open Food Facts) — July 27:** for a **text** search, results
+from Open Food Facts are merged in after our own so a product we don't curate
+(e.g. *"Mother Dairy"*) still appears in search instead of only when its barcode is
+scanned. Our own DB rows come first and are never delayed by OFF; external hits are
+appended best-effort (short timeout, cached ~5 min), de-duplicated by barcode, and
+pass the very same score/grade/clean-label filters. Clicking an OFF result through
+to [`GET /product/{barcode}`](#1-get-product-details-api) resolves it fully. This
+uses OFF's [Search-a-licious](https://search.openfoodfacts.org) API — the legacy
+`cgi/search.pl` endpoint is heavily rate-limited and often returns a 503 HTML page,
+which is why name search previously "found nothing".
 
 **Pagination:** results are scored, filtered and ranked, then the page is sliced
 as `results[offset : offset + limit]`. For example `?limit=10&offset=0` is page 1
@@ -895,8 +985,11 @@ product's own uploaded image, or the shared placeholder
 
 **Example using `curl`:**
 ```bash
-# Text search (healthiest first)
-curl "http://127.0.0.1:8000/search?q=lays"
+# Text search (healthiest first) — includes Open Food Facts products
+curl "http://127.0.0.1:8000/search?q=mother+dairy"
+
+# Our curated catalogue only (no external results)
+curl "http://127.0.0.1:8000/search?q=lays&external=false"
 
 # Filter: grade-A products in the "chips" category, cheapest-scoring first
 curl "http://127.0.0.1:8000/search?category=chips&min_score=3&sort=score_desc&limit=5"
@@ -915,7 +1008,9 @@ curl "http://127.0.0.1:8000/search?q=&sort=name&limit=10&offset=10"
     "category": "chips",
     "score": 6,
     "grade": "C",
-    "image_url": "/product-images/_placeholder.svg"
+    "is_better_for_you": false,
+    "image_url": "/product-images/_placeholder.svg",
+    "source": "database"
   }
 ]
 ```
@@ -1109,6 +1204,18 @@ barcode scanned:
   ("You can scan the barcode of this product using the scanner to get all the
   details and score"), with `product_in_database: false` and `source:
   "product-lookup"`.
+
+> **Keyword weighting (July 27).** Every keyword found in the question is ranked by
+> how *identifying* it is — a full product name or brand outranks a longer but
+> generic descriptor word — so *"Kellogg's Multigrain Chocos"* resolves to
+> **"Chocos cereal"** instead of an unrelated *"…multigrain…chips"* (the old logic
+> let the single longest word win). Generic grain/label adjectives
+> (`multigrain`, `wholegrain`, …) are excluded from the lookup index.
+>
+> When a product-info question resolves to a product, the deterministic fast-path
+> answers directly from our scored data (`source: "fast-path-deterministic"`) and
+> now returns `product_name`, `score`, `grade` and `ingredient_flags` alongside the
+> Markdown `response`, so the client can render the score card without a second call.
 
 #### Greeting fast-path (performance)
 A bare greeting or smalltalk message (`"hi"`, `"hello"`, `"thanks"`, `"how are
@@ -3050,6 +3157,17 @@ the category id (`soft_drink` → `Soft Drink`).
 - **Query Parameters:**
   - `sort`: `score_desc` (default, healthiest first), `score_asc`, or `name`.
   - `limit`: 1–500 per page (default 50). · `offset`: skip N for pagination.
+  - `external` (boolean, July 27): include Open Food Facts' global catalogue for
+    this category. Defaults to the `SWAPIFY_EXTERNAL_SEARCH` setting (on); pass
+    `external=false` for our curated list only.
+
+**Global catalogue (Open Food Facts) — July 27:** so a category page isn't capped at
+our ~250 curated rows, Open Food Facts products for the category are appended (via
+[Search-a-licious](https://search.openfoodfacts.org), mapped through
+`_OFF_CATEGORY_TAGS`), scored with the same engine, de-duplicated by barcode against
+our own rows, and re-ranked into the combined list. The response adds
+`external_count` (how many OFF products were merged) and each product carries a
+`source` (`"database"` or `"openfoodfacts"`).
 
 ```bash
 curl "http://127.0.0.1:8000/products/by-category/protein_bar?limit=2"
@@ -3058,7 +3176,8 @@ curl "http://127.0.0.1:8000/products/by-category/protein_bar?limit=2"
 {
   "category": "protein_bar",
   "label": "Protein Bar",
-  "total": 10,
+  "total": 30,
+  "external_count": 20,
   "count": 2,
   "limit": 2,
   "offset": 0,
@@ -3068,11 +3187,12 @@ curl "http://127.0.0.1:8000/products/by-category/protein_bar?limit=2"
      "brand": "The whole truth", "category": "protein_bar", "score": 6.1, "grade": "C",
      "recommended": false, "is_better_for_you": false,
      "nutrition_per_100g": {"basis": "per_100g", "serving_size_g": 52.0, "sugar": 0.0, "protein": 25.0, "fiber": 8.5, "…": "…"},
-     "image_url": "/product-images/_placeholder.svg"}
+     "image_url": "/product-images/_placeholder.svg", "source": "database"}
   ]
 }
 ```
-An unknown/empty category returns `total: 0` and an empty `products` array.
+An unknown/empty category returns `total: 0` and an empty `products` array (plus
+`external_count` for any OFF products found for the label).
 
 ## Health Scoring Logic (V2)
 
