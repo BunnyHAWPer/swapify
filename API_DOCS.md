@@ -3134,6 +3134,10 @@ auth.**
 
 #### List categories
 - **URL:** `/products/categories` · **Method:** `GET`
+- **Query Parameters:**
+  - `external` (boolean, July 28): include the Open Food Facts half of the counts.
+    Defaults to the `SWAPIFY_EXTERNAL_SEARCH` setting (on); pass `external=false`
+    for our curated counts only.
 
 ```bash
 curl http://127.0.0.1:8000/products/categories
@@ -3141,16 +3145,31 @@ curl http://127.0.0.1:8000/products/categories
 ```json
 {
   "count": 23,
-  "total_products": 252,
+  "total_products": 4852,
+  "db_products": 252,
+  "external_products": 4600,
+  "external_limit": 200,
   "categories": [
-    {"category": "chocolate", "label": "Chocolate", "count": 48},
-    {"category": "chips", "label": "Chips", "count": 34},
-    {"category": "soft_drink", "label": "Soft Drink", "count": 30}
+    {"category": "chocolate", "label": "Chocolate", "count": 248, "db_count": 48, "external_count": 200},
+    {"category": "chips", "label": "Chips", "count": 234, "db_count": 34, "external_count": 200},
+    {"category": "soft_drink", "label": "Soft Drink", "count": 230, "db_count": 30, "external_count": 200}
   ]
 }
 ```
 Ordered by product count (largest first). `label` is a display-friendly form of
 the category id (`soft_drink` → `Soft Drink`).
+
+**Counts cover both halves — July 28.** `count` = `db_count` (our curated rows) +
+`external_count` (the Open Food Facts products `/products/by-category` will merge
+in), so the grid reflects what is actually browsable instead of the size of our
+seed catalogue. Categories we can browse on OFF but curate nothing for still get a
+tile. `external_count` is the ceiling
+(`SWAPIFY_CATEGORY_EXTERNAL_LIMIT`, default 200) that browsing fetches on demand;
+it tightens to the real page size once that category has been browsed and cached.
+Treat it as "about this many": `/products/by-category` can still drop a couple by
+de-duplicating OFF hits against our own rows. Listing categories never calls out to
+OFF itself, so this endpoint stays a single local query. `external=false` restores
+the pre-July-28 DB-only counts.
 
 #### Products in a category (paginated, scored)
 - **URL:** `/products/by-category/{category}` · **Method:** `GET`
@@ -3169,6 +3188,15 @@ our own rows, and re-ranked into the combined list. The response adds
 `external_count` (how many OFF products were merged) and each product carries a
 `source` (`"database"` or `"openfoodfacts"`).
 
+**Depth — July 28.** Category browsing used to borrow the 20-hit name-search
+default, so a category page was our own rows plus a token 20 no matter how much OFF
+had. It now pulls up to `SWAPIFY_CATEGORY_EXTERNAL_LIMIT` products (default **200**,
+max 1000) — one Search-a-licious request covers 250 hits, and higher limits page in
+parallel. Pages are cached for `SWAPIFY_CATEGORY_EXTERNAL_TTL` (default 30 min) in
+their own cache, so only the first visitor per category pays the ~1–3 s fetch.
+`other` is the taxonomy's "no known peers" bucket, not a real category, so it stays
+DB-only (and now correctly returns rows whose `category` is empty).
+
 ```bash
 curl "http://127.0.0.1:8000/products/by-category/protein_bar?limit=2"
 ```
@@ -3176,8 +3204,8 @@ curl "http://127.0.0.1:8000/products/by-category/protein_bar?limit=2"
 {
   "category": "protein_bar",
   "label": "Protein Bar",
-  "total": 30,
-  "external_count": 20,
+  "total": 210,
+  "external_count": 200,
   "count": 2,
   "limit": 2,
   "offset": 0,
