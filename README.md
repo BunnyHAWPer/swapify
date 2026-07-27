@@ -31,35 +31,6 @@ No key or external account is required to boot the app and score products.
 
 ---
 
-## Repository layout
-
-```
-swapify-main/
-├─ src/
-│  ├─ app.py                 # the entire FastAPI backend (~10k lines, one file)
-│  ├─ category_taxonomy.py   # single source of truth for product categories
-│  ├─ ocr_label_scanner.py   # OCR label POC (Tesseract) — optional, lazy-loaded
-│  └─ observability.py       # optional Sentry error tracking
-├─ static/                   # the frontend (deploys to Vercel as-is)
-│  ├─ index.html
-│  ├─ script.js              # BACKEND_OVERRIDE_URL points at the live API
-│  ├─ style.css
-│  └─ swapify_products.csv   # offline catalogue mirror for the browser
-├─ swapify.db                # SQLite database (seeded catalogue + runtime data)
-├─ products.csv              # seed/sync source for the products table
-├─ requirements.txt
-├─ .env.example              # copy to .env and fill in what you need
-├─ render.yaml               # Render deploy blueprint (see DEPLOYMENT.md)
-├─ test_api.sh / test_api.ps1        # local end-to-end HTTP smoke tests
-├─ test_live_api.ps1                 # same suite against the live URL
-├─ test_scoring_spec.py              # scoring-engine spec test (100 assertions)
-├─ sync_db.py / export_products.py / normalize_db_to_100g.py   # DB ops tools
-├─ weekly_digest.py / cron_weekly_digest.py                    # digest email
-└─ *.md                      # this README + the docs linked above
-```
-
----
-
 ## Quick start (local backend)
 
 From the repository root:
