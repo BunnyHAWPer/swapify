@@ -1,232 +1,311 @@
-"""Sentry error tracking with request context (Task 2).
+"""OCR Label Scanner — Proof of Concept (Task 6).
 
-Design constraints
-------------------
-**It must be impossible for this file to take the app down.** Error tracking is
-support machinery; if it breaks, the API must still serve. So every entry point here
-degrades to a no-op rather than raising:
+Takes a photo of a packaged-food label and extracts the printed text using
+Tesseract OCR (via ``pytesseract`` + ``Pillow``), then parses out:
 
-* ``sentry_sdk`` not installed  -> no-op (the import is guarded)
-* ``SENTRY_DSN`` unset          -> no-op (this is the normal local-dev state)
-* Sentry itself throws          -> swallowed and logged
+  * the **ingredient list** (everything after the "Ingredients:" heading), and
+  * any **nutrition facts** it can find (sugar, sodium/salt, saturated fat,
+    protein, fiber, energy) as per-serving numbers,
 
-That means you can run, test and deploy this backend with no Sentry account at all,
-and turn tracking on later purely by setting one environment variable.
+so the result can be fed straight into Swapify's existing scoring engine
+(``calculate_health_score_v2`` in app.py) — no separate scoring logic lives here.
 
-What gets attached to an event
-------------------------------
-A bare stack trace tells you *what* broke but not *who* hit it or *what they asked
-for*, which is the difference between a five-minute fix and an afternoon. Every event
-carries:
+Design notes
+------------
+* **Optional dependency.** Tesseract is not always installed (it's a native
+  binary plus two Python packages). This module never imports them at module
+  load; ``ocr_available()`` reports whether OCR can run and, if not, why. The
+  FastAPI app imports this module unconditionally and simply returns a helpful
+  503 when OCR isn't installed, so the rest of the backend keeps working.
+* **Proof of concept.** Real-world label OCR needs image preprocessing
+  (deskew, threshold, denoise) and a trained ingredient parser. This POC does a
+  light grayscale + autocontrast pass and heuristic parsing — enough to
+  demonstrate the end-to-end flow: image → text → ingredients → score.
 
-* **user**     — ``user_id`` from the JWT (never the email/password)
-* **endpoint** — the route *template* (``/product/{barcode}``, not ``/product/890...``)
-                 so all failures of one route group into a single Sentry issue instead
-                 of one issue per barcode
-* **request**  — method, path, query string, and a request id echoed back in the
-                 ``X-Request-ID`` response header, so a user's bug report ("I got a
-                 500, here's the id") maps to exactly one Sentry event
-
-PII
----
-``send_default_pii`` is off, and ``before_send`` additionally strips the
-``Authorization``/``Cookie`` headers and any ``password``/``token`` field before the
-event leaves the process. We send the user's *id*, never their credentials.
+Install (to actually run OCR):
+    pip install pytesseract Pillow
+    # plus the Tesseract engine itself:
+    #   Windows : https://github.com/UB-Mannheim/tesseract/wiki  (then add to PATH
+    #             or set TESSERACT_CMD to the tesseract.exe path)
+    #   macOS   : brew install tesseract
+    #   Linux   : sudo apt-get install tesseract-ocr
 """
 
 from __future__ import annotations
 
-import logging
+import io
 import os
-import uuid
-
-logger = logging.getLogger("swapify.observability")
-
-try:  # Sentry is optional — the app must run without it.
-    import sentry_sdk
-    from sentry_sdk.integrations.logging import LoggingIntegration
-except ImportError:  # pragma: no cover
-    sentry_sdk = None
-    LoggingIntegration = None
-
-# Header/body keys that must never reach Sentry.
-_SCRUB_HEADERS = {"authorization", "cookie", "x-admin-token", "set-cookie"}
-_SCRUB_FIELDS = {"password", "token", "access_token", "secret", "admin_token"}
-
-_enabled = False
+import re
+from typing import Dict, List, Optional
 
 
-def _scrub(event, _hint):
-    """Strip credentials from an event just before it is sent."""
-    try:
-        request = event.get("request") or {}
-
-        headers = request.get("headers")
-        if isinstance(headers, dict):
-            for key in list(headers):
-                if key.lower() in _SCRUB_HEADERS:
-                    headers[key] = "[redacted]"
-
-        data = request.get("data")
-        if isinstance(data, dict):
-            for key in list(data):
-                if key.lower() in _SCRUB_FIELDS:
-                    data[key] = "[redacted]"
-    except Exception as exc:  # never let scrubbing break delivery
-        logger.warning("sentry before_send scrub failed: %s", exc)
-    return event
+class OcrUnavailable(RuntimeError):
+    """Raised when an OCR call is attempted but Tesseract/Pillow are missing."""
 
 
-def init_sentry() -> bool:
-    """Initialise Sentry from the environment. Returns True when tracking is live.
+def ocr_available() -> tuple[bool, str]:
+    """Return ``(available, reason)``.
 
-    Env:
-        SENTRY_DSN          the project DSN. **Unset disables Sentry entirely.**
-        SENTRY_ENVIRONMENT  e.g. "production" / "development" (default "development")
-        SENTRY_RELEASE      release identifier, e.g. a git sha (optional)
-        SENTRY_TRACES_SAMPLE_RATE  performance-trace sampling, 0.0-1.0 (default 0.0)
+    ``available`` is True only when ``pytesseract`` + ``Pillow`` import *and* the
+    Tesseract binary is reachable. ``reason`` explains any failure so the caller
+    (and the screen recording) can see exactly what to install.
     """
-    global _enabled
-
-    dsn = (os.environ.get("SENTRY_DSN") or "").strip()
-    if not dsn:
-        logger.info("SENTRY_DSN unset - error tracking disabled (this is fine locally).")
-        return False
-    if sentry_sdk is None:
-        logger.warning("SENTRY_DSN is set but sentry-sdk is not installed; "
-                       "run: pip install 'sentry-sdk[fastapi]'")
-        return False
-
     try:
-        rate = float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0") or 0)
-    except ValueError:
-        rate = 0.0
-
-    try:
-        sentry_sdk.init(
-            dsn=dsn,
-            environment=os.environ.get("SENTRY_ENVIRONMENT", "development"),
-            release=os.environ.get("SENTRY_RELEASE") or None,
-            traces_sample_rate=rate,
-            # We attach the user id ourselves; never let the SDK harvest bodies,
-            # cookies or IPs on its own.
-            send_default_pii=False,
-            # Do NOT ship local variables with stack traces.
-            #
-            # This is not paranoia — it was caught by an actual test. Sentry captures
-            # every frame's locals by default, and the raw ASGI ``scope`` dict (which
-            # embeds the complete header list, Authorization and X-Admin-Token included)
-            # is a local in ~20 Starlette/FastAPI frames on any request that raises. The
-            # credentials therefore reach Sentry *even though* ``before_send`` redacts
-            # ``request.headers``, because they ride along a second time inside the
-            # frame locals.
-            #
-            # Scrubbing those by name is unwinnable: they live in framework internals
-            # (``scope``, ``conn``, ``solved_result``, ...) that we neither own nor
-            # control across upgrades. Dropping locals entirely kills the whole class of
-            # leak. We keep the full stack trace — file, function, line, source context —
-            # plus the user/endpoint/request context attached below, which is what is
-            # actually needed to chase a bug.
-            include_local_variables=False,
-            before_send=_scrub,
-            # Breadcrumbs from WARNING+, and send ERROR+ logs as events, so a
-            # logger.error() in a route shows up without an explicit capture call.
-            integrations=[LoggingIntegration(level=logging.WARNING,
-                                             event_level=logging.ERROR)]
-            if LoggingIntegration else [],
+        import pytesseract  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except Exception as exc:  # pragma: no cover - depends on env
+        return False, (
+            "Python OCR packages not installed. Run: pip install pytesseract Pillow "
+            f"({exc})"
         )
-    except Exception as exc:  # pragma: no cover - never fatal
-        logger.warning("Sentry init failed, continuing without it: %s", exc)
-        return False
 
-    _enabled = True
-    logger.info("Sentry initialised (environment=%s).",
-                os.environ.get("SENTRY_ENVIRONMENT", "development"))
-    return True
+    # Allow an explicit path to the tesseract binary (common on Windows).
+    cmd = os.environ.get("TESSERACT_CMD")
+    if cmd:
+        import pytesseract
+        pytesseract.pytesseract.tesseract_cmd = cmd
 
-
-def is_enabled() -> bool:
-    return _enabled
-
-
-def install_request_context(app, decode_user_id) -> None:
-    """Attach user/endpoint/request context to every event, and tag responses.
-
-    ``decode_user_id(auth_header)`` is injected rather than imported so this module
-    stays independent of the app's auth internals (and unit-testable on its own).
-
-    The middleware runs whether or not Sentry is live: it always assigns the request
-    id and the ``X-Request-ID`` response header, which is useful for plain log
-    correlation even with tracking switched off.
-    """
-    # Local imports: keep this module importable even without Starlette present.
-    from starlette.requests import Request
-    from starlette.responses import JSONResponse
-
-    @app.middleware("http")
-    async def _sentry_request_context(request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:16]
-        request.state.request_id = request_id
-
-        if _enabled and sentry_sdk is not None:
-            try:
-                scope = sentry_sdk.get_current_scope()
-
-                # The route *template*, so every failure of this route lands in one
-                # Sentry issue. Falls back to the raw path before routing resolves.
-                route = request.scope.get("route")
-                endpoint = getattr(route, "path", None) or request.url.path
-
-                scope.set_tag("endpoint", endpoint)
-                scope.set_tag("method", request.method)
-                scope.set_tag("request_id", request_id)
-                scope.set_context("request_details", {
-                    "method": request.method,
-                    "path": request.url.path,
-                    "query": str(request.url.query or ""),
-                    "endpoint": endpoint,
-                    "client": request.client.host if request.client else None,
-                })
-
-                user_id = decode_user_id(request.headers.get("Authorization"))
-                # id only — never the email or anything else identifying.
-                scope.set_user({"id": user_id} if user_id else None)
-            except Exception as exc:  # pragma: no cover
-                logger.warning("sentry context enrichment failed: %s", exc)
-
-        try:
-            response = await call_next(request)
-        except Exception:
-            # Capture explicitly so the event carries the scope built above rather
-            # than a bare trace.
-            if _enabled and sentry_sdk is not None:
-                sentry_sdk.capture_exception()
-            logger.exception("Unhandled error [request_id=%s] %s %s",
-                             request_id, request.method, request.url.path)
-
-            # Answer here instead of re-raising into Starlette's default 500. If we
-            # re-raise, the response is generated above this middleware and never
-            # gets the X-Request-ID header — losing the id on precisely the responses
-            # where it matters. Returning it ourselves means a user can quote the id
-            # from a failed request and we can pull up that exact Sentry event.
-            return JSONResponse(
-                status_code=500,
-                content={"detail": "Internal server error", "request_id": request_id},
-                headers={"X-Request-ID": request_id},
-            )
-
-        response.headers["X-Request-ID"] = request_id
-        return response
-
-
-def capture_message(message: str, level: str = "info", **tags) -> None:
-    """Record a non-exception event (no-op when Sentry is off)."""
-    if not (_enabled and sentry_sdk is not None):
-        return
     try:
-        scope = sentry_sdk.get_current_scope()
-        for key, value in tags.items():
-            scope.set_tag(key, value)
-        sentry_sdk.capture_message(message, level=level)
-    except Exception as exc:  # pragma: no cover
-        logger.warning("sentry capture_message failed: %s", exc)
+        import pytesseract
+        version = pytesseract.get_tesseract_version()
+    except Exception as exc:  # pragma: no cover - depends on env
+        return False, (
+            "Tesseract engine not found. Install it and add to PATH (or set "
+            "TESSERACT_CMD). See https://github.com/UB-Mannheim/tesseract/wiki. "
+            f"({exc})"
+        )
+    return True, f"Tesseract {version} ready"
+
+
+def extract_text_from_image(data: bytes, lang: str = "eng") -> str:
+    """OCR the raw image ``data`` into a single text string.
+
+    Applies a light preprocessing pass (grayscale + autocontrast) that noticeably
+    improves recognition on photos of glossy packaging. Raises ``OcrUnavailable``
+    when the OCR stack isn't installed.
+    """
+    available, reason = ocr_available()
+    if not available:
+        raise OcrUnavailable(reason)
+
+    import pytesseract
+    from PIL import Image, ImageOps
+
+    try:
+        image = Image.open(io.BytesIO(data))
+    except Exception as exc:
+        raise ValueError(f"Could not read image: {exc}")
+
+    # Preprocess: grayscale + autocontrast for cleaner OCR on busy packaging.
+    image = ImageOps.grayscale(image)
+    image = ImageOps.autocontrast(image)
+
+    return pytesseract.image_to_string(image, lang=lang)
+
+
+# ------------------------------------------------------------------------------
+# Parsing helpers — turn raw OCR text into structured, scorer-ready fields.
+# ------------------------------------------------------------------------------
+
+# Words that mark where the ingredient list ends (start of another panel).
+_INGREDIENTS_END_MARKERS = (
+    "nutrition", "nutritional", "allergen", "contains", "manufactured",
+    "best before", "storage", "net weight", "mrp", "fssai", "marketed",
+    "for allergen", "packed", "customer care",
+)
+
+
+def parse_ingredients(text: str) -> List[str]:
+    """Extract the ingredient list from OCR text.
+
+    Finds the "Ingredients" heading and returns everything up to the next label
+    panel, split into individual ingredients. Nested parentheticals (e.g.
+    "Chocolate (Sugar, Cocoa)") are kept with their parent item. Returns an empty
+    list when no ingredient heading is found.
+    """
+    if not text:
+        return []
+
+    lower = text.lower()
+    match = re.search(r"ingredients?\s*[:\-]?", lower)
+    if not match:
+        return []
+
+    segment = text[match.end():]
+    seg_lower = segment.lower()
+
+    # Cut the segment at the first "next panel" marker so nutrition/allergen text
+    # doesn't leak into the ingredient list.
+    cut = len(segment)
+    for marker in _INGREDIENTS_END_MARKERS:
+        idx = seg_lower.find(marker)
+        if idx != -1:
+            cut = min(cut, idx)
+    segment = segment[:cut]
+
+    # Normalise whitespace/newlines, then split on commas that are not inside
+    # parentheses so "Milk Solids (Sugar, Cocoa)" stays a single item.
+    segment = re.sub(r"\s+", " ", segment).strip(" .;:")
+    ingredients, depth, current = [], 0, ""
+    for ch in segment:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        if ch == "," and depth == 0:
+            ingredients.append(current)
+            current = ""
+        else:
+            current += ch
+    if current:
+        ingredients.append(current)
+
+    cleaned = []
+    for item in ingredients:
+        item = item.strip(" .;:*-•·")
+        # Drop noise fragments the OCR sometimes leaves behind.
+        if item and len(item) <= 60 and any(c.isalpha() for c in item):
+            cleaned.append(item)
+    return cleaned
+
+
+# Regexes for the nutrients the scoring engine cares about. Each captures the
+# first number following the nutrient name (units vary and are handled per-key).
+_NUTRIENT_PATTERNS = {
+    "sugar_g_per_serving": r"(?:added\s+)?sugars?\b[^\d]{0,20}?([\d.]+)\s*g",
+    "saturated_fat_g_per_serving": r"saturated(?:\s+fat)?\b[^\d]{0,20}?([\d.]+)\s*g",
+    "protein_g_per_serving": r"protein\b[^\d]{0,20}?([\d.]+)\s*g",
+    "fiber_g_per_serving": r"(?:dietary\s+)?fib(?:re|er)\b[^\d]{0,20}?([\d.]+)\s*g",
+    "calories_kcal_per_serving": r"(?:energy|calories)\b[^\d]{0,20}?([\d.]+)\s*(?:kcal|cal)",
+}
+
+
+def _to_float(value: str) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_nutrition(text: str) -> Dict[str, Optional[float]]:
+    """Best-effort extraction of per-serving nutrition numbers from OCR text.
+
+    Sodium is derived from a "sodium" figure when present (converted mg), else
+    estimated from a "salt" figure (salt ≈ sodium × 2.5). Missing nutrients are
+    omitted so the scorer treats them as unknown rather than zero.
+    """
+    if not text:
+        return {}
+    lower = text.lower()
+
+    nutrition: Dict[str, Optional[float]] = {}
+    for key, pattern in _NUTRIENT_PATTERNS.items():
+        m = re.search(pattern, lower)
+        if m:
+            val = _to_float(m.group(1))
+            if val is not None:
+                nutrition[key] = val
+
+    # Sodium (mg): prefer an explicit sodium figure, else convert from salt.
+    m_sodium = re.search(r"sodium\b[^\d]{0,20}?([\d.]+)\s*(mg|g)?", lower)
+    if m_sodium:
+        val = _to_float(m_sodium.group(1))
+        unit = (m_sodium.group(2) or "mg").lower()
+        if val is not None:
+            nutrition["sodium_mg_per_serving"] = val * 1000 if unit == "g" else val
+    else:
+        m_salt = re.search(r"salt\b[^\d]{0,20}?([\d.]+)\s*g", lower)
+        if m_salt:
+            val = _to_float(m_salt.group(1))
+            if val is not None:
+                # salt(g) → sodium(mg): /2.5 g then ×1000
+                nutrition["sodium_mg_per_serving"] = round(val / 2.5 * 1000, 1)
+    return nutrition
+
+
+def guess_product_name(text: str) -> Optional[str]:
+    """Best-effort guess at the product's name from OCR'd packaging text.
+
+    There's no reliable way to tell "this is the brand/product name" from
+    plain OCR text alone — real name detection needs layout/font-size info
+    (the name is usually the biggest text on the pack) that Tesseract's
+    plain-text output doesn't preserve. This is a plain heuristic instead:
+    the product name is almost always near the top of the photo and is
+    short, mostly-alphabetic, and isn't one of the standard label panels
+    (ingredients, nutrition, allergen warnings, etc.) — so scan the first
+    handful of OCR'd lines, discard anything that looks like one of those
+    panels or is too short/long/numeric to plausibly be a name, and return
+    the longest survivor (a longer line is more likely to be a full product
+    name like "Maggi 2-Minute Noodles" than a stray logo fragment).
+
+    Good enough to seed a text search the user can correct via the search
+    suggestions that come back — not meant to be exact.
+    """
+    if not text:
+        return None
+
+    skip_markers = (
+        "ingredient", "nutrition", "nutritional", "allergen", "contains",
+        "manufactured", "best before", "storage", "net weight", "net wt",
+        "mrp", "fssai", "marketed", "packed", "customer care", "energy",
+        "per serving", "serving size", "www.", "http", "barcode",
+    )
+
+    candidates = []
+    lines = [l.strip(" .,:;*-•·|_") for l in text.splitlines()]
+    for line in lines[:10]:  # the name is almost always near the top
+        if not line:
+            continue
+        lower = line.lower()
+        if any(marker in lower for marker in skip_markers):
+            continue
+        letters = sum(1 for c in line if c.isalpha())
+        digits = sum(1 for c in line if c.isdigit())
+        if letters < 3 or digits > letters:
+            continue  # too short, or looks like a code/number rather than a name
+        if len(line) > 60:
+            continue  # too long to plausibly be just the product name
+        candidates.append(line)
+
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
+def scan_label(data: bytes, lang: str = "eng") -> Dict:
+    """Full POC pipeline: image bytes → OCR text → ingredients + nutrition.
+
+    Returns a dict with the raw text, the parsed ingredient list, a single
+    ``ingredients_text`` string (comma-joined, ready for the scoring engine),
+    the parsed nutrition facts, and a best-effort ``guessed_name`` (see
+    ``guess_product_name``) so a label photo can also be used to search by
+    product name, not just to score its nutrition. Scoring itself is done by
+    the caller (the app endpoint) so this module stays decoupled from the
+    scoring code.
+    """
+    raw_text = extract_text_from_image(data, lang=lang)
+    ingredients = parse_ingredients(raw_text)
+    nutrition = parse_nutrition(raw_text)
+    return {
+        "raw_text": raw_text,
+        "ingredients": ingredients,
+        "ingredients_text": ", ".join(ingredients),
+        "nutrition": nutrition,
+        "guessed_name": guess_product_name(raw_text),
+    }
+
+
+if __name__ == "__main__":
+    # Tiny CLI so the POC can be demonstrated without the web server:
+    #   python ocr_label_scanner.py path/to/label.jpg
+    import json
+    import sys
+
+    ok, why = ocr_available()
+    print(f"OCR available: {ok} — {why}")
+    if len(sys.argv) > 1:
+        with open(sys.argv[1], "rb") as fh:
+            result = scan_label(fh.read())
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print("Usage: python ocr_label_scanner.py <image-path>")
