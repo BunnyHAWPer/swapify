@@ -16,6 +16,7 @@ import datetime
 import time
 import json
 import logging
+import threading
 
 # OCR label scanner POC (Task 6). The module itself has no hard dependency on the
 # OCR stack at import time (Tesseract/Pillow are looked up lazily), so this import
@@ -595,8 +596,11 @@ def invalidate_product_cache(barcode=None):
     (e.g. a crowdsourced image upload)."""
     if barcode is None:
         _product_cache.clear()
+        _negative_resolution_cache.clear()
     else:
         _product_cache.pop(barcode, None)
+        # A product that now resolves must not stay remembered as a miss.
+        _negative_resolution_cache.pop(barcode, None)
     _popular_cache.clear()
     # The typeahead index/result caches derive from the catalogue, so any product
     # change must drop them too or new/renamed products won't appear in search.
@@ -895,7 +899,7 @@ def fetch_off_product(barcode: str):
         off_resp = requests.get(
             f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json",
             headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
-            timeout=8,
+            timeout=min(_OFF_TIMEOUT_S, _autofill_remaining()),
         )
     except requests.RequestException:
         return None
@@ -906,8 +910,20 @@ def fetch_off_product(barcode: str):
     if data.get('status') != 1 or not data.get('product'):
         return None
 
-    p = data['product']
-    nutriments = p.get('nutriments', {})
+    return _normalize_off_raw(data['product'], barcode)
+
+
+def _normalize_off_raw(p: dict, barcode: str):
+    """Turn one raw Open Food Facts product object into our per-100g row shape.
+
+    Shared by the barcode lookup (fetch_off_product) and the name search
+    (_off_search_by_name). Returns None when the object carries neither a name
+    nor any nutrition worth keeping. ``product_name`` intentionally falls back to
+    the brand (never the literal 'Unknown Product') so the client always has a
+    real label to show (Issue 2)."""
+    if not p:
+        return None
+    nutriments = p.get('nutriments', {}) or {}
 
     def _num(*keys):
         for k in keys:
@@ -926,7 +942,10 @@ def fetch_off_product(barcode: str):
         sodium_val = (salt_val / 2.5) if salt_val is not None else None
     sodium_mg = sodium_val * 1000 if sodium_val is not None else None
 
-    category = (p.get('categories', '') or '').split(',')[0].strip().lower()
+    cats_raw = p.get('categories')
+    if isinstance(cats_raw, (list, tuple)):
+        cats_raw = cats_raw[0] if cats_raw else ""
+    category = (cats_raw or '').split(',')[0].strip().lower()
     category = re.sub(r'^[a-z]{2}:', '', category) or None
 
     # OFF stores ingredients under several keys; fall back across them
@@ -942,10 +961,27 @@ def fetch_off_product(barcode: str):
             i.get('text', '') for i in p['ingredients'] if i.get('text')
         )
 
-    return {
-        "barcode": barcode,
-        "product_name": p.get('product_name') or 'Unknown Product',
-        "brand": p.get('brands', ''),
+    # ``brands`` is a comma string on the product API but a list on the
+    # Search-a-licious API — accept either.
+    brands_raw = p.get('brands')
+    if isinstance(brands_raw, (list, tuple)):
+        brand = (brands_raw[0] if brands_raw else "").strip()
+    else:
+        brand = (brands_raw or '').split(',')[0].strip()
+    # ``product_name`` can likewise arrive as a list; coerce, then fall back across
+    # the English name and the brand rather than the useless placeholder OFF often
+    # carries — never surface 'Unknown Product' (Issue 2).
+    name_raw = p.get('product_name') or p.get('product_name_en') or ""
+    if isinstance(name_raw, (list, tuple)):
+        name_raw = name_raw[0] if name_raw else ""
+    name = (name_raw or "").strip()
+    if not name or name.lower() in ("unknown product", "unknown"):
+        name = brand or None
+
+    row = {
+        "barcode": barcode or p.get("code") or "",
+        "product_name": name,
+        "brand": brand,
         # OFF exposes product imagery under a few keys; the front image is best
         # for a share card. None of the local DB rows carry an image, so this is
         # only populated for products resolved from Open Food Facts.
@@ -965,6 +1001,11 @@ def fetch_off_product(barcode: str):
         "calories_kcal_per_serving": _num('energy-kcal_serving', 'energy-kcal_100g'),
         "ingredients_text": off_ingredients,
     }
+    # A candidate with no name AND no nutrition at all is noise, not a product.
+    if not row["product_name"] and all(
+            row.get(f) is None for f in CORE_NUTRIENT_FIELDS):
+        return None
+    return row
 
 
 # ==============================================================================
@@ -1182,7 +1223,63 @@ AUTOFILL_ENABLED = os.environ.get("SWAPIFY_AUTOFILL", "1") not in ("0", "false",
 GOOGLE_FALLBACK_ENABLED = os.environ.get("SWAPIFY_GOOGLE_FALLBACK", "1") not in ("0", "false", "False", "")
 USDA_API_KEY = os.environ.get("USDA_API_KEY", "DEMO_KEY").strip()
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "").strip()
-EXTERNAL_SOURCE_TIMEOUT_S = float(os.environ.get("SWAPIFY_SOURCE_TIMEOUT", "6"))
+EXTERNAL_SOURCE_TIMEOUT_S = float(os.environ.get("SWAPIFY_SOURCE_TIMEOUT", "5"))
+# Open Food Facts barcode lookup timeout (was a hard-coded 8s that dominated the
+# scan latency for any product OFF is slow to answer for). Kept short so a slow
+# OFF response can't hold up the scan; the auto-fill budget bounds it further.
+_OFF_TIMEOUT_S = float(os.environ.get("SWAPIFY_OFF_TIMEOUT", "5"))
+
+# Overall wall-clock ceiling for the WHOLE external auto-fill chain per scan
+# (Issue 1 — scanner was taking 20+s). Each source gets min(its own timeout, the
+# budget still remaining), and once the budget is spent the chain stops trying
+# more sources and returns whatever it already has. This bounds the very first
+# scan of an unknown/incomplete product; every later scan is served from our DB
+# cache with no network at all.
+AUTOFILL_TOTAL_BUDGET_S = float(os.environ.get("SWAPIFY_AUTOFILL_BUDGET", "6"))
+# The AI/LLM nutrition estimate is the slowest, least reliable source (a free
+# model can take 8-20s and often returns nothing), so it gets a tight cap of its
+# own and is never allowed to blow the per-scan budget.
+AI_ESTIMATE_TIMEOUT_S = float(os.environ.get("SWAPIFY_AI_ESTIMATE_TIMEOUT", "4"))
+
+# Negative-resolution cache (Issue 1): a barcode that resolves to *nothing*
+# anywhere is remembered for a short while so repeat scans of the same unknown
+# pack return a fast 404 instead of re-running the whole (slow) fallback chain
+# every time. Cleared for a barcode whenever its product cache is invalidated.
+NEGATIVE_RESOLUTION_TTL = int(os.environ.get("SWAPIFY_NEGATIVE_TTL", "600"))
+_negative_resolution_cache = TTLCache(maxsize=2048, ttl=NEGATIVE_RESOLUTION_TTL)
+
+# Enrichment cooldown (Issue 1): some products resolve but stay *partially*
+# incomplete (e.g. OFF has the pack but no fiber, and USDA/AI can't fill it).
+# Without this, every rescan would re-run the whole slow fallback chain for the
+# same gap. Once we've attempted enrichment for a barcode we skip re-attempting
+# for this window, so only the first scan pays the network cost; after it lapses
+# we retry in case a source has since recovered.
+ENRICHMENT_COOLDOWN_TTL = int(os.environ.get("SWAPIFY_ENRICH_COOLDOWN", "600"))
+_enrichment_attempt_cache = TTLCache(maxsize=4096, ttl=ENRICHMENT_COOLDOWN_TTL)
+
+# Include Open Food Facts' global catalogue in name search and category browsing
+# (Issues 6 & 7) so results aren't limited to our ~250 curated products. Kept
+# best-effort and short-timeout: our own DB results are always returned first and
+# never wait on OFF; external hits are appended when they arrive. Results are
+# cached briefly so repeated queries/paging don't re-hit the network.
+EXTERNAL_SEARCH_ENABLED = os.environ.get("SWAPIFY_EXTERNAL_SEARCH", "1") not in ("0", "false", "False", "")
+EXTERNAL_SEARCH_LIMIT = int(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_LIMIT", "20"))
+EXTERNAL_SEARCH_TIMEOUT_S = float(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_TIMEOUT", "4"))
+_external_search_cache = TTLCache(maxsize=256, ttl=int(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_TTL", "300")))
+
+# Per-scan auto-fill deadline, shared with the individual source functions so each
+# network call is bounded by min(its own timeout, the budget left) — one slow
+# source can't blow the whole scan. Thread-local because sync FastAPI endpoints
+# each run on their own worker thread.
+_autofill_ctx = threading.local()
+
+
+def _autofill_remaining() -> float:
+    """Seconds left in the current scan's auto-fill budget (inf outside a scan)."""
+    deadline = getattr(_autofill_ctx, "deadline", None)
+    if deadline is None:
+        return float("inf")
+    return max(0.0, deadline - time.monotonic())
 
 # The nutrient columns an auto-fill can populate (ingredients handled alongside).
 CORE_NUTRIENT_FIELDS = (
@@ -1198,6 +1295,16 @@ FILLABLE_FIELDS = CORE_NUTRIENT_FIELDS + ("ingredients_text", "category", "brand
 # Sources whose data is a best-effort estimate rather than a measured value.
 ESTIMATED_SOURCES = {"google"}
 
+# The nutrients that actually MOVE the health score (penalties + calories info).
+# Protein and fiber are bonus-only and, crucially, are very commonly absent on
+# Open Food Facts — so we do NOT spend network time chasing them alone.
+PRIMARY_NUTRIENT_FIELDS = (
+    "calories_kcal_per_serving",
+    "sugar_g_per_serving",
+    "sodium_mg_per_serving",
+    "saturated_fat_g_per_serving",
+)
+
 
 def _has_missing_nutrition(product: dict) -> bool:
     """True when any of the six core nutrients is absent.
@@ -1209,6 +1316,23 @@ def _has_missing_nutrition(product: dict) -> bool:
     if product is None:
         return True
     return any(not _field_present(product.get(f)) for f in CORE_NUTRIENT_FIELDS)
+
+
+def _needs_enrichment(product: dict) -> bool:
+    """True when a product is worth spending external network time on.
+
+    We only chase external data when a *score-driving* nutrient is missing
+    (calories / sugar / sodium / saturated fat). Protein and fiber alone are
+    bonus-only and are missing on the vast majority of Open Food Facts products —
+    gating enrichment on them made nearly every OFF scan burn the whole fallback
+    budget (USDA -> IFCT -> a slow AI estimate) chasing, say, a fiber value those
+    sources rarely have, adding ~3s per first scan for usually nothing. A product
+    that already has all four primaries is 'complete enough' to score well; if the
+    chain runs for another reason, it still opportunistically fills protein/fiber
+    when a source happens to return them."""
+    if product is None:
+        return True
+    return any(not _field_present(product.get(f)) for f in PRIMARY_NUTRIENT_FIELDS)
 
 
 def _normalize_to_100g(product: dict) -> dict:
@@ -1245,6 +1369,31 @@ def _name_hint(product: dict) -> str:
     return " ".join(p.strip() for p in parts if p and p.strip()).strip()
 
 
+# Placeholder labels that must never reach the UI as a product's name (Issue 2).
+_PLACEHOLDER_NAMES = {"", "unknown product", "unknown", "n/a", "na", "none", "null"}
+
+
+def _ensure_display_name(product: dict) -> dict:
+    """Guarantee a real, non-placeholder ``product_name`` on a resolved product.
+
+    A product resolved from Open Food Facts / USDA (or an AI estimate) often has
+    no name or the literal string "Unknown Product", which is exactly what the
+    reviewer saw for 5-Star (Issue 2): the score rendered but the name did not.
+    Prefer the brand, then a barcode-tagged label, so the client always shows
+    something meaningful. Mutates and returns ``product``."""
+    if product is None:
+        return product
+    name = (product.get("product_name") or "").strip()
+    if name.lower() in _PLACEHOLDER_NAMES:
+        brand = (product.get("brand") or "").strip()
+        if brand:
+            product["product_name"] = brand
+        else:
+            bc = (product.get("barcode") or "").strip()
+            product["product_name"] = f"Scanned product {bc}".strip() if bc else "Scanned product"
+    return product
+
+
 def _present_nutrient_fields(product: dict) -> list:
     """List of fillable fields ``product`` actually has (for the audit trail)."""
     return [f for f in FILLABLE_FIELDS if _field_present(product.get(f))]
@@ -1264,10 +1413,217 @@ def _fill_missing_fields(base: dict, extra: dict) -> list:
     return filled
 
 
+# Words that carry no identifying weight, so they must not be what makes a fuzzy
+# external match "relevant" (see _name_is_relevant). Kept small and generic.
+_RELEVANCE_STOPWORDS = {
+    "the", "and", "with", "of", "in", "a", "an", "for", "to", "flavour", "flavor",
+    "pack", "packet", "bottle", "can", "box", "jar", "chocolate", "biscuit",
+    "cookie", "cookies", "milk", "drink", "juice", "cream", "powder", "mix",
+    "bar", "food", "product", "snack", "original", "classic", "regular",
+}
+
+
+def _significant_tokens(text: str) -> set:
+    """Lower-cased identifying words (>=3 chars, not generic filler) from a name."""
+    if not text:
+        return set()
+    words = re.split(r"[^a-z0-9]+", text.lower())
+    return {w for w in words if len(w) >= 3 and w not in _RELEVANCE_STOPWORDS}
+
+
+def _name_is_relevant(query: str, candidate: str) -> bool:
+    """True when a fuzzy external match plausibly *is* the product we searched for.
+
+    External name searches (USDA / OFF text search) return a best-guess first row
+    for ANY query — e.g. USDA answers "Amul Fruit N Nut" with "McDonald's Fruit 'n
+    Yogurt Parfait". Filling our DB with that is worse than filling nothing.
+
+    A single shared generic word ("fruit") is not enough — that is exactly how the
+    parfait sneaks in. We require a real overlap: at least half of the query's
+    identifying words appear in the candidate (and, when the query is a single
+    word like "Frooti", that exact word must be present). With no query name to
+    judge against (a bare barcode lookup) relevance can't be assessed, so we allow
+    it — a GTIN match is already exact."""
+    q_tokens = _significant_tokens(query)
+    if not q_tokens:
+        return True
+    c_tokens = _significant_tokens(candidate)
+    if not c_tokens:
+        return False
+    overlap = q_tokens & c_tokens
+    if not overlap:
+        return False
+    # Need a majority of the query's identifying words, so one incidental shared
+    # word ("fruit") can't carry an otherwise-unrelated product through.
+    return len(overlap) / len(q_tokens) >= 0.5
+
+
 # --- Source 2: Open Food Facts ------------------------------------------------
+def _off_search_by_name(name: str, limit: int = 6, timeout: float = None):
+    """Search Open Food Facts by product name and return raw candidate rows.
+
+    OFF's barcode API only helps when we already have the exact barcode; a lot of
+    packs (Indian brands especially) are on OFF under a name but were scanned with
+    a barcode OFF doesn't index. This text search backs both the auto-fill chain
+    (Issues 3/4) and name search (Issue 7). Returns a list of unscored per-100g
+    product dicts (may be empty); best-effort, never raises."""
+    name = (name or "").strip()
+    if not name:
+        return []
+    # Use OFF's Search-a-licious API — the legacy cgi/search.pl is heavily
+    # rate-limited and frequently answers with a 503 HTML page (which is exactly
+    # why name search "found nothing"); Search-a-licious returns relevant JSON hits
+    # reliably in <1s.
+    try:
+        resp = requests.get(
+            "https://search.openfoodfacts.org/search",
+            headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
+            params={
+                "q": name,
+                "page_size": max(1, min(limit, 25)),
+                "fields": (
+                    "code,product_name,product_name_en,brands,categories,"
+                    "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en"
+                ),
+            },
+            timeout=timeout or min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining()),
+        )
+        if resp.status_code != 200:
+            return []
+        data = resp.json() or {}
+        products = data.get("hits") or data.get("products") or []
+    except (requests.RequestException, ValueError):
+        return []
+    out = []
+    for p in products:
+        norm = _normalize_off_raw(p, p.get("code") or "")
+        if norm:
+            out.append(norm)
+    return out
+
+
 def _source_openfoodfacts(barcode: str, name: str):
-    """Barcode lookup against Open Food Facts (already per-100g)."""
-    return fetch_off_product(barcode)
+    """Open Food Facts lookup: exact barcode first, then a name search fallback.
+
+    The name fallback only accepts a candidate that is actually relevant to the
+    name we searched (see _name_is_relevant), so a loose text match can't inject
+    an unrelated product's nutrition into our DB (already per-100g)."""
+    got = fetch_off_product(barcode)
+    if got is not None:
+        return got
+    name = (name or "").strip()
+    if not name:
+        return None
+    for cand in _off_search_by_name(name, limit=6):
+        if not _has_missing_nutrition(cand) or _present_nutrient_fields(cand):
+            if _name_is_relevant(name, cand.get("product_name") or ""):
+                return cand
+    return None
+
+
+def _external_search_results(query: str, limit: int = None):
+    """Scored Open Food Facts name-search results for /search and category browsing
+    (Issues 6 & 7). Returns a list of ``(product_dict, score, grade, breakdown)``
+    for products OFF knows that our own catalogue may not, so search isn't limited
+    to the ~250 curated items. Cached briefly; best-effort (never raises)."""
+    query = (query or "").strip()
+    if not query or not EXTERNAL_SEARCH_ENABLED:
+        return []
+    limit = limit or EXTERNAL_SEARCH_LIMIT
+    key = (query.lower(), limit)
+    cached = _external_search_cache.get(key)
+    if cached is not None:
+        return cached
+    try:
+        cands = _off_search_by_name(query, limit=limit, timeout=EXTERNAL_SEARCH_TIMEOUT_S)
+    except Exception as exc:  # never let an external hiccup break search
+        logger.warning("external search failed for %r: %s", query, exc)
+        cands = []
+    return _score_external_candidates(cands, key)
+
+
+def _score_external_candidates(cands, cache_key):
+    """Score raw OFF candidate rows into ``(product, score, grade, breakdown)`` and
+    memoise under ``cache_key``. Shared by name search and category browsing."""
+    out = []
+    for cand in cands:
+        if not (cand.get("product_name") or "").strip():
+            continue
+        _ensure_display_name(cand)
+        _normalize_to_100g(cand)
+        try:
+            score, grade, _rv, breakdown = calculate_health_score_v2(dict(cand), 1)
+        except Exception:
+            continue
+        out.append((cand, score, grade, breakdown))
+    if cache_key is not None:
+        _external_search_cache[cache_key] = out
+    return out
+
+
+# Our category ids -> the nearest Open Food Facts category tag, so a category page
+# can pull OFF's global catalogue for that category (Issue 6), not just our ~250
+# curated rows. Anything unmapped falls back to a plain name search on the label.
+_OFF_CATEGORY_TAGS = {
+    "soft_drink": "carbonated-drinks", "juice": "fruit-juices",
+    "chocolate": "chocolates", "chips": "chips-and-fries", "biscuit": "biscuits",
+    "ice_cream": "ice-creams", "noodles": "noodles", "cake": "cakes",
+    "cereal": "breakfast-cereals", "yogurt": "yogurts",
+    "energy_drink": "energy-drinks", "coffee": "coffees", "muesli": "mueslis",
+    "oats": "rolled-oats", "milkshake": "milkshakes", "dairy_drink": "dairy-drinks",
+    "protein_bar": "protein-bars", "sauce": "sauces", "nut_mix": "nuts",
+    "supplement": "dietary-supplements", "health_drink": "beverages",
+    "ready_to_eat": "meals", "pancake": "pancakes",
+}
+
+
+def _off_category_products(category: str, limit: int = None):
+    """Scored Open Food Facts products for one of our categories (Issue 6).
+
+    Uses OFF's category facet when we have a tag mapping, otherwise a name search
+    on the human label. Returns ``(product, score, grade, breakdown)`` tuples;
+    cached and best-effort."""
+    category = (category or "").strip().lower()
+    if not category or not EXTERNAL_SEARCH_ENABLED:
+        return []
+    limit = limit or EXTERNAL_SEARCH_LIMIT
+    key = ("cat:" + category, limit)
+    cached = _external_search_cache.get(key)
+    if cached is not None:
+        return cached
+    tag = _OFF_CATEGORY_TAGS.get(category)
+    if not tag:
+        # No tag mapping — fall back to a plain label search (still per-category-ish).
+        return _external_search_results(category_label(category), limit)
+    # Search-a-licious with a categories filter (reliable JSON; the legacy
+    # search.pl facet endpoint returns rate-limit HTML — see _off_search_by_name).
+    try:
+        resp = requests.get(
+            "https://search.openfoodfacts.org/search",
+            headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
+            params={
+                "q": category_label(category),
+                "categories_tags": f"en:{tag}",
+                "page_size": max(1, min(limit, 50)),
+                "fields": (
+                    "code,product_name,product_name_en,brands,categories,"
+                    "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en"
+                ),
+            },
+            timeout=EXTERNAL_SEARCH_TIMEOUT_S,
+        )
+        data = resp.json() or {} if resp.status_code == 200 else {}
+        products = data.get("hits") or data.get("products") or []
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("OFF category fetch failed for %s: %s", category, exc)
+        products = []
+    cands = []
+    for p in products:
+        norm = _normalize_off_raw(p, p.get("code") or "")
+        if norm:
+            norm["category"] = category  # tag with OUR id so it groups correctly
+            cands.append(norm)
+    return _score_external_candidates(cands, key)
 
 
 # --- Source 3: USDA FoodData Central ------------------------------------------
@@ -1287,7 +1643,7 @@ def _source_usda(barcode: str, name: str):
             r = requests.get(
                 "https://api.nal.usda.gov/fdc/v1/foods/search",
                 params={"query": q, "api_key": USDA_API_KEY, "pageSize": 1},
-                timeout=EXTERNAL_SOURCE_TIMEOUT_S,
+                timeout=min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining()),
             )
             if r.status_code != 200:
                 return None
@@ -1296,9 +1652,20 @@ def _source_usda(barcode: str, name: str):
             return None
 
     food = _search(query)
+    matched_on = "barcode" if barcode else "name"
     if not food and name and query != name:
         food = _search(name)          # barcode missed -> retry on the name
+        matched_on = "name"
     if not food:
+        return None
+
+    # USDA's search returns a best-guess first row for ANY text query, so a name
+    # search for "Amul Fruit N Nut" happily answers with "McDonald's Fruit 'n
+    # Yogurt Parfait". Accept a name match only when the returned description
+    # actually shares an identifying word with what we searched (Issue 3) — a
+    # barcode (GTIN) match is exact and needs no such guard.
+    if matched_on == "name" and name and not _name_is_relevant(
+            name, food.get("description") or ""):
         return None
 
     nutrients = food.get("foodNutrients", []) or []
@@ -1334,7 +1701,10 @@ def _source_usda(barcode: str, name: str):
 
     return {
         "barcode": barcode,
-        "product_name": food.get("description") or name or "Unknown Product",
+        # Never emit the literal placeholder (Issue 2): fall back to the searched
+        # name, then the brand, then leave it None for the resolver to sort out.
+        "product_name": (food.get("description") or name
+                         or food.get("brandOwner") or food.get("brandName") or None),
         "brand": food.get("brandOwner") or food.get("brandName") or "",
         "serving_size_g": 100.0,
         "calories_kcal_per_serving": _energy_kcal(),
@@ -1448,7 +1818,7 @@ def _serpapi_nutrition(query: str, barcode: str):
                 "api_key": SERPAPI_KEY,
                 "num": 5,
             },
-            timeout=EXTERNAL_SOURCE_TIMEOUT_S,
+            timeout=min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining()),
         )
         if r.status_code != 200:
             return None
@@ -1494,7 +1864,12 @@ def _ai_estimate_nutrition(query: str, barcode: str):
         f'"saturated_fat_g": number}}. Use null for any value you genuinely do not know.'
     )
     try:
-        text, _provider, _model = call_llm(question, context="")
+        # Bound the LLM call tightly: the estimate is a nice-to-have safety net,
+        # not worth making the user wait out a slow free model (Issue 1). The
+        # remaining per-scan budget caps it further via the caller.
+        text, _provider, _model = call_llm(
+            question, context="",
+            budget=_Budget(min(AI_ESTIMATE_TIMEOUT_S, _autofill_remaining())))
     except Exception as exc:
         logger.warning("AI nutrition estimate failed for %r: %s", query, exc)
         return None
@@ -1553,33 +1928,48 @@ FALLBACK_SOURCES = (
 def _run_autofill_chain(barcode: str, product: dict, audit: dict):
     """Fill missing nutrition from external sources in strict priority order.
 
-    Stops as soon as the six core nutrients are all present. Returns the
-    (possibly newly created / enriched) product and the updated audit."""
-    for src_name, src_fn in FALLBACK_SOURCES:
-        if product is not None and not _has_missing_nutrition(product):
-            break
-        try:
-            fetched = src_fn(barcode, _name_hint(product))
-        except Exception as exc:     # one bad source must never break resolution
-            logger.warning("auto-fill source %s errored for %s: %s", src_name, barcode, exc)
-            fetched = None
-        audit["sources_tried"].append(src_name)
-        if not fetched:
-            continue
-        _normalize_to_100g(fetched)
-        if product is None:
-            product = fetched
-            audit["source"] = src_name
-            audit["filled_fields"] = _present_nutrient_fields(fetched)
-            contributed = True
-        else:
-            filled = _fill_missing_fields(product, fetched)
-            audit["filled_fields"].extend(filled)
-            if filled:
-                audit["enriched_by"].append(src_name)
-            contributed = bool(filled)
-        if contributed and src_name in ESTIMATED_SOURCES:
-            audit["estimated"] = True
+    Bounded by a single wall-clock budget (``AUTOFILL_TOTAL_BUDGET_S``) shared
+    with the source functions, so the whole enrichment can never take more than
+    ~that many seconds no matter how slow/unresponsive a source is (Issue 1).
+    Stops as soon as the score-driving nutrients are present (see
+    ``_needs_enrichment``) — it does NOT keep hitting slow sources just to chase a
+    bonus-only protein/fiber gap. Returns the (possibly newly created / enriched)
+    product and the updated audit."""
+    _autofill_ctx.deadline = time.monotonic() + AUTOFILL_TOTAL_BUDGET_S
+    try:
+        for src_name, src_fn in FALLBACK_SOURCES:
+            if product is not None and not _needs_enrichment(product):
+                break
+            if _autofill_remaining() <= 0:
+                audit["budget_exhausted"] = True
+                logger.info("auto-fill budget spent for %s before trying %s",
+                            barcode, src_name)
+                break
+            try:
+                fetched = src_fn(barcode, _name_hint(product))
+            except Exception as exc:  # one bad source must never break resolution
+                logger.warning("auto-fill source %s errored for %s: %s",
+                               src_name, barcode, exc)
+                fetched = None
+            audit["sources_tried"].append(src_name)
+            if not fetched:
+                continue
+            _normalize_to_100g(fetched)
+            if product is None:
+                product = fetched
+                audit["source"] = src_name
+                audit["filled_fields"] = _present_nutrient_fields(fetched)
+                contributed = True
+            else:
+                filled = _fill_missing_fields(product, fetched)
+                audit["filled_fields"].extend(filled)
+                if filled:
+                    audit["enriched_by"].append(src_name)
+                contributed = bool(filled)
+            if contributed and src_name in ESTIMATED_SOURCES:
+                audit["estimated"] = True
+    finally:
+        _autofill_ctx.deadline = None
     return product, audit
 
 
@@ -1684,6 +2074,16 @@ def resolve_raw_product(barcode: str, enrich: bool = None):
         "flagged_for_review": False,
     }
 
+    # A barcode we've very recently failed to resolve anywhere is returned as an
+    # instant miss instead of re-running the whole (slow) fallback chain on every
+    # rescan (Issue 1). A successful resolution is never cached here — those live
+    # in the DB and the product cache.
+    if enrich and barcode in _negative_resolution_cache:
+        audit["sources_tried"] = list(_negative_resolution_cache[barcode])
+        audit["flagged_for_review"] = True
+        audit["cached_miss"] = True
+        return None, None, audit
+
     # --- Step 1: OUR DATABASE, FIRST (Task 1) --------------------------------
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1701,18 +2101,30 @@ def resolve_raw_product(barcode: str, enrich: bool = None):
         audit["sources_tried"].append("database")
         audit["canonical_barcode"] = product.get("barcode") or barcode
 
-    # --- Steps 2-5: fallback chain, only when data is actually missing --------
-    if enrich and _has_missing_nutrition(product):
-        product, audit = _run_autofill_chain(audit["canonical_barcode"], product, audit)
+    # --- Steps 2-5: fallback chain, only when a score-driving nutrient is missing
+    # (not merely a bonus-only protein/fiber gap — see _needs_enrichment) and only
+    # when we haven't already just tried for this barcode (cooldown), so a product
+    # that stays partially incomplete isn't re-fetched on every scan.
+    canonical = audit["canonical_barcode"]
+    if (enrich and _needs_enrichment(product)
+            and canonical not in _enrichment_attempt_cache):
+        _enrichment_attempt_cache[canonical] = True
+        product, audit = _run_autofill_chain(canonical, product, audit)
         if product is not None and (audit["source"] != "database" or audit["filled_fields"]):
             _store_resolved_product(product, audit)
 
     if product is None:
         _flag_for_manual_review(barcode, audit)
         audit["flagged_for_review"] = True
+        # Remember the miss briefly so repeat scans are instant (Issue 1).
+        _negative_resolution_cache[barcode] = tuple(audit["sources_tried"])
         return None, None, audit
 
     _normalize_to_100g(product)
+    # Guarantee a human-readable name on every resolved product (Issue 2): prefer
+    # the real name, fall back to the brand, and only then a neutral label — never
+    # surface the literal "Unknown Product" that OFF/USDA hand back.
+    _ensure_display_name(product)
     product["barcode"] = audit["canonical_barcode"]
     product["data_source"] = audit["source"]
     product["data_estimated"] = audit["estimated"]
@@ -3590,16 +4002,41 @@ def get_history(user_id: int = Depends(get_current_user)):
 
 
 @app.post("/report-missing")
-def report_missing(report: MissingReport, user_id: int = Depends(get_current_user)):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO missing_reports (barcode, product_name, user_comment) VALUES (?, ?, ?)",
-        (report.barcode, report.product_name, report.comment)
-    )
-    conn.commit()
-    conn.close()
-    return {"status": "reported"}
+def report_missing(report: MissingReport,
+                   user_id: Optional[int] = Depends(get_current_user_optional)):
+    """Log a product the catalogue is missing so it can be added later (Issue 8).
+
+    Auth is OPTIONAL: a shopper who hits an unknown pack must be able to report it
+    whether or not they're signed in (requiring a valid JWT here is what surfaced
+    as "Backend Unreachable / could not submit"). The write is wrapped so a
+    transient DB hiccup returns a clean 503 the client can retry, never an
+    unhandled 500 or a dropped connection. De-duplicated per barcode so repeat
+    reports of the same pack don't pile up."""
+    barcode = (report.barcode or "").strip()
+    if not barcode:
+        raise HTTPException(status_code=400, detail="barcode is required")
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM missing_reports WHERE barcode = ? LIMIT 1", (barcode,))
+        already = cursor.fetchone() is not None
+        if not already:
+            cursor.execute(
+                "INSERT INTO missing_reports (barcode, product_name, user_comment) "
+                "VALUES (?, ?, ?)",
+                (barcode, report.product_name, report.comment),
+            )
+            conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("report-missing write failed for %s: %s", barcode, exc)
+        raise HTTPException(status_code=503,
+                            detail="Could not save the report right now — please try again.")
+    if isinstance(user_id, int):
+        log_activity(user_id, "report_missing", barcode,
+                     {"product_name": report.product_name})
+    return {"status": "reported", "barcode": barcode,
+            "already_reported": already, "authenticated": isinstance(user_id, int)}
 
 
 # ==============================================================================
@@ -4548,6 +4985,7 @@ def search_products(
         no_artificial_flavors: bool = False,
         no_palm_oil: bool = False,
         clean_label: bool = False,
+        external: Optional[bool] = None,
         user_id: Optional[int] = Depends(get_current_user_optional),
 ):
     """Search the product catalogue by name/brand text, with optional filtering.
@@ -4670,7 +5108,47 @@ def search_products(
             "grade": grade_val,
             "is_better_for_you": is_better_for_you(score),  # Feature 2
             "image_url": image_or_placeholder(p_dict.get("image_url")),
+            "source": "database",
         })
+
+    # Merge in Open Food Facts' global catalogue for name searches (Issue 7) so a
+    # product we don't curate — "Mother Dairy", say — still shows up in search
+    # instead of only when its barcode is scanned. Our DB results come first and
+    # are never delayed by OFF; external hits are appended, de-duplicated by
+    # barcode, and pass the very same score/grade/clean-label filters.
+    want_external = EXTERNAL_SEARCH_ENABLED if external is None else external
+    if want_external and q and q.strip():
+        seen = {r["barcode"] for r in results if r.get("barcode")}
+        brand_f = (brand or "").strip().lower()
+        category_f = (category or "").strip().lower()
+        for p_dict, score, grade_val, breakdown in _external_search_results(q.strip()):
+            bc = p_dict.get("barcode")
+            if not bc or bc in seen:
+                continue
+            if min_score is not None and score < min_score:
+                continue
+            if max_score is not None and score > max_score:
+                continue
+            if grade_filter and grade_val != grade_filter:
+                continue
+            if brand_f and brand_f not in (p_dict.get("brand") or "").lower():
+                continue
+            if category_f and category_f not in (p_dict.get("category") or "").lower():
+                continue
+            if not product_matches_clean_preferences(p_dict, clean_prefs, breakdown):
+                continue
+            seen.add(bc)
+            results.append({
+                "barcode": bc,
+                "name": p_dict.get("product_name"),
+                "brand": p_dict.get("brand"),
+                "category": p_dict.get("category"),
+                "score": score,
+                "grade": grade_val,
+                "is_better_for_you": is_better_for_you(score),
+                "image_url": image_or_placeholder(p_dict.get("image_url")),
+                "source": "openfoodfacts",
+            })
 
     if sort == "score_asc":
         results.sort(key=lambda x: (x["score"], (x["name"] or "").lower()))
@@ -4745,12 +5223,16 @@ def products_by_category(
         limit: int = 50,
         offset: int = 0,
         sort: str = "score_desc",
+        external: Optional[bool] = None,
 ):
     """Paginated, scored products within a category (Feature 4).
 
     - ``category``: category id (case-insensitive, e.g. ``soft_drink``).
     - ``sort``: ``score_desc`` (default, healthiest first), ``score_asc`` or ``name``.
     - ``limit`` (1-500, default 50) / ``offset``: pagination.
+    - ``external``: include Open Food Facts' global catalogue for this category
+      (Issue 6). Defaults to the ``SWAPIFY_EXTERNAL_SEARCH`` setting; pass
+      ``external=false`` for our curated list only.
 
     Each product carries its generic health ``score``/``grade``, the ``recommended``
     (7+) and ``is_better_for_you`` (Feature 2) flags, key nutrients and per-100g
@@ -4761,11 +5243,35 @@ def products_by_category(
     scored = _score_catalogue(cat)  # cached, generic score, healthiest-first
 
     items = list(scored)  # copy before re-sorting (the cached list is shared)
+
+    # Append Open Food Facts products for this category so browsing isn't capped at
+    # our curated catalogue (Issue 6). De-duplicated against our own rows by barcode.
+    want_external = EXTERNAL_SEARCH_ENABLED if external is None else external
+    external_count = 0
+    if want_external:
+        seen = {p.get("barcode") for p in items if p.get("barcode")}
+        for p_dict, score, grade_val, breakdown in _off_category_products(cat):
+            bc = p_dict.get("barcode")
+            if not bc or bc in seen:
+                continue
+            seen.add(bc)
+            external_count += 1
+            entry = dict(p_dict)
+            entry["score"] = score
+            entry["grade"] = grade_val
+            entry["recommended"] = score >= 7.0
+            entry["is_better_for_you"] = is_better_for_you(score)
+            entry["image_url"] = image_or_placeholder(p_dict.get("image_url"))
+            entry["source"] = "openfoodfacts"
+            attach_nutrition_per_100g(entry)
+            items.append(entry)
+
     if sort == "score_asc":
-        items.sort(key=lambda x: (x["score"], (x["product_name"] or "").lower()))
+        items.sort(key=lambda x: (x["score"], (x.get("product_name") or "").lower()))
     elif sort == "name":
-        items.sort(key=lambda x: (x["product_name"] or "").lower())
-    # score_desc: _score_catalogue already returns this order.
+        items.sort(key=lambda x: (x.get("product_name") or "").lower())
+    else:  # score_desc — healthiest first (re-sort because external rows were added)
+        items.sort(key=lambda x: (-x["score"], (x.get("product_name") or "").lower()))
 
     limit = max(1, min(limit, SEARCH_MAX_LIMIT))
     offset = max(0, offset)
@@ -4776,6 +5282,7 @@ def products_by_category(
         "category": cat,
         "label": category_label(cat),
         "total": total,
+        "external_count": external_count,
         "count": len(page),
         "limit": limit,
         "offset": offset,
@@ -5196,6 +5703,11 @@ _PRODUCT_NAME_STOPWORDS = {
     "health", "greek", "zero", "diet", "cake", "chips", "namkeen", "noodles",
     "muesli", "cereal", "oats", "ice", "for", "you", "real", "star", "gold",
     "day", "mixed", "mixture", "spread", "sauce", "water", "green", "white",
+    # generic grain / label descriptors — adjectives, never the product itself.
+    # Without these, "multigrain" in "Kellogg's Multigrain Chocos" hijacked the
+    # lookup to an unrelated "…multigrain…chips" instead of "Chocos" (Issue 5).
+    "multigrain", "wholegrain", "wholewheat", "grain", "flavoured", "flavored",
+    "crunchy", "creamy", "toasted", "baked", "premium", "special", "value",
     # common English words that appear inside catalogue names
     "good", "best", "more", "less", "than", "this", "that", "what", "some",
     "from", "your", "have", "will", "they", "them", "here", "there", "when",
@@ -5213,7 +5725,10 @@ def _build_product_lookup_index():
     if _PRODUCT_LOOKUP_INDEX is not None:
         return _PRODUCT_LOOKUP_INDEX
 
-    entries = {}  # keyword -> barcode (first product wins for a shared brand)
+    # keyword -> (barcode, weight). Weight ranks how *identifying* a keyword is:
+    # a full product name (3) or brand (2) is far more telling than one generic
+    # word (1), so a brand/name match beats a longer-but-generic single word.
+    entries = {}
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -5225,42 +5740,56 @@ def _build_product_lookup_index():
         _PRODUCT_LOOKUP_INDEX = []
         return _PRODUCT_LOOKUP_INDEX
 
-    def add(keyword, barcode):
+    def add(keyword, barcode, weight):
         keyword = (keyword or "").strip().lower()
         if len(keyword) < 3 or keyword in _PRODUCT_NAME_STOPWORDS:
             return
-        entries.setdefault(keyword, barcode)
+        cur = entries.get(keyword)
+        if cur is None or weight > cur[1]:
+            entries[keyword] = (barcode, weight)
 
     for r in rows:
         name = (r["product_name"] or "").strip()
         brand = (r["brand"] or "").strip()
         # Full product name and brand are the most specific keys.
-        add(name, r["barcode"])
-        add(brand, r["barcode"])
+        add(name, r["barcode"], 3)
+        add(brand, r["barcode"], 2)
         # Plus each distinctive single word of the name (>= 5 chars so short
         # common words can't match; skips filler/type/common words).
         for word in re.split(r"[^a-z0-9]+", name.lower()):
             if len(word) >= 5 and word not in _PRODUCT_NAME_STOPWORDS:
-                add(word, r["barcode"])
+                add(word, r["barcode"], 1)
 
-    index = sorted(entries.items(), key=lambda kv: len(kv[0]), reverse=True)
+    # Longest first is only a tie-break within a weight tier now.
+    index = sorted(
+        ((kw, bc, w) for kw, (bc, w) in entries.items()),
+        key=lambda t: (t[2], len(t[0])), reverse=True,
+    )
     _PRODUCT_LOOKUP_INDEX = index
     return index
 
 
 def find_catalog_product_for_question(question: str, preferences: dict = None):
     """Best-effort: find a catalogue product named in the question and return it
-    fully scored, or None. Longest keyword wins so "coca cola" beats "cola"."""
+    fully scored, or None.
+
+    Ranks every keyword found in the question by (how identifying it is, then how
+    long it is) and returns the best — so a brand/full-name hit beats a longer but
+    generic descriptor word. This is what stops "Kellogg's Multigrain Chocos" from
+    resolving to an unrelated '…multigrain…chips' instead of 'Chocos' (Issue 5)."""
     q = (question or "").lower()
     if len(q.strip()) < 3:
         return None
-    for keyword, barcode in _build_product_lookup_index():
+    best = None  # (weight, keyword_len, barcode)
+    for keyword, barcode, weight in _build_product_lookup_index():
         # Whole-word / phrase boundary match.
         if re.search(r"(?<![a-z0-9])" + re.escape(keyword) + r"(?![a-z0-9])", q):
-            product = get_scored_product(barcode, preferences)
-            if product is not None:
-                return product
-    return None
+            cand = (weight, len(keyword), barcode)
+            if best is None or cand[:2] > best[:2]:
+                best = cand
+    if best is None:
+        return None
+    return get_scored_product(best[2], preferences)
 
 
 # Triggers that mark a question as being about a specific product's health, so
@@ -6054,9 +6583,17 @@ def chat(req: ChatRequest):
             "barcode": (product.get("barcode") if product else None) or req.barcode,
             "product_found": True,
             "product_in_database": True,
+            "resolved_by": ("name" if named_product is not None
+                            else "barcode" if scanned_product is not None else None),
             "source": "fast-path-deterministic",
             "model": None,
             "ai_enabled": AI_ENABLED,
+            # Surface the structured product facts too, so the client can render the
+            # score/flags card even though we skipped the LLM (Issue 5).
+            "product_name": product.get("product_name"),
+            "score": product.get("score"),
+            "grade": product.get("grade"),
+            "ingredient_flags": product.get("ingredient_flags", []),
         }
 
     context = build_product_context(product)
