@@ -394,6 +394,50 @@ request DELETE "/favorites/$BC_HEALTHY" "" auth
 section 16 "SCAN HISTORY  (GET /history)  [auth]  <- proves scans from step 4 saved"
 request GET "/history" "" auth
 
+section "16b" "ISSUE 2 — NO 'UNKNOWN PRODUCT' ANYWHERE  (/history, /favorites, /search, /product)"
+echo "${BLUE}  A scanned product we hold a name for must never render as 'Unknown Product'${RESET}"
+echo "${BLUE}  (the reported 5-Star bug: scan_history stored the real name, /history ignored it)${RESET}"
+# /history — a barcode with no `products` row must still show its scan-time name.
+request POST "/activity" "{\"action_type\":\"scan\",\"barcode\":\"$BC_HEALTHY\"}" auth
+request GET "/history" "" auth
+HIST_BAD="$("$PY" -c "import sys,json;
+rows=json.load(sys.stdin);
+bad=[r for r in rows if not (r.get('product_name') or '').strip()
+     or (r.get('product_name') or '').strip().lower() in ('unknown','unknown product','n/a','none','null')];
+print(len(bad))" <<< "$LAST_BODY")"
+check "no history row renders as 'Unknown Product'" "$HIST_BAD" "0"
+
+request POST "/favorites" "{\"barcode\":\"$BC_BAR\"}" auth
+request GET "/favorites" "" auth
+FAV_BAD="$("$PY" -c "import sys,json;
+rows=json.load(sys.stdin);
+bad=[r for r in rows if not (r.get('product_name') or '').strip()
+     or (r.get('product_name') or '').strip().lower() in ('unknown','unknown product','n/a','none','null')];
+print(len(bad))" <<< "$LAST_BODY")"
+check "no favorite renders as 'Unknown Product'" "$FAV_BAD" "0"
+request DELETE "/favorites/$BC_BAR" "" auth
+
+# Whole-catalogue sweep: every search result must carry a real name.
+request GET "/search?limit=300&external=false" "" noauth 0
+SEARCH_BAD="$("$PY" -c "import sys,json;
+d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get('results',[]);
+bad=[r for r in rows if not (r.get('name') or '').strip()
+     or (r.get('name') or '').strip().lower() in ('unknown','unknown product','n/a','none','null')];
+print('%d/%d' % (len(bad), len(rows)))" <<< "$LAST_BODY")"
+check "every curated product carries a real name" "${SEARCH_BAD%%/*}" "0"
+echo "${BLUE}  (placeholder names / products checked: $SEARCH_BAD)${RESET}"
+
+# The specific product from the report.
+request GET "/search?q=star&external=false&limit=10" "" noauth 0
+STAR_NAMES="$("$PY" -c "import sys,json;
+d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get('results',[]);
+print(' | '.join((r.get('name') or '?') for r in rows) or 'NONE')" <<< "$LAST_BODY")"
+echo "${BLUE}  '5 star' search -> $STAR_NAMES${RESET}"
+STAR_OK="$("$PY" -c "import sys,json;
+d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get('results',[]);
+print('yes' if any('star' in (r.get('name') or '').lower() for r in rows) else 'no')" <<< "$LAST_BODY")"
+check "5 Star chocolate resolves by name (Issue 2)" "$STAR_OK" "yes"
+
 section 17 "WEEKLY SUMMARY  (GET /weekly-summary)  [auth]"
 request GET "/weekly-summary" "" auth
 
@@ -852,8 +896,37 @@ section 100 "FEATURE 2 — BETTER FOR YOU BADGE  (GET /product/{barcode})  <- is
 request GET "/product/$BC_HEALTHY" "" noauth
 echo "${BLUE}response carries is_better_for_you (true when score >= 7) and better_for_you_badge${RESET}"
 
-section 101 "FEATURE 4 — LIST CATEGORIES  (GET /products/categories)  <- category + count list"
+section 101 "FEATURE 4 — LIST CATEGORIES  (GET /products/categories)  <- DB + Open Food Facts counts"
 request GET "/products/categories" "" noauth
+CATS_TOTAL="$(printf '%s' "$LAST_BODY" | json_get total_products)"
+CATS_DB="$(printf '%s' "$LAST_BODY" | json_get db_products)"
+CATS_EXT="$(printf '%s' "$LAST_BODY" | json_get external_products)"
+CATS_LIMIT="$(printf '%s' "$LAST_BODY" | json_get external_limit)"
+echo "${BLUE}  total_products=$CATS_TOTAL  (db=$CATS_DB + external=$CATS_EXT, per-category limit $CATS_LIMIT)${RESET}"
+check "categories status" "$LAST_CODE" "200"
+# July 28: each tile is db_count + external_count, so the grid reflects what is
+# browsable rather than the size of our seed catalogue (the "stuck at 367" bug).
+TILE_SHAPE="$("$PY" -c "import sys,json;
+c=(json.load(sys.stdin).get('categories') or [{}])[0];
+print('yes' if all(k in c for k in ('category','label','count','db_count','external_count')) else 'no')" <<< "$LAST_BODY")"
+check "each tile carries db_count + external_count" "$TILE_SHAPE" "yes"
+SUM_OK="$("$PY" -c "import sys,json;
+d=json.load(sys.stdin); c=d.get('categories') or [];
+print('yes' if c and all(x['count']==x['db_count']+x['external_count'] for x in c)
+      and d.get('total_products')==d.get('db_products',0)+d.get('external_products',0) else 'no')" <<< "$LAST_BODY")"
+check "count == db_count + external_count everywhere" "$SUM_OK" "yes"
+
+section "101a" "FEATURE 4 — CURATED-ONLY COUNTS  (GET /products/categories?external=false)  <- opt out of OFF"
+request GET "/products/categories?external=false" "" noauth
+DBONLY_TOTAL="$(printf '%s' "$LAST_BODY" | json_get total_products)"
+DBONLY_EXT="$(printf '%s' "$LAST_BODY" | json_get external_products)"
+echo "${BLUE}  external=false -> total_products=$DBONLY_TOTAL (external_products=$DBONLY_EXT)${RESET}"
+check "external=false reports no external products" "$DBONLY_EXT" "0"
+if [ "${CATS_TOTAL:-0}" -gt "${DBONLY_TOTAL:-0}" ]; then
+  check "combined counts exceed curated-only counts" "yes" "yes"
+else
+  echo "${YELLOW}  (no OFF products merged — network/OFF may be unavailable; not failing the run)${RESET}"
+fi
 
 section "101b" "FEATURE 4 — PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
 request GET "/products/by-category/protein_bar?limit=3" "" noauth
@@ -873,10 +946,12 @@ ADMIN_TOKEN_VALUE="${ADMIN_TOKEN:-swapify-admin-dev}"
 request_admin POST "/admin/send-weekly-digests?limit=2" "" "$ADMIN_TOKEN_VALUE"
 
 section "102e" "FEATURE 3 — ADMIN BATCH WITHOUT TOKEN -> 403  (POST /admin/send-weekly-digests)"
-request POST "/admin/send-weekly-digests" "" noauth 4
+# The expected-status prefix is the 6th arg; the 5th is `head`. Passing 4 without
+# the empty head made these two deliberate 403/400 tests tally as failures.
+request POST "/admin/send-weekly-digests" "" noauth "" 4
 
 section "102f" "FEATURE 3 — UNSUBSCRIBE BAD TOKEN -> 400  (GET /unsubscribe?token=garbage)"
-request GET "/unsubscribe?token=garbage" "" noauth 4
+request GET "/unsubscribe?token=garbage" "" noauth "" 4
 
 section 103 "SCORING SPEC COMPLIANCE  (python test_scoring_spec.py)  <- engine matches ScoringLogic_Swapify.md"
 echo "${DIM}\$ $PY test_scoring_spec.py${RESET}"
@@ -1031,6 +1106,36 @@ echo "${BLUE}  chocolate -> total=$CAT_TOTAL  external_count=$CAT_EXT${RESET}"
 check "category endpoint status" "$LAST_CODE" "200"
 HAS_EXT_FIELD="$("$PY" -c "import sys,json;print('yes' if 'external_count' in json.load(sys.stdin) else 'no')" <<< "$LAST_BODY")"
 check "category response reports external_count" "$HAS_EXT_FIELD" "yes"
+
+section "127e2" "JULY 28 — CATEGORY BROWSING GOES DEEP INTO OFF  (was capped at the 20-hit search default)"
+echo "${BLUE}  a category page should offer hundreds of products, not our rows + 20${RESET}"
+if [ "${CAT_EXT:-0}" -gt 20 ]; then
+  check "chocolate merges more than the old 20-product cap" "yes" "yes"
+else
+  echo "${YELLOW}  (external_count=$CAT_EXT — OFF unavailable or SWAPIFY_CATEGORY_EXTERNAL_LIMIT lowered; not failing)${RESET}"
+fi
+# Deep pagination has to reach past our curated rows into the OFF half.
+request GET "/products/by-category/chocolate?limit=5&offset=100" "" noauth
+DEEP_COUNT="$(printf '%s' "$LAST_BODY" | json_get count)"
+DEEP_SRC="$("$PY" -c "import sys,json;
+p=(json.load(sys.stdin).get('products') or []);
+print('yes' if any(x.get('source')=='openfoodfacts' for x in p) else 'no')" <<< "$LAST_BODY")"
+echo "${BLUE}  offset=100 -> count=$DEEP_COUNT  (openfoodfacts rows present: $DEEP_SRC)${RESET}"
+check "deep offset still returns a page" "$LAST_CODE" "200"
+if [ "${CAT_EXT:-0}" -gt 20 ]; then
+  check "page past our curated rows is served from OFF" "$DEEP_SRC" "yes"
+fi
+
+section "127e3" "JULY 28 — CURATED-ONLY CATEGORY PAGE  (?external=false)  <- our rows, no OFF"
+request GET "/products/by-category/chocolate?limit=80&external=false" "" noauth
+CUR_TOTAL="$(printf '%s' "$LAST_BODY" | json_get total)"
+CUR_EXT="$(printf '%s' "$LAST_BODY" | json_get external_count)"
+ONLY_DB="$("$PY" -c "import sys,json;
+p=(json.load(sys.stdin).get('products') or []);
+print('yes' if p and all(x.get('source','database')=='database' for x in p) else 'no')" <<< "$LAST_BODY")"
+echo "${BLUE}  external=false -> total=$CUR_TOTAL external_count=$CUR_EXT${RESET}"
+check "external=false merges no OFF products" "$CUR_EXT" "0"
+check "external=false returns only our own rows" "$ONLY_DB" "yes"
 
 section "127f" "FIX #8 — REPORT MISSING PRODUCT WORKS ANONYMOUSLY  (no auth required)"
 request POST "/report-missing" "{\"barcode\":\"0000000000027\",\"product_name\":\"Anon Test\"}" noauth
