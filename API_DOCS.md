@@ -772,6 +772,21 @@ curl -H "Authorization: Bearer <YOUR_TOKEN>" "http://127.0.0.1:8000/history"
 ]
 ```
 
+**Product names are never a placeholder — July 28 (Issue 2).** `scan_history` keeps
+its own `product_name`/`health_score` snapshot taken at scan time. When the scanned
+barcode has no row in `products` (the pack was resolved from Open Food Facts, or
+scanned from the bundled offline CSV), the endpoint used to ignore that snapshot and
+return the literal **`"Unknown Product"`** — which is how a scanned *Cadbury 5 Star*
+appeared as an unknown product even though its name was recorded. It now falls back
+in order: the `products` name → the scan-time snapshot → the brand → `"Scanned
+product <barcode>"`. The stored `health_score` is returned too (with a derived
+`grade`) instead of `null`.
+
+The same fallback policy (`display_product_name` in `app.py`) now covers
+`GET /favorites` and the `card.title` of `GET /share/{barcode}` — every endpoint
+that renders a denormalised snapshot rather than a freshly resolved product. No API
+response contains the string `"Unknown Product"` any more.
+
 ### 9. Report Missing Product API
 This endpoint allows users to report a product that was not found in the database.
 
