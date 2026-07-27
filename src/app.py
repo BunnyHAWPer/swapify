@@ -900,7 +900,7 @@ def fetch_off_product(barcode: str):
         off_resp = requests.get(
             f"https://world.openfoodfacts.org/api/v0/product/{barcode}.json",
             headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
-            timeout=min(_OFF_TIMEOUT_S, _autofill_remaining()),
+            timeout=_budgeted_timeout(min(_OFF_TIMEOUT_S, _autofill_remaining())),
         )
     except requests.RequestException:
         return None
@@ -1318,6 +1318,29 @@ def _autofill_remaining() -> float:
         return float("inf")
     return max(0.0, deadline - time.monotonic())
 
+
+# requests applies a SCALAR timeout to the connect phase and the read phase
+# separately, so `timeout=4` actually permits an 8-second call. Every wall-clock
+# budget in this file (the per-scan auto-fill budget, the LLM _Budget) was handed
+# to requests as a scalar, so none of them were the ceiling they claimed to be —
+# measured: the Google safety net took 10.4s against a 4s budget. Splitting the
+# allowance into an explicit (connect, read) pair makes one call genuinely unable
+# to outlast it.
+_CONNECT_TIMEOUT_CAP_S = 3.05  # a connection is either quick or hopeless
+
+
+def _budgeted_timeout(seconds: float):
+    """Turn a wall-clock allowance into requests' ``(connect, read)`` pair."""
+    try:
+        seconds = float(seconds)
+    except (TypeError, ValueError):
+        seconds = EXTERNAL_SOURCE_TIMEOUT_S
+    if seconds != seconds or seconds == float("inf"):  # NaN / inf
+        seconds = EXTERNAL_SOURCE_TIMEOUT_S
+    seconds = max(0.2, seconds)
+    connect = min(_CONNECT_TIMEOUT_CAP_S, seconds / 2)
+    return (connect, max(0.1, seconds - connect))
+
 # The nutrient columns an auto-fill can populate (ingredients handled alongside).
 CORE_NUTRIENT_FIELDS = (
     "calories_kcal_per_serving",
@@ -1410,24 +1433,64 @@ def _name_hint(product: dict) -> str:
 _PLACEHOLDER_NAMES = {"", "unknown product", "unknown", "n/a", "na", "none", "null"}
 
 
-def _ensure_display_name(product: dict) -> dict:
-    """Guarantee a real, non-placeholder ``product_name`` on a resolved product.
+def display_product_name(name, brand=None, barcode=None, fallback_name=None) -> str:
+    """The one policy for turning whatever name we hold into something displayable.
 
     A product resolved from Open Food Facts / USDA (or an AI estimate) often has
     no name or the literal string "Unknown Product", which is exactly what the
     reviewer saw for 5-Star (Issue 2): the score rendered but the name did not.
-    Prefer the brand, then a barcode-tagged label, so the client always shows
-    something meaningful. Mutates and returns ``product``."""
+    Order: the name itself -> ``fallback_name`` (e.g. the name a snapshot recorded
+    at scan/favourite time) -> the brand -> a barcode-tagged label. Never returns a
+    placeholder, so no caller has to hardcode "Unknown Product" again.
+
+    Every endpoint that builds a product payload MUST go through this (or
+    ``_ensure_display_name``). The endpoints that did not — /history and
+    /favorites, which render a denormalised snapshot rather than a resolved
+    product — are how "Unknown Product" came back for a product we hold a perfectly
+    good name for.
+    """
+    for candidate in (name, fallback_name, brand):
+        text = ("" if candidate is None else str(candidate)).strip()
+        if text and text.lower() not in _PLACEHOLDER_NAMES:
+            return text
+    bc = ("" if barcode is None else str(barcode)).strip()
+    return f"Scanned product {bc}" if bc else "Scanned product"
+
+
+def grade_for_score(score):
+    """Letter grade for an already-computed score (None when there is no score).
+
+    Mirrors the A/B/C/D/F thresholds in ``calculate_health_score_v2``; only for
+    rows that carry a stored score but no grade (scan-history snapshots). Anything
+    that scores a product live gets its grade from the engine, not from here —
+    ``test_scoring_spec.py`` pins the engine's boundaries.
+    """
+    if score is None:
+        return None
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    if value >= 9:
+        return "A"
+    if value >= 7:
+        return "B"
+    if value >= 5:
+        return "C"
+    if value >= 3:
+        return "D"
+    return "F"
+
+
+def _ensure_display_name(product: dict) -> dict:
+    """Guarantee a real, non-placeholder ``product_name`` on a resolved product.
+
+    Mutates and returns ``product``. Thin wrapper over ``display_product_name`` so
+    the resolved-product path and the snapshot paths share one policy."""
     if product is None:
         return product
-    name = (product.get("product_name") or "").strip()
-    if name.lower() in _PLACEHOLDER_NAMES:
-        brand = (product.get("brand") or "").strip()
-        if brand:
-            product["product_name"] = brand
-        else:
-            bc = (product.get("barcode") or "").strip()
-            product["product_name"] = f"Scanned product {bc}".strip() if bc else "Scanned product"
+    product["product_name"] = display_product_name(
+        product.get("product_name"), product.get("brand"), product.get("barcode"))
     return product
 
 
@@ -1523,7 +1586,7 @@ def _off_search_by_name(name: str, limit: int = 6, timeout: float = None):
                     "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en"
                 ),
             },
-            timeout=timeout or min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining()),
+            timeout=_budgeted_timeout(timeout or min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining())),
         )
         if resp.status_code != 200:
             return []
@@ -1737,7 +1800,7 @@ def _source_usda(barcode: str, name: str):
             r = requests.get(
                 "https://api.nal.usda.gov/fdc/v1/foods/search",
                 params={"query": q, "api_key": USDA_API_KEY, "pageSize": 1},
-                timeout=min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining()),
+                timeout=_budgeted_timeout(min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining())),
             )
             if r.status_code != 200:
                 return None
@@ -1912,7 +1975,7 @@ def _serpapi_nutrition(query: str, barcode: str):
                 "api_key": SERPAPI_KEY,
                 "num": 5,
             },
-            timeout=min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining()),
+            timeout=_budgeted_timeout(min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining())),
         )
         if r.status_code != 200:
             return None
@@ -2410,9 +2473,10 @@ def lookup_by_gs1_payload(cursor, barcode: str):
 
     A scanner verifies the check digit before it emits anything, so it can only ever
     hand us a *valid* barcode. Much of the catalogue was transcribed by hand from the
-    physical packs, and 47 of those rows carry a check digit that does not match their
-    payload — a code no scanner will ever produce. On an exact match alone those
-    products are permanently unscannable.
+    physical packs, and 54 of the 252 rows carry a check digit that does not match
+    their payload — a code no scanner will ever produce. On an exact match alone
+    those products are permanently unscannable (they would resolve to "not found",
+    or to whatever Open Food Facts guesses, instead of to our own row).
 
     Everything before the check digit is the GS1 item number, which identifies the
     product on its own (the check digit is *derived* from it, carrying no identity).
@@ -4051,12 +4115,19 @@ def get_history(user_id: int = Depends(get_current_user)):
     conn = get_db_connection()
     cursor = conn.cursor()
 
+    # `scan_history` keeps its own product_name/health_score snapshot, taken at
+    # scan time. Select them: when the LEFT JOIN misses (the pack was scanned from
+    # the bundled CSV or resolved via Open Food Facts and never landed in
+    # `products`) that snapshot is the real name, and ignoring it is what showed a
+    # scanned 5-Star as "Unknown Product" in history (Issue 2).
     cursor.execute('''
-        SELECT h.scanned_at, h.barcode AS h_barcode, p.* 
-        FROM scan_history h 
-        LEFT JOIN products p ON h.barcode = p.barcode 
-        WHERE h.user_id = ? 
-        ORDER BY h.scanned_at DESC 
+        SELECT h.scanned_at, h.barcode AS h_barcode,
+               h.product_name AS h_product_name, h.health_score AS h_health_score,
+               p.*
+        FROM scan_history h
+        LEFT JOIN products p ON h.barcode = p.barcode
+        WHERE h.user_id = ?
+        ORDER BY h.scanned_at DESC
         LIMIT 5
     ''', (user_id,))
 
@@ -4069,15 +4140,16 @@ def get_history(user_id: int = Depends(get_current_user)):
         p_dict = dict(row)
         barcode = p_dict.get("barcode") or p_dict.get("h_barcode")
         if p_dict.get("barcode") is None:
-            # Scanned, but the product isn't in our own `products` table
-            # (came from the bundled CSV database or Open Food Facts) — show
-            # it with the barcode alone rather than dropping it from history.
+            # Scanned, but the product isn't in our own `products` table — show the
+            # name we recorded at scan time rather than dropping it or labelling a
+            # real product "Unknown".
             results.append({
                 "barcode": barcode,
-                "product_name": "Unknown Product",
+                "product_name": display_product_name(
+                    p_dict.get("h_product_name"), barcode=barcode),
                 "brand": None,
-                "health_score": None,
-                "grade": None,
+                "health_score": p_dict.get("h_health_score"),
+                "grade": grade_for_score(p_dict.get("h_health_score")),
                 "image_url": None,
                 "scanned_at": p_dict["scanned_at"]
             })
@@ -4085,7 +4157,9 @@ def get_history(user_id: int = Depends(get_current_user)):
         score, grade, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
         results.append({
             "barcode": barcode,
-            "product_name": p_dict["product_name"],
+            "product_name": display_product_name(
+                p_dict.get("product_name"), p_dict.get("brand"), barcode,
+                fallback_name=p_dict.get("h_product_name")),
             "brand": p_dict["brand"],
             "health_score": score,
             "grade": grade,
@@ -4349,20 +4423,26 @@ def get_favorites(user_id: int = Depends(get_current_user)):
             score, grade, _, _ = calculate_health_score_v2(p_dict, 1, preferences)
             results.append({
                 "barcode": p_dict.get("barcode"),
-                "product_name": p_dict.get("product_name"),
+                "product_name": display_product_name(
+                    p_dict.get("product_name"), p_dict.get("brand"),
+                    p_dict.get("barcode"), fallback_name=p_dict.get("f_product_name")),
                 "brand": p_dict.get("brand"),
                 "health_score": score,
                 "grade": grade,
                 "added_at": p_dict.get("added_at")
             })
         else:
-            # No `products` match — use the snapshot taken when it was favorited.
+            # No `products` match — use the snapshot taken when it was favorited,
+            # then the brand, then a barcode label. Never the literal "Unknown
+            # Product": a favourite the user recognised is not an unknown product.
             results.append({
                 "barcode": p_dict.get("f_barcode"),
-                "product_name": p_dict.get("f_product_name") or "Unknown Product",
+                "product_name": display_product_name(
+                    p_dict.get("f_product_name"), p_dict.get("f_brand"),
+                    p_dict.get("f_barcode")),
                 "brand": p_dict.get("f_brand"),
                 "health_score": p_dict.get("f_health_score"),
-                "grade": p_dict.get("f_grade"),
+                "grade": p_dict.get("f_grade") or grade_for_score(p_dict.get("f_health_score")),
                 "added_at": p_dict.get("added_at")
             })
     return results
@@ -6043,8 +6123,9 @@ def _call_openrouter_model(model: str, question: str, context: str,
         "temperature": 0.4,
         "max_tokens": LLM_MAX_TOKENS,
     }
-    timeout = OPENROUTER_TIMEOUT_S if budget is None else min(
-        OPENROUTER_TIMEOUT_S, budget.remaining()
+    timeout = _budgeted_timeout(
+        OPENROUTER_TIMEOUT_S if budget is None
+        else min(OPENROUTER_TIMEOUT_S, budget.remaining())
     )
     try:
         resp = requests.post(
@@ -6148,8 +6229,8 @@ def _call_gemini(question: str, context: str, budget: "_Budget" = None) -> str:
         ],
         "generationConfig": {"temperature": 0.4, "maxOutputTokens": LLM_MAX_TOKENS},
     }
-    timeout = GEMINI_TIMEOUT_S if budget is None else min(
-        GEMINI_TIMEOUT_S, budget.remaining()
+    timeout = _budgeted_timeout(
+        GEMINI_TIMEOUT_S if budget is None else min(GEMINI_TIMEOUT_S, budget.remaining())
     )
     try:
         resp = requests.post(
@@ -7585,7 +7666,8 @@ def share_product(barcode: str, user_id: Optional[int] = Depends(get_current_use
         "warnings": warnings,
         "ingredient_flags": flags,
         "card": {
-            "title": product.get("product_name") or "Unknown Product",
+            "title": display_product_name(product.get("product_name"),
+                                          product.get("brand"), product.get("barcode")),
             "subtitle": product.get("brand") or "",
             "score_label": f"{score}/10",
             "grade": grade,
