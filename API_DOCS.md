@@ -947,15 +947,33 @@ curl "http://127.0.0.1:8000/search?q=&sort=name&limit=10&offset=10"
 ```
 
 #### Autocomplete (typeahead) — `/search/autocomplete`
-Lightweight suggestions for a search box, returned as the user types. Matches
-`product_name` and `brand` with SQL `LIKE`; **prefix** matches are ranked ahead of
+Lightweight suggestions for a search box, returned as the user types. Matching is
+word-level and punctuation-tolerant; **prefix** matches are ranked ahead of
 mid-word matches. A blank query returns an empty list.
+
+Suggestions come from the curated catalogue first and are then **topped up from
+Open Food Facts** when our own rows can't fill the dropdown, so the search box
+can reach products we don't curate ("nutella", "pringles") instead of only the
+~250 seeded ones. Curated rows always keep the top slots and are never delayed by
+OFF — if OFF is slow or unreachable, the catalogue half is returned on its own.
+
+Each suggestion carries `source` (`"database"` or `"openfoodfacts"`); OFF rows
+arrive already scored, so they also carry `score`, `grade` and
+`is_better_for_you`. Catalogue rows omit those three (the typeahead index holds
+no nutrition — clients score them locally or call `/product/{barcode}`).
 
 - **URL:** `/search/autocomplete`
 - **Method:** `GET`
 - **Query Parameters:**
   - `q` (required): the partial text typed so far.
   - `limit`: 1–10 suggestions (default 8).
+  - `external`: include the Open Food Facts half. Defaults to the
+    `SWAPIFY_EXTERNAL_SEARCH` setting; pass `external=false` for curated only.
+
+The OFF top-up is skipped for queries shorter than
+`SWAPIFY_AUTOCOMPLETE_EXTERNAL_MIN_CHARS` (default 3) so short prefixes stay
+instant, and is bounded by `SWAPIFY_AUTOCOMPLETE_EXTERNAL_TIMEOUT` (default
+2.5 s).
 
 **Example using `curl`:**
 ```bash
@@ -966,10 +984,14 @@ curl "http://127.0.0.1:8000/search/autocomplete?q=mag&limit=5"
 ```json
 {
   "query": "mag",
-  "count": 2,
+  "count": 3,
   "suggestions": [
-    {"product_name": "Maggi noodles", "brand": "Maggi", "barcode": "8901058005783"},
-    {"product_name": "Maggi masala",  "brand": "Maggi", "barcode": "8901058005784"}
+    {"product_name": "Maggi noodles", "brand": "Maggi", "barcode": "8901058005783",
+     "source": "database"},
+    {"product_name": "Maggi masala",  "brand": "Maggi", "barcode": "8901058005784",
+     "source": "database"},
+    {"product_name": "Maggi Hot Heads", "brand": "Nestlé", "barcode": "8901058872231",
+     "source": "openfoodfacts", "score": 3.5, "grade": "D", "is_better_for_you": false}
   ]
 }
 ```
