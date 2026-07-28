@@ -782,6 +782,33 @@ request GET "/search/autocomplete?q=pro&limit=5" "" noauth
 section 78 "AUTOCOMPLETE — blank query  (GET /search/autocomplete?q=)  -> empty suggestions (still 200)"
 request GET "/search/autocomplete?q=" "" noauth
 
+section "78a" "AUTOCOMPLETE reaches OPEN FOOD FACTS  (q=nutella — a product NOT in our catalogue)"
+# Regression guard: the search box only ever calls /search/autocomplete, so when
+# this was a DB-only lookup the UI could not see anything beyond our ~250 curated
+# rows — "nutella" returned 0 suggestions while /search had 20 OFF hits.
+request GET "/search/autocomplete?q=nutella&limit=8" "" noauth
+printf '%s' "$LAST_BODY" | "$PY" -c "
+import sys,json
+d=json.load(sys.stdin); s=d.get('suggestions') or []
+off=[x for x in s if x.get('source')=='openfoodfacts']
+if not off:
+    print('   NO openfoodfacts suggestions — the search box cannot reach OFF'); sys.exit(1)
+named=[x for x in off if (x.get('product_name') or '').strip()]
+if len(named)!=len(off):
+    print('   %d OFF suggestion(s) have no product_name' % (len(off)-len(named))); sys.exit(1)
+print('   %d OFF suggestion(s), e.g. %r (score %s)' % (len(off), off[0]['product_name'], off[0].get('score')))
+" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
+section "78b" "AUTOCOMPLETE — external=false keeps the curated-only behaviour"
+request GET "/search/autocomplete?q=nutella&limit=8&external=false" "" noauth
+printf '%s' "$LAST_BODY" | "$PY" -c "
+import sys,json
+d=json.load(sys.stdin)
+bad=[x for x in (d.get('suggestions') or []) if x.get('source')=='openfoodfacts']
+if bad: print('   external=false still returned OFF rows'); sys.exit(1)
+print('   curated-only honoured (%d suggestion(s))' % d.get('count',0))
+" && PASS=$((PASS+1)) || FAIL=$((FAIL+1))
+
 section 79 "SEARCH — enhanced filtering  (GET /search?q=protein&sort=score_desc&limit=5)"
 request GET "/search?q=protein&sort=score_desc&limit=5" "" noauth 3
 
