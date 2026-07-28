@@ -1282,6 +1282,19 @@ EXTERNAL_SEARCH_LIMIT = int(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_LIMIT", "20"
 EXTERNAL_SEARCH_TIMEOUT_S = float(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_TIMEOUT", "4"))
 _external_search_cache = TTLCache(maxsize=256, ttl=int(os.environ.get("SWAPIFY_EXTERNAL_SEARCH_TTL", "300")))
 
+# Typeahead reaches Open Food Facts too (the search box only ever calls
+# /search/autocomplete, so without this the UI could never see anything outside
+# our ~250 curated rows — "nutella" returned nothing at all). Two guards keep a
+# per-keystroke endpoint honest:
+#   * a tighter timeout than page search — a suggestion that lands after the user
+#     has finished typing is worthless, so we'd rather return the DB rows alone;
+#   * a minimum query length, so 2-char prefixes ("nu", "ch") don't each cost an
+#     OFF round-trip on the way to the word the user actually meant.
+AUTOCOMPLETE_EXTERNAL_TIMEOUT_S = float(
+    os.environ.get("SWAPIFY_AUTOCOMPLETE_EXTERNAL_TIMEOUT", "2.5"))
+AUTOCOMPLETE_EXTERNAL_MIN_CHARS = int(
+    os.environ.get("SWAPIFY_AUTOCOMPLETE_EXTERNAL_MIN_CHARS", "3"))
+
 # Category *browsing* pulls a far deeper slice of OFF than a name search does.
 # Browsing a category is a "show me everything" gesture: capping it at the 20-hit
 # search default meant the categories page only ever showed our own rows plus a
@@ -1621,11 +1634,16 @@ def _source_openfoodfacts(barcode: str, name: str):
     return None
 
 
-def _external_search_results(query: str, limit: int = None):
-    """Scored Open Food Facts name-search results for /search and category browsing
-    (Issues 6 & 7). Returns a list of ``(product_dict, score, grade, breakdown)``
-    for products OFF knows that our own catalogue may not, so search isn't limited
-    to the ~250 curated items. Cached briefly; best-effort (never raises)."""
+def _external_search_results(query: str, limit: int = None, timeout: float = None):
+    """Scored Open Food Facts name-search results for /search, autocomplete and
+    category browsing (Issues 6 & 7). Returns a list of ``(product_dict, score,
+    grade, breakdown)`` for products OFF knows that our own catalogue may not, so
+    search isn't limited to the ~250 curated items. Cached briefly; best-effort
+    (never raises).
+
+    ``timeout`` lets a latency-sensitive caller (typeahead) buy a tighter budget
+    than page search without forking the cache — the results are identical, only
+    the patience differs."""
     query = (query or "").strip()
     if not query or not EXTERNAL_SEARCH_ENABLED:
         return []
@@ -1635,7 +1653,8 @@ def _external_search_results(query: str, limit: int = None):
     if cached is not None:
         return cached
     try:
-        cands = _off_search_by_name(query, limit=limit, timeout=EXTERNAL_SEARCH_TIMEOUT_S)
+        cands = _off_search_by_name(
+            query, limit=limit, timeout=timeout or EXTERNAL_SEARCH_TIMEOUT_S)
     except Exception as exc:  # never let an external hiccup break search
         logger.warning("external search failed for %r: %s", query, exc)
         cands = []
@@ -5049,7 +5068,7 @@ def _normalize_search_text(s: str) -> str:
 
 
 @app.get("/search/autocomplete")
-def search_autocomplete(q: str, limit: int = 8):
+def search_autocomplete(q: str, limit: int = 8, external: Optional[bool] = None):
     """Smart Search autocomplete (Task 2).
 
     Returns lightweight typeahead suggestions as the user types/speaks: product
@@ -5062,9 +5081,26 @@ def search_autocomplete(q: str, limit: int = 8):
     ``limit`` is clamped to 1-10 (default 8); a blank query returns an empty
     list.
 
+    Suggestions come from our curated catalogue first and are then topped up from
+    Open Food Facts (Issue 7). That top-up is the *only* way the UI reaches OFF:
+    the search box calls this endpoint and never /search, so while this was a
+    DB-only lookup, typing "nutella" or "pringles" returned nothing even though
+    /search had 20 OFF hits for each. Curated rows still rank first and are never
+    delayed by OFF — if the network is slow or down, the DB half is what you get.
+
+    - ``external``: include the Open Food Facts half. Defaults to the
+      ``SWAPIFY_EXTERNAL_SEARCH`` setting; pass ``external=false`` for our
+      curated suggestions only.
+
+    Each suggestion carries ``source`` ("database" or "openfoodfacts"), plus
+    ``score``/``grade`` when known — OFF rows arrive already scored, so the
+    dropdown can show a real grade chip instead of a "?" placeholder.
+
     Example response:
         {"suggestions": [
-            {"product_name": "Maggi noodles", "brand": "Maggi", "barcode": "8901058005783"}
+            {"product_name": "Maggi noodles", "brand": "Maggi",
+             "barcode": "8901058005783", "source": "database",
+             "score": 3.5, "grade": "D"}
         ]}
     """
     raw_query = (q or "").strip()
@@ -5077,9 +5113,12 @@ def search_autocomplete(q: str, limit: int = 8):
     if not words:
         return {"query": raw_query, "count": 0, "suggestions": []}
 
+    want_external = EXTERNAL_SEARCH_ENABLED if external is None else external
+
     # Result cache first — repeated keystrokes and shared prefixes across users
-    # are served straight from memory (Fix 7).
-    cache_key = (normalized, limit)
+    # are served straight from memory (Fix 7). Keyed on the external toggle too,
+    # so an ``external=false`` probe can't serve its DB-only list to normal callers.
+    cache_key = (normalized, limit, bool(want_external))
     cached = _autocomplete_result_cache.get(cache_key)
     if cached is not None:
         _cache_stats_autocomplete["hits"] += 1
@@ -5120,7 +5159,37 @@ def search_autocomplete(q: str, limit: int = 8):
         "product_name": name,
         "brand": brand,
         "barcode": barcode,
+        "source": "database",
     } for _rank, _sort, barcode, name, brand in rows[:limit]]
+
+    # Top up from Open Food Facts when our catalogue can't fill the dropdown.
+    # Curated rows keep their places at the top; OFF only ever fills the gap, so
+    # a product we actually curate never gets pushed off the list by a fuzzy
+    # external hit. Skipped for very short prefixes (see the config note) and
+    # whenever the DB already answered in full.
+    if (want_external and len(suggestions) < limit
+            and len(normalized) >= AUTOCOMPLETE_EXTERNAL_MIN_CHARS):
+        seen = {s["barcode"] for s in suggestions if s.get("barcode")}
+        # Ask for the shared EXTERNAL_SEARCH_LIMIT rather than the few we need, so
+        # this hits the very same cache entry /search populates for this query
+        # instead of forking a near-duplicate fetch under a different key.
+        for p_dict, score, grade_val, _breakdown in _external_search_results(
+                normalized, timeout=AUTOCOMPLETE_EXTERNAL_TIMEOUT_S):
+            if len(suggestions) >= limit:
+                break
+            bc = p_dict.get("barcode")
+            if not bc or bc in seen:
+                continue
+            seen.add(bc)
+            suggestions.append({
+                "product_name": p_dict.get("product_name"),
+                "brand": p_dict.get("brand"),
+                "barcode": bc,
+                "source": "openfoodfacts",
+                "score": score,
+                "grade": grade_val,
+                "is_better_for_you": is_better_for_you(score),
+            })
 
     _autocomplete_result_cache[cache_key] = suggestions
     return {"query": raw_query, "count": len(suggestions), "suggestions": suggestions}
