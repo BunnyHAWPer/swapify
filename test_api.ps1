@@ -859,6 +859,23 @@ try {
     Write-Section 78 "AUTOCOMPLETE - blank query  (GET /search/autocomplete?q=)  -> empty suggestions (still 200)"
     Invoke-Api GET "/search/autocomplete?q="
 
+    Write-Section "78a" "AUTOCOMPLETE reaches OPEN FOOD FACTS  (q=nutella - a product NOT in our catalogue)"
+    # Regression guard: the search box only ever calls /search/autocomplete, so
+    # while this was a DB-only lookup the UI could not see anything beyond our
+    # ~250 curated rows - "nutella" returned 0 suggestions while /search had 20.
+    Invoke-Api GET "/search/autocomplete?q=nutella&limit=8"
+    try { $ac = $script:LastBody | ConvertFrom-Json } catch { $ac = $null }
+    $offRows = @($ac.suggestions | Where-Object { $_.source -eq 'openfoodfacts' })
+    Assert-Equal "autocomplete surfaces Open Food Facts products" ($offRows.Count -gt 0) $true
+    $offNamed = @($offRows | Where-Object { -not [string]::IsNullOrWhiteSpace($_.product_name) }).Count
+    Assert-Equal "every OFF suggestion carries a product_name" $offNamed $offRows.Count
+
+    Write-Section "78b" "AUTOCOMPLETE - external=false keeps the curated-only behaviour"
+    Invoke-Api GET "/search/autocomplete?q=nutella&limit=8&external=false"
+    try { $ac2 = $script:LastBody | ConvertFrom-Json } catch { $ac2 = $null }
+    $offCount2 = @($ac2.suggestions | Where-Object { $_.source -eq 'openfoodfacts' }).Count
+    Assert-Equal "external=false returns no OFF rows" $offCount2 0
+
     Write-Section 79 "SEARCH - enhanced filtering  (GET /search?q=protein&sort=score_desc&limit=5)"
     Invoke-Api GET "/search?q=protein&sort=score_desc&limit=5" -Head 3
 
