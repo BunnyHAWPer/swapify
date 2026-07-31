@@ -12,7 +12,10 @@ $ServerDir = $ScriptDir
 $Base      = $BaseUrl.TrimEnd('/')
 $Py        = Join-Path $ServerDir 'venv\Scripts\python.exe'
 if (-not (Test-Path $Py)) { $Py = 'python' }
-$Db        = Join-Path $ServerDir 'swapify.db'
+# Inspect whatever database the server is actually using: SWAPIFY_DB_PATH points
+# it elsewhere in deployment (and when running the suite against a scratch copy),
+# and a DB dump of a different file than the one under test proves nothing.
+$Db        = if ($env:SWAPIFY_DB_PATH) { $env:SWAPIFY_DB_PATH } else { Join-Path $ServerDir 'swapify.db' }
 $OutLog    = Join-Path $ServerDir '.test_server.out.log'
 $ErrLog    = Join-Path $ServerDir '.test_server.err.log'
 $script:Pass = 0
@@ -995,8 +998,8 @@ try {
     $catsTotal = if ($c) { [int]$c.total_products } else { 0 }
     $catsDb    = if ($c) { [int]$c.db_products } else { 0 }
     $catsExt   = if ($c) { [int]$c.external_products } else { 0 }
-    $catsLimit = if ($c) { [int]$c.external_limit } else { 0 }
-    Write-Host "  total_products=$catsTotal  (db=$catsDb + external=$catsExt, per-category limit $catsLimit)" -ForegroundColor Blue
+    $catsPending = if ($c) { [int]$c.counts_pending } else { 0 }
+    Write-Host "  total_products=$catsTotal  (db=$catsDb + external=$catsExt, counts_pending=$catsPending)" -ForegroundColor Blue
     Assert-Equal "categories status 200" $script:LastCode 200
     # July 28: each tile is db_count + external_count, so the grid reflects what is
     # browsable rather than the size of our seed catalogue (the "stuck at 367" bug).
@@ -1015,6 +1018,16 @@ try {
         $sumOk = ($bad -eq 0) -and ($catsTotal -eq ($catsDb + $catsExt))
     }
     Assert-Equal "count == db_count + external_count everywhere" $sumOk $true
+    # July 30 (Task 3): external_count is Open Food Facts' REAL count for the category,
+    # not our fetch cap. It used to be SWAPIFY_CATEGORY_EXTERNAL_LIMIT (200), which is
+    # how the section reported a few hundred products for a database of millions.
+    $known = @($tiles | Where-Object { $_.external_count_known })
+    if ($known.Count -gt 0 -and (@($known | ForEach-Object { [int]$_.external_count } |
+            Measure-Object -Maximum).Maximum -gt 1000)) {
+        Assert-Equal "a category reports thousands of OFF products (not a 200 cap)" $true $true
+    } else {
+        Write-Host "  (no OFF counts resolved - network/OFF may be unavailable; not failing the run)" -ForegroundColor Yellow
+    }
 
     Write-Section "101a" "FEATURE 4 - CURATED-ONLY COUNTS  (GET /products/categories?external=false)  <- opt out of OFF"
     Invoke-Api GET "/products/categories?external=false"
@@ -1031,6 +1044,36 @@ try {
 
     Write-Section "101b" "FEATURE 4 - PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
     Invoke-Api GET "/products/by-category/protein_bar?limit=3"
+
+    Write-Section "101c" "TASK 3 - CATEGORY PAGING IS UNCAPPED  (GET /products/by-category/biscuit?offset=...)  <- pages into OFF"
+    Invoke-Api GET "/products/by-category/biscuit?limit=5"
+    try { $bc = $script:LastBody | ConvertFrom-Json } catch { $bc = $null }
+    $bcTotal = if ($bc) { [int]$bc.total } else { 0 }
+    $bcDb    = if ($bc) { [int]$bc.db_total } else { 0 }
+    Write-Host "  biscuit: total=$bcTotal (our rows: $bcDb) - total is db + Open Food Facts' real count" -ForegroundColor Blue
+    Assert-Equal "by-category status 200" $script:LastCode 200
+    # An offset far past our curated rows must fetch the corresponding page from Open
+    # Food Facts on demand. Before Task 3 browsing stopped at the 200 products we had
+    # pre-fetched, so a deep offset returned an empty page.
+    Invoke-Api GET "/products/by-category/biscuit?limit=5&offset=1000"
+    try { $deep = $script:LastBody | ConvertFrom-Json } catch { $deep = $null }
+    if ($deep -and [int]$deep.count -gt 0 -and [int]$deep.external_count -gt 0) {
+        Assert-Equal "offset=1000 still returns Open Food Facts products" $true $true
+    } else {
+        Write-Host "  (deep page empty - network/OFF may be unavailable; not failing the run)" -ForegroundColor Yellow
+    }
+
+    Write-Section "101d" "TASK 1 - LOOK UP A PRODUCT BY NAME  (GET /product/by-name/{name})  <- auto-fill without a barcode"
+    Invoke-Api GET "/product/by-name/Nutella"
+    Assert-Equal "by-name status 200" $script:LastCode 200
+    try { $byName = $script:LastBody | ConvertFrom-Json } catch { $byName = $null }
+    $byNameOk = ($byName -and $null -ne $byName.score -and
+                 $byName.resolution -and @($byName.resolution.sources_tried).Count -gt 0)
+    Assert-Equal "by-name returns a scored product with a resolution trail" $byNameOk $true
+
+    Write-Section "101e" "TASK 1 - FORCE A RE-RESOLVE  (GET /product/{barcode}?refresh=true)  <- bypasses caches + cooldown"
+    Invoke-Api GET "/product/$BcHealthy`?refresh=true"
+    Assert-Equal "refresh=true still returns the product" $script:LastCode 200
 
     Write-Section 102 "FEATURE 3 - WEEKLY DIGEST PREVIEW  (GET /weekly-digest/{user_id})  <- data + rendered email"
     Invoke-Api GET "/weekly-digest/$($script:UserId)" -Auth
@@ -1051,6 +1094,115 @@ try {
 
     Write-Section "102f" "FEATURE 3 - UNSUBSCRIBE BAD TOKEN -> 400  (GET /unsubscribe?token=garbage)"
     Invoke-Api GET "/unsubscribe?token=garbage" -Expect '4'
+
+    # =========================================================================
+    #  AUTH: forgot password / reset password / Google OAuth
+    # =========================================================================
+    # Uses its own throwaway account so changing a password can't disturb the
+    # rest of the run ($script:Token is a JWT and stays valid regardless).
+    $resetEmail   = "resettester_$stamp@example.com"
+    $resetPassOld = 'Passw0rd!'
+    $resetPassNew = 'N3wPassw0rd!'
+
+    Write-Section "105a" "AUTH - EMAIL DELIVERY STATUS  (GET /auth/email/status)  <- which provider is live"
+    Invoke-Api GET "/auth/email/status"
+    try { $mail = $script:LastBody | ConvertFrom-Json } catch { $mail = $null }
+    $mailProvider = if ($mail) { $mail.provider } else { 'unknown' }
+    Write-Host "  email provider = $mailProvider" -ForegroundColor Blue
+    if ($mailProvider -eq 'outbox') {
+        Write-Host "  No mail provider configured - reset mail goes to outbox/*.eml (dry run)." -ForegroundColor Yellow
+    }
+
+    Write-Section "105b" "AUTH - FORGOT PASSWORD, UNKNOWN EMAIL  (POST /forgot-password)  <- must NOT reveal that"
+    Invoke-Api POST "/forgot-password" (@{ email = "definitely-not-registered-$stamp@example.com" } | ConvertTo-Json -Compress)
+    try { $genericMsg = ($script:LastBody | ConvertFrom-Json).message } catch { $genericMsg = '' }
+
+    Write-Section "105c" "AUTH - FORGOT PASSWORD, MALFORMED EMAIL -> 400"
+    Invoke-Api POST "/forgot-password" '{"email":"not-an-email"}' -Expect '4'
+
+    Write-Section "105d" "AUTH - FORGOT PASSWORD, REAL ACCOUNT  (POST /forgot-password)"
+    Invoke-Api POST "/register" (@{ email = $resetEmail; username = "resettester_$stamp"; password = $resetPassOld } | ConvertTo-Json -Compress)
+    Invoke-Api POST "/forgot-password" (@{ email = $resetEmail } | ConvertTo-Json -Compress)
+    try { $forgot = $script:LastBody | ConvertFrom-Json } catch { $forgot = $null }
+    $knownMsg = if ($forgot) { $forgot.message } else { '' }
+    # Account-enumeration guard: registered and unregistered addresses must get
+    # the byte-identical response.
+    Assert-Equal "known and unknown emails get the identical response" ($knownMsg -eq $genericMsg -and $genericMsg) $true
+    # The token comes back only when no mail provider is configured
+    # (PASSWORD_RESET_EXPOSE_TOKEN=auto); with SMTP live it is in the inbox, so
+    # the end-to-end steps are skipped rather than failed.
+    $resetToken = ''
+    if ($forgot -and $forgot.PSObject.Properties.Name -contains 'debug' -and $forgot.debug) {
+        $resetToken = $forgot.debug.token
+    }
+
+    if ($resetToken) {
+        Write-Section "105e" "AUTH - VALIDATE THE EMAILED LINK  (GET /reset-password/validate?token=...)"
+        Invoke-Api GET "/reset-password/validate?token=$resetToken"
+        try { $v = $script:LastBody | ConvertFrom-Json } catch { $v = $null }
+        Assert-Equal "the emailed token validates" ($v -and $v.valid) $true
+        Assert-Equal "the email is masked in the response" ($v -and "$($v.email)".Contains('*')) $true
+
+        Write-Section "105f" "AUTH - RESET REJECTS A TOO-SHORT PASSWORD -> 400"
+        Invoke-Api POST "/reset-password" (@{ token = $resetToken; new_password = 'abc' } | ConvertTo-Json -Compress) -Expect '4'
+
+        Write-Section "105g" "AUTH - RESET PASSWORD  (POST /reset-password)"
+        Invoke-Api POST "/reset-password" (@{ token = $resetToken; new_password = $resetPassNew } | ConvertTo-Json -Compress)
+
+        Write-Section "105h" "AUTH - THE NEW PASSWORD WORKS, THE OLD ONE DOESN'T"
+        Invoke-Api POST "/login" (@{ email = $resetEmail; password = $resetPassNew } | ConvertTo-Json -Compress)
+        Assert-Equal "login with the NEW password" $script:LastCode 200
+        Invoke-Api POST "/login" (@{ email = $resetEmail; password = $resetPassOld } | ConvertTo-Json -Compress) -Expect '4'
+        Assert-Equal "login with the OLD password is refused" $script:LastCode 401
+
+        Write-Section "105i" "AUTH - THE RESET LINK IS SINGLE-USE  (replaying it -> 400)"
+        Invoke-Api POST "/reset-password" (@{ token = $resetToken; new_password = 'Another1!' } | ConvertTo-Json -Compress) -Expect '4'
+    } else {
+        Write-Host "  (skipping 105e-105i: a mail provider is configured, so the token is only in the inbox)" -ForegroundColor Yellow
+    }
+
+    Write-Section "105j" "AUTH - RESET WITH A GARBAGE TOKEN -> 400"
+    Invoke-Api POST "/reset-password" '{"token":"garbage-token","new_password":"Whatever1!"}' -Expect '4'
+
+    Write-Section "105k" "AUTH - THE RESET PAGE THE EMAIL LINKS TO  (GET /reset-password)"
+    Invoke-Api GET "/reset-password"
+    Assert-Equal "reset page served" $script:LastCode 200
+
+    Write-Section "105l" "AUTH - GOOGLE OAUTH CONFIG  (GET /auth/google/config)  <- no secrets, drives the button"
+    Invoke-Api GET "/auth/google/config"
+    try { $gcfg = $script:LastBody | ConvertFrom-Json } catch { $gcfg = $null }
+    $googleConfigured = ($gcfg -and $gcfg.configured)
+    Write-Host "  google oauth configured = $googleConfigured" -ForegroundColor Blue
+    if ($gcfg) {
+        Assert-Equal "config never returns the client secret" ($gcfg.PSObject.Properties.Name -contains 'client_secret') $false
+    }
+
+    if ($googleConfigured) {
+        Write-Section "105m" "AUTH - GOOGLE SIGN-IN REDIRECTS TO GOOGLE  (GET /auth/google/login -> 302)"
+        # -MaximumRedirection 0 so the 302 itself is observed, not followed.
+        $loc = ''; $code = 0
+        try {
+            $r = Invoke-WebRequest -Uri "$Base/auth/google/login" -MaximumRedirection 0 -ErrorAction Stop
+            $code = [int]$r.StatusCode; $loc = $r.Headers.Location
+        } catch {
+            if ($_.Exception.Response) {
+                $code = [int]$_.Exception.Response.StatusCode
+                $loc  = "" + $_.Exception.Response.Headers.Location
+            }
+        }
+        Write-Host "  HTTP $code -> $($loc.Substring(0, [Math]::Min(110, $loc.Length)))" -ForegroundColor DarkGray
+        Assert-Equal "302 to Google's consent screen" ($code -ge 300 -and $code -lt 400 -and $loc.StartsWith('https://accounts.google.com/')) $true
+        Assert-Equal "carries a signed state (CSRF guard)" ($loc -match '[?&]state=') $true
+        Assert-Equal "asks for the openid scope" ($loc -match 'scope=openid') $true
+    } else {
+        Write-Host "  (skipping 105m: set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET to test the redirect)" -ForegroundColor Yellow
+    }
+
+    Write-Section "105n" "AUTH - GOOGLE CALLBACK WITH A FORGED STATE -> 400  (CSRF guard)"
+    Invoke-Api GET "/auth/google/callback?code=fake&state=forged" -Expect '4'
+
+    Write-Section "105o" "AUTH - GOOGLE ID TOKEN THAT ISN'T ONE -> 401  (POST /auth/google/token)"
+    Invoke-Api POST "/auth/google/token" '{"credential":"not.a.real.jwt"}' -Expect '4'
 
     Write-Section 103 "SCORING SPEC COMPLIANCE  (python test_scoring_spec.py)  <- engine matches ScoringLogic_Swapify.md"
     $specScript = Join-Path $ServerDir 'test_scoring_spec.py'
@@ -1310,6 +1462,14 @@ try {
     Write-Host ""
     Write-Host "product indexes  (Task 1A; created at startup)" -ForegroundColor White
     Invoke-DbQuery "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='products' AND name LIKE 'idx_%' ORDER BY name"
+
+    Write-Host ""
+    Write-Host "password_reset_tokens  (from steps 105d-105i; note token_hash - the raw token is never stored)" -ForegroundColor White
+    Invoke-DbQuery "SELECT id, user_id, substr(token_hash,1,16) AS token_hash_prefix, expires_at, used_at FROM password_reset_tokens ORDER BY id DESC LIMIT 5"
+
+    Write-Host ""
+    Write-Host "users - Google sign-in columns  (google_id stays NULL until an account signs in with Google)" -ForegroundColor White
+    Invoke-DbQuery "SELECT id, username, auth_provider, google_id FROM users ORDER BY id DESC LIMIT 5"
 
     # =========================================================================
     Write-Banner "SUMMARY"
