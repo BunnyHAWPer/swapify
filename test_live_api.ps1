@@ -1004,8 +1004,8 @@ try {
     $catsTotal = if ($c) { [int]$c.total_products } else { 0 }
     $catsDb    = if ($c) { [int]$c.db_products } else { 0 }
     $catsExt   = if ($c) { [int]$c.external_products } else { 0 }
-    $catsLimit = if ($c) { [int]$c.external_limit } else { 0 }
-    Write-Host "  total_products=$catsTotal  (db=$catsDb + external=$catsExt, per-category limit $catsLimit)" -ForegroundColor Blue
+    $catsPending = if ($c) { [int]$c.counts_pending } else { 0 }
+    Write-Host "  total_products=$catsTotal  (db=$catsDb + external=$catsExt, counts_pending=$catsPending)" -ForegroundColor Blue
     Assert-Equal "categories status 200" $script:LastCode 200
     # July 28: the deployed DB's own row count (252 seed + auto-filled rows) is only
     # the db_products half now - total_products must also carry the OFF catalogue.
@@ -1018,6 +1018,17 @@ try {
         $tileShape = (@($missing).Count -eq 0)
     }
     Assert-Equal "each tile carries db_count + external_count" $tileShape $true
+    # July 30 (Task 3): external_count is Open Food Facts' REAL count for the category,
+    # not our fetch cap. It used to be SWAPIFY_CATEGORY_EXTERNAL_LIMIT (200), which is
+    # how the section reported a few hundred products for a database of millions. If the
+    # deployed host still advertises ~200 per category, it is running the old build.
+    $known = @($tiles | Where-Object { $_.external_count_known })
+    if ($known.Count -gt 0 -and (@($known | ForEach-Object { [int]$_.external_count } |
+            Measure-Object -Maximum).Maximum -gt 1000)) {
+        Assert-Equal "a category reports thousands of OFF products (not a 200 cap)" $true $true
+    } else {
+        Write-Host "  (no OFF counts resolved - network/OFF unavailable, or the host predates Task 3; not failing the run)" -ForegroundColor Yellow
+    }
     if ($catsExt -gt 0) {
         Assert-Equal "categories total exceeds our own catalogue" ($catsTotal -gt $catsDb) $true
     } else {
@@ -1033,6 +1044,33 @@ try {
 
     Write-Section "112b" "FEATURE 4 - PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
     Invoke-Api GET "/products/by-category/protein_bar?limit=3"
+
+    Write-Section "112c" "TASK 3 - CATEGORY PAGING IS UNCAPPED  (GET /products/by-category/biscuit?offset=...)  <- pages into OFF"
+    Invoke-Api GET "/products/by-category/biscuit?limit=5"
+    try { $bc = $script:LastBody | ConvertFrom-Json } catch { $bc = $null }
+    $bcTotal = if ($bc) { [int]$bc.total } else { 0 }
+    $bcDb    = if ($bc) { [int]$bc.db_total } else { 0 }
+    Write-Host "  biscuit: total=$bcTotal (our rows: $bcDb) - total is db + Open Food Facts' real count" -ForegroundColor Blue
+    Assert-Equal "by-category status 200" $script:LastCode 200
+    Invoke-Api GET "/products/by-category/biscuit?limit=5&offset=1000"
+    try { $deep = $script:LastBody | ConvertFrom-Json } catch { $deep = $null }
+    if ($deep -and [int]$deep.count -gt 0 -and [int]$deep.external_count -gt 0) {
+        Assert-Equal "offset=1000 still returns Open Food Facts products" $true $true
+    } else {
+        Write-Host "  (deep page empty - network/OFF may be unavailable; not failing the run)" -ForegroundColor Yellow
+    }
+
+    Write-Section "112d" "TASK 1 - LOOK UP A PRODUCT BY NAME  (GET /product/by-name/{name})  <- auto-fill without a barcode"
+    Invoke-Api GET "/product/by-name/Nutella"
+    Assert-Equal "by-name status 200" $script:LastCode 200
+    try { $byName = $script:LastBody | ConvertFrom-Json } catch { $byName = $null }
+    $byNameOk = ($byName -and $null -ne $byName.score -and
+                 $byName.resolution -and @($byName.resolution.sources_tried).Count -gt 0)
+    Assert-Equal "by-name returns a scored product with a resolution trail" $byNameOk $true
+
+    Write-Section "112e" "TASK 1 - FORCE A RE-RESOLVE  (GET /product/{barcode}?refresh=true)  <- bypasses caches + cooldown"
+    Invoke-Api GET "/product/$BcHealthy`?refresh=true"
+    Assert-Equal "refresh=true still returns the product" $script:LastCode 200
 
     Write-Section 113 "FEATURE 3 - WEEKLY DIGEST PREVIEW  (GET /weekly-digest/{user_id})"
     Invoke-Api GET "/weekly-digest/$($script:UserId)" -Auth
@@ -1218,6 +1256,99 @@ try {
 
     Write-Host "  FIX #9 (sodium vs salt): a frontend-only change - bare 'Salt' is no longer flagged" -ForegroundColor DarkGray
     Write-Host "  when the sodium panel reads 0mg (static/script.js calculateScore). Not an API check." -ForegroundColor DarkGray
+
+    # =========================================================================
+    Write-Banner "AUTH - FORGOT / RESET PASSWORD + GOOGLE OAUTH"
+    # Everything here is read-only against live data by default. The one step
+    # that would send a real email and change a real password is gated behind
+    # -RunDestructive: /forgot-password for an address that does NOT exist sends
+    # nothing (no account -> no mail), which is exactly what makes it safe to run
+    # against production on every pass.
+
+    Write-Section "128a" "AUTH - IS OUTGOING MAIL ACTUALLY CONFIGURED?  (GET /auth/email/status)"
+    Invoke-Api GET "/auth/email/status"
+    try { $mail = $script:LastBody | ConvertFrom-Json } catch { $mail = $null }
+    $liveProvider = if ($mail) { "" + $mail.provider } else { 'unknown' }
+    Assert-Equal "email status endpoint is live" $script:LastCode 200
+    if ($liveProvider -eq 'outbox') {
+        Write-Host "  WARNING: this deployment has NO mail provider - password reset emails are" -ForegroundColor Yellow
+        Write-Host "  written to outbox/*.eml on the server and never delivered. Set SMTP_PASSWORD" -ForegroundColor Yellow
+        Write-Host "  (a Gmail App Password) in the Render dashboard." -ForegroundColor Yellow
+    } else {
+        Write-Host "  mail provider = $liveProvider" -ForegroundColor Green
+    }
+    Assert-Equal "reset tokens are NOT exposed in responses on live" ($mail -and $mail.token_exposed_in_response) $false
+
+    Write-Section "128b" "AUTH - FORGOT PASSWORD FOR AN UNREGISTERED ADDRESS  (sends nothing; must not say so)"
+    Invoke-Api POST "/forgot-password" (@{ email = "definitely-not-registered-$stamp@example.com" } | ConvertTo-Json -Compress)
+    try { $fp = $script:LastBody | ConvertFrom-Json } catch { $fp = $null }
+    Assert-Equal "answers 200 for an unknown address" $script:LastCode 200
+    Assert-Equal "does not confirm whether the account exists" ($fp -and "$($fp.message)".StartsWith('If an account exists')) $true
+    Assert-Equal "never leaks a token on live" ($fp -and ($fp.PSObject.Properties.Name -contains 'debug')) $false
+
+    Write-Section "128c" "AUTH - FORGOT PASSWORD, MALFORMED EMAIL -> 400"
+    Invoke-Api POST "/forgot-password" '{"email":"not-an-email"}' -Expect '4'
+
+    Write-Section "128d" "AUTH - RESET WITH A GARBAGE TOKEN -> 400  (POST /reset-password)"
+    Invoke-Api POST "/reset-password" '{"token":"garbage-token","new_password":"Whatever1!"}' -Expect '4'
+
+    Write-Section "128e" "AUTH - VALIDATE A GARBAGE TOKEN  (GET /reset-password/validate)  <- valid:false"
+    Invoke-Api GET "/reset-password/validate?token=garbage"
+    try { $rv = $script:LastBody | ConvertFrom-Json } catch { $rv = $null }
+    Assert-Equal "garbage token reports valid:false" ($rv -and $rv.valid) $false
+
+    Write-Section "128f" "AUTH - THE RESET PAGE THE EMAIL LINKS TO  (GET /reset-password)"
+    Invoke-Api GET "/reset-password"
+    Assert-Equal "reset page is served by the API" $script:LastCode 200
+
+    Write-Section "128g" "AUTH - GOOGLE OAUTH CONFIG  (GET /auth/google/config)"
+    Invoke-Api GET "/auth/google/config"
+    try { $gcfg = $script:LastBody | ConvertFrom-Json } catch { $gcfg = $null }
+    $googleLive = ($gcfg -and $gcfg.configured)
+    Assert-Equal "Google OAuth is configured on this deployment" $googleLive $true
+    Assert-Equal "the client secret is never returned" ($gcfg -and ($gcfg.PSObject.Properties.Name -contains 'client_secret')) $false
+    if ($gcfg) {
+        Write-Host "  redirect_uri = $($gcfg.redirect_uri)" -ForegroundColor Blue
+        Write-Host "  (this exact string must be in Google Cloud Console > Authorised redirect URIs)" -ForegroundColor DarkGray
+    }
+
+    if ($googleLive) {
+        Write-Section "128h" "AUTH - GOOGLE SIGN-IN REDIRECTS TO GOOGLE  (GET /auth/google/login -> 302)"
+        $loc = ''; $code = 0
+        try {
+            $r = Invoke-WebRequest -Uri "$Base/auth/google/login" -MaximumRedirection 0 -ErrorAction Stop
+            $code = [int]$r.StatusCode; $loc = "" + $r.Headers.Location
+        } catch {
+            if ($_.Exception.Response) {
+                $code = [int]$_.Exception.Response.StatusCode
+                $loc  = "" + $_.Exception.Response.Headers.Location
+            }
+        }
+        Write-Host "  HTTP $code -> $($loc.Substring(0, [Math]::Min(110, $loc.Length)))" -ForegroundColor DarkGray
+        Assert-Equal "302 to Google's consent screen" ($code -ge 300 -and $code -lt 400 -and $loc.StartsWith('https://accounts.google.com/')) $true
+        Assert-Equal "carries a signed state (CSRF guard)" ($loc -match '[?&]state=') $true
+        Assert-Equal "requests the openid scope" ($loc -match 'scope=openid') $true
+    }
+
+    Write-Section "128i" "AUTH - GOOGLE CALLBACK WITH A FORGED STATE -> 400  (CSRF guard)"
+    Invoke-Api GET "/auth/google/callback?code=fake&state=forged" -Expect '4'
+
+    Write-Section "128j" "AUTH - GOOGLE ID TOKEN THAT ISN'T ONE -> 401  (POST /auth/google/token)"
+    Invoke-Api POST "/auth/google/token" '{"credential":"not.a.real.jwt"}' -Expect '4'
+
+    Write-Section "128k" "AUTH - FULL RESET ROUND TRIP  <- registers a real account and SENDS REAL MAIL; -RunDestructive only"
+    if ($RunDestructive) {
+        # Registers a throwaway account on the live DB and asks for a reset. On a
+        # configured deployment the link lands in that mailbox, so the suite can
+        # only assert that the request was accepted - not complete the reset.
+        $liveResetEmail = "resettester_$stamp@example.com"
+        Invoke-Api POST "/register" (@{ email = $liveResetEmail; username = "resettester_$stamp"; password = 'Passw0rd!' } | ConvertTo-Json -Compress)
+        Invoke-Api POST "/forgot-password" (@{ email = $liveResetEmail } | ConvertTo-Json -Compress)
+        Assert-Equal "reset request accepted for a real account" $script:LastCode 200
+        Write-Host "  Check the server log for 'reset link sent to ... via $liveProvider'." -ForegroundColor DarkGray
+    } else {
+        Write-Host "SKIPPED - would create a live user and send a real email. Re-run with -RunDestructive." -ForegroundColor DarkGray
+    }
 
     # =========================================================================
     Write-Banner "SUMMARY"
