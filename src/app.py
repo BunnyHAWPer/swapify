@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, Depends, Header, status, UploadFile, File, Form
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi import (FastAPI, HTTPException, Depends, Header, status, UploadFile,
+                     File, Form, Request)
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -18,6 +19,24 @@ import json
 import logging
 import threading
 import concurrent.futures
+import html
+import urllib.parse
+import base64
+import hashlib
+import hmac
+import secrets
+
+# .env is loaded FIRST, before anything else in this module reads os.environ.
+# It used to be loaded ~200 lines down, which meant every setting consumed above
+# that line — SECRET_KEY, and every mail setting in the weekly_digest import
+# below — was resolved from the raw process environment and silently ignored
+# whatever .env said. That is why SMTP configuration appeared to have no effect.
+try:
+    from dotenv import load_dotenv  # type: ignore
+
+    load_dotenv()
+except Exception:  # pragma: no cover - python-dotenv is optional
+    pass
 
 # OCR label scanner POC (Task 6). The module itself has no hard dependency on the
 # OCR stack at import time (Tesseract/Pillow are looked up lazily), so this import
@@ -114,6 +133,25 @@ class UserRegister(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    # Clients in the wild send one or the other; accept both rather than make the
+    # caller guess. Exactly one must be present (validated in the endpoint).
+    new_password: Optional[str] = None
+    password: Optional[str] = None
+
+
+class GoogleTokenLogin(BaseModel):
+    # Google Identity Services calls it `credential`; the OAuth spec calls it
+    # `id_token`. Both name the same JWT.
+    credential: Optional[str] = None
+    id_token: Optional[str] = None
 
 
 class UserPreferences(BaseModel):
@@ -215,13 +253,6 @@ class ReviewReply(BaseModel):
 # dev and the test suite keep working unchanged.
 SECRET_KEY = os.environ.get("SECRET_KEY", "supersecretkey")
 ALGORITHM = "HS256"
-
-try:
-    from dotenv import load_dotenv  # type: ignore
-
-    load_dotenv()
-except Exception:
-    pass
 
 # --- Provider 1: OpenRouter (OpenAI-compatible; many free-tier models) --------
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
@@ -738,12 +769,7 @@ def login(user: UserLogin):
     if not bcrypt.checkpw(user.password.encode('utf-8'), user_db['password_hash'].encode('utf-8')):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
-    payload = {
-        "user_id": user_db['id'],
-        "username": user_db['username'],
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=24)
-    }
-    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    token = _create_access_token(user_db['id'], user_db['username'])
 
     return {"access_token": token, "token_type": "bearer"}
 
@@ -887,6 +913,1099 @@ def get_badges(user_id: int = Depends(get_current_user)):
             "pct": round(100 * min(val, target) / target, 1) if target else 0.0,
         }
     return {"badges": badges}
+
+
+# ==============================================================================
+# Account recovery + Google sign-in
+# ==============================================================================
+# Three endpoints the app was missing: POST /forgot-password (email a reset
+# link), POST /reset-password (consume the link, set a new password) and the
+# Google OAuth 2.0 authorization-code flow.
+#
+# Four rules run through all of it:
+#
+#   1. **Never leak who has an account.** /forgot-password answers identically
+#      for a registered and an unregistered address — only the mail actually
+#      sent differs. A reset form that says "no such user" is how account lists
+#      get harvested.
+#   2. **Only a hash of the reset token is stored.** The token itself exists in
+#      the email and nowhere else, so a leaked database still cannot be used to
+#      take over accounts — the same reasoning as hashing passwords.
+#   3. **Tokens are single-use and short-lived** (PASSWORD_RESET_TTL_MINUTES,
+#      default 30). Using one, or requesting a new one, invalidates every other
+#      outstanding token for that account.
+#   4. **A failed send is never a 500.** Mail delivery is best-effort and
+#      reported through GET /auth/email/status, so an SMTP outage degrades the
+#      feature instead of breaking the endpoint.
+
+PASSWORD_RESET_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TTL_MINUTES", "30"))
+# Matches the 6-character minimum the registration form already enforces; raising
+# it here alone would let people register a password they could never reset to.
+PASSWORD_MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "6"))
+FORGOT_PASSWORD_MAX_PER_HOUR = int(os.environ.get("FORGOT_PASSWORD_MAX_PER_HOUR", "5"))
+
+# Public base URL of *this* API — used for the reset link and as the default
+# OAuth redirect target. Must match what is registered in Google Cloud Console.
+APP_BASE_URL = (os.environ.get("APP_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+# Where the web app lives, when it is deployed separately from the API (it is:
+# Vercel frontend, Render backend). Used to hand the OAuth result back.
+FRONTEND_BASE_URL = (os.environ.get("FRONTEND_BASE_URL") or "").rstrip("/")
+# The page the emailed link points at. Defaults to the page this API serves
+# itself (GET /reset-password below), so password reset works with no frontend
+# deployed at all; point it at the web app to use that instead.
+PASSWORD_RESET_URL_BASE = (
+    os.environ.get("PASSWORD_RESET_URL_BASE") or f"{APP_BASE_URL}/reset-password"
+)
+
+
+def _client_ip(request: Optional[Request]) -> str:
+    """Best-effort caller IP, honouring the proxy header Render/Vercel set."""
+    if request is None:
+        return "unknown"
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return getattr(request.client, "host", None) or "unknown"
+
+
+def ensure_auth_schema():
+    """Idempotent migration for password reset + Google sign-in.
+
+    Adds:
+      - ``password_reset_tokens`` (hash only — never the token itself)
+      - ``users.google_id`` / ``auth_provider`` / ``avatar_url``
+
+    Best-effort like the other ensure_* migrations: a failure is logged, never
+    fatal, so the app still boots on a read-only volume.
+    """
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.executescript('''
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at   TEXT NOT NULL,
+                used_at      TEXT,
+                requested_ip TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reset_tokens_user ON password_reset_tokens(user_id);
+        ''')
+
+        user_cols = {r[1] for r in cur.execute("PRAGMA table_info(users)")}
+        if "google_id" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN google_id TEXT")
+        if "auth_provider" not in user_cols:
+            # 'password' for accounts created through /register, 'google' for
+            # accounts first created by signing in with Google.
+            cur.execute("ALTER TABLE users ADD COLUMN auth_provider TEXT DEFAULT 'password'")
+        if "avatar_url" not in user_cols:
+            cur.execute("ALTER TABLE users ADD COLUMN avatar_url TEXT")
+        # UNIQUE so one Google account can never end up attached to two rows.
+        # SQLite allows unlimited NULLs in a unique index, so password-only
+        # accounts are unaffected.
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_id "
+                    "ON users(google_id)")
+        conn.commit()
+        conn.close()
+    except Exception as exc:  # pragma: no cover - defensive bootstrap
+        logger.warning("ensure_auth_schema failed: %s", exc)
+
+
+def _create_access_token(user_id, username, hours: int = 24) -> str:
+    """Issue the same 24-hour bearer token /login returns.
+
+    Google sign-in and password login must produce interchangeable tokens —
+    every other endpoint only knows how to read this shape.
+    """
+    payload = {
+        "user_id": user_id,
+        "username": username,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=hours),
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def _hash_reset_token(token: str) -> str:
+    """SHA-256 of the token, peppered with SECRET_KEY.
+
+    Peppering means a stolen ``password_reset_tokens`` table is useless without
+    the application secret, which lives in the environment rather than the DB.
+    """
+    return hashlib.sha256(f"{SECRET_KEY}:{token}".encode()).hexdigest()
+
+
+# Per-process request log for the /forgot-password throttle. In-memory on
+# purpose: this is abuse damping (mail-bombing an address, or fishing for
+# accounts), not a security boundary, and it must not add a DB write to an
+# unauthenticated endpoint. With several workers the effective limit is
+# per-worker — documented rather than hidden.
+_forgot_password_log = {}
+_forgot_password_lock = threading.Lock()
+
+
+def _rate_limit_ok(key: str, limit: int, window_s: int = 3600) -> bool:
+    """True when ``key`` is still under ``limit`` requests in the last window."""
+    if limit <= 0:
+        return True
+    now = time.time()
+    with _forgot_password_lock:
+        hits = [t for t in _forgot_password_log.get(key, []) if now - t < window_s]
+        if len(hits) >= limit:
+            _forgot_password_log[key] = hits
+            return False
+        hits.append(now)
+        _forgot_password_log[key] = hits
+        # Opportunistic sweep so a long-running worker can't grow this forever.
+        if len(_forgot_password_log) > 2048:
+            for k in [k for k, v in _forgot_password_log.items()
+                      if not v or now - v[-1] > window_s]:
+                _forgot_password_log.pop(k, None)
+    return True
+
+
+def _email_provider() -> str:
+    """'sendgrid' | 'smtp' | 'outbox' | 'unavailable'."""
+    if weekly_digest is None:
+        return "unavailable"
+    return weekly_digest.active_provider()
+
+
+def _reset_token_exposed() -> bool:
+    """Whether the API may hand the reset link straight back in the response.
+
+    Returning the token makes the flow testable with no inbox, and is how the
+    test suites exercise it end to end — but anyone who can POST an email address
+    could then reset that account, so it must never be on in production.
+
+    Default ("auto") requires BOTH conditions: no mail provider is configured
+    *and* this instance is serving a loopback ``APP_BASE_URL``. The second half
+    matters because "no mail provider" is also what a real deployment looks like
+    when someone forgets ``SMTP_PASSWORD`` — exactly the moment you least want
+    tokens in responses. ``PASSWORD_RESET_EXPOSE_TOKEN=1`` forces it on (for a
+    recorded demo), ``=0`` forces it off.
+    """
+    flag = (os.environ.get("PASSWORD_RESET_EXPOSE_TOKEN") or "auto").strip().lower()
+    if flag in ("1", "true", "yes", "on"):
+        return True
+    if flag in ("0", "false", "no", "off"):
+        return False
+    if _email_provider() not in ("outbox", "unavailable"):
+        return False
+    host = (urllib.parse.urlparse(APP_BASE_URL).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def _mask_email(email: str) -> str:
+    """'dhruvrwt1211@gmail.com' -> 'd**********1@gmail.com'."""
+    if not email or "@" not in email:
+        return "***"
+    local, _, domain = email.partition("@")
+    if len(local) <= 2:
+        return f"{local[0]}*@{domain}"
+    return f"{local[0]}{'*' * (len(local) - 2)}{local[-1]}@{domain}"
+
+
+def _password_reset_link(token: str) -> str:
+    joiner = "&" if "?" in PASSWORD_RESET_URL_BASE else "?"
+    return f"{PASSWORD_RESET_URL_BASE}{joiner}token={urllib.parse.quote(token)}"
+
+
+def _render_password_reset_email(username: str, reset_url: str, ttl_minutes: int):
+    """(subject, html, text) for the reset mail — styled like the weekly digest."""
+    subject = "Reset your Swapify password"
+    safe_name = html.escape(username or "there")
+    safe_url = html.escape(reset_url, quote=True)
+    text = "\n".join([
+        f"Hi {username or 'there'},",
+        "",
+        "We received a request to reset the password on your Swapify account.",
+        "",
+        "Open this link to choose a new password:",
+        reset_url,
+        "",
+        f"The link expires in {ttl_minutes} minutes and can only be used once.",
+        "",
+        "If you didn't ask for this, you can safely ignore this email — your "
+        "password stays exactly as it is.",
+        "",
+        "— The Swapify team",
+    ])
+    html_body = f"""\
+<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px;color:#222;">
+  <div style="text-align:center;margin-bottom:8px;">
+    <span style="font-size:24px;font-weight:800;color:#5b3df5;">Swapify</span>
+    <div style="color:#888;font-size:13px;">Password reset</div>
+  </div>
+  <p style="font-size:15px;">Hi {safe_name},</p>
+  <p style="font-size:15px;color:#333;">
+    We received a request to reset the password on your Swapify account.
+    Choose a new one here:
+  </p>
+  <div style="text-align:center;margin:28px 0;">
+    <a href="{safe_url}" style="background:#5b3df5;color:#fff;text-decoration:none;padding:13px 26px;border-radius:8px;font-weight:600;display:inline-block;">Reset my password</a>
+  </div>
+  <p style="font-size:13px;color:#666;">
+    This link expires in <b>{ttl_minutes} minutes</b> and can only be used once.
+  </p>
+  <p style="font-size:13px;color:#666;">
+    If the button doesn't work, paste this into your browser:<br>
+    <span style="word-break:break-all;color:#5b3df5;">{safe_url}</span>
+  </p>
+  <hr style="border:none;border-top:1px solid #eee;margin:24px 0;">
+  <p style="font-size:11px;color:#999;text-align:center;">
+    Didn't ask for this? You can safely ignore this email — your password stays as it is.
+  </p>
+</div>"""
+    return subject, html_body, text
+
+
+@app.post("/forgot-password")
+def forgot_password(body: ForgotPasswordRequest, request: Request = None):
+    """Email a single-use password-reset link.
+
+    Always 200 with the same message whether or not the address is registered
+    (see rule 1 at the top of this section) — the only 4xx cases are a malformed
+    email and the abuse throttle.
+    """
+    email = (body.email or "").strip()
+    if not email or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address.")
+
+    ip = _client_ip(request)
+    if not _rate_limit_ok(f"email:{email.lower()}", FORGOT_PASSWORD_MAX_PER_HOUR) or \
+       not _rate_limit_ok(f"ip:{ip}", FORGOT_PASSWORD_MAX_PER_HOUR * 4):
+        raise HTTPException(
+            status_code=429,
+            detail=("Too many password reset requests. Please wait an hour and "
+                    "try again, or check your inbox for the link already sent."),
+        )
+
+    generic = {
+        "message": ("If an account exists for that email, a password reset link "
+                    "is on its way. Check your inbox (and spam folder)."),
+        "expires_in_minutes": PASSWORD_RESET_TTL_MINUTES,
+    }
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    # Case-insensitive: people type 'Dhruv@Gmail.com' and expect it to work.
+    cur.execute("SELECT id, username, email, auth_provider FROM users "
+                "WHERE lower(email) = lower(?)", (email,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        logger.info("forgot-password: no account for %s (answered generically)",
+                    _mask_email(email))
+        return generic
+
+    user = dict(row)
+    token = secrets.token_urlsafe(32)
+    expires_at = (datetime.datetime.utcnow()
+                  + datetime.timedelta(minutes=PASSWORD_RESET_TTL_MINUTES))
+    # Requesting a new link kills the old ones: two live links means two chances
+    # for an intercepted email to be replayed.
+    cur.execute("UPDATE password_reset_tokens SET used_at = ? "
+                "WHERE user_id = ? AND used_at IS NULL",
+                (datetime.datetime.utcnow().isoformat(), user["id"]))
+    cur.execute("INSERT INTO password_reset_tokens "
+                "(user_id, token_hash, expires_at, requested_ip) VALUES (?, ?, ?, ?)",
+                (user["id"], _hash_reset_token(token), expires_at.isoformat(), ip))
+    conn.commit()
+    conn.close()
+
+    reset_url = _password_reset_link(token)
+    subject, html_body, text_body = _render_password_reset_email(
+        user["username"], reset_url, PASSWORD_RESET_TTL_MINUTES)
+
+    if weekly_digest is not None:
+        delivery = weekly_digest.send_email(user["email"], subject, html_body,
+                                            text_body, kind="password_reset")
+    else:  # pragma: no cover - the module is bundled
+        delivery = {"provider": "unavailable", "delivered": False,
+                    "detail": "email module not importable"}
+
+    if not delivery.get("delivered"):
+        # Loud, because the user is standing at a form waiting for mail that
+        # will never arrive. The endpoint still succeeds: the token is valid and
+        # an admin can read the link out of the log.
+        logger.error("forgot-password: delivery FAILED for %s via %s: %s",
+                     _mask_email(user["email"]), delivery.get("provider"),
+                     delivery.get("detail"))
+    else:
+        logger.info("forgot-password: reset link sent to %s via %s",
+                    _mask_email(user["email"]), delivery.get("provider"))
+    if _email_provider() in ("outbox", "unavailable"):
+        logger.info("forgot-password: reset link (no mail provider configured) %s",
+                    reset_url)
+
+    if _reset_token_exposed():
+        # Dev/demo mode only — see _reset_token_exposed().
+        generic["debug"] = {
+            "note": ("Token returned because no mail provider is configured "
+                     "(PASSWORD_RESET_EXPOSE_TOKEN). Never enabled in production."),
+            "reset_url": reset_url,
+            "token": token,
+            "delivery": delivery,
+        }
+    return generic
+
+
+def _lookup_reset_token(token: str):
+    """Return ``(row, reason)``; ``row`` is None when the token can't be used."""
+    if not token or not token.strip():
+        return None, "missing"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT t.id, t.user_id, t.expires_at, t.used_at, u.email, u.username "
+        "FROM password_reset_tokens t JOIN users u ON u.id = t.user_id "
+        "WHERE t.token_hash = ?",
+        (_hash_reset_token(token.strip()),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None, "invalid"
+    row = dict(row)
+    if row["used_at"]:
+        return None, "used"
+    try:
+        expires = datetime.datetime.fromisoformat(row["expires_at"])
+    except (TypeError, ValueError):  # pragma: no cover - corrupt row
+        return None, "invalid"
+    if expires < datetime.datetime.utcnow():
+        return None, "expired"
+    return row, "valid"
+
+
+_RESET_TOKEN_MESSAGES = {
+    "missing": "No reset token supplied.",
+    "invalid": "This password reset link is not valid. Request a new one.",
+    "used": "This password reset link has already been used. Request a new one.",
+    "expired": "This password reset link has expired. Request a new one.",
+}
+
+
+@app.get("/reset-password/validate")
+def validate_reset_token(token: str = ""):
+    """Check a reset link before showing the new-password form.
+
+    Lets the page say "this link expired" up front instead of after someone has
+    typed a new password twice.
+    """
+    row, reason = _lookup_reset_token(token)
+    if row is None:
+        return {"valid": False, "reason": reason,
+                "message": _RESET_TOKEN_MESSAGES.get(reason, "Invalid token.")}
+    return {
+        "valid": True,
+        "reason": "valid",
+        "email": _mask_email(row["email"]),
+        "expires_at": row["expires_at"],
+        "message": "Link is valid. Choose a new password.",
+    }
+
+
+@app.post("/reset-password")
+def reset_password(body: ResetPasswordRequest):
+    """Consume a reset token and set the new password.
+
+    On success every other outstanding token for the account is invalidated too,
+    so a second link sitting in the mailbox can't be replayed later.
+    """
+    new_password = body.new_password if body.new_password is not None else body.password
+    if not new_password:
+        raise HTTPException(
+            status_code=400,
+            detail="A new password is required (send it as 'new_password').",
+        )
+    if len(new_password) < PASSWORD_MIN_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Password must be at least {PASSWORD_MIN_LENGTH} characters.",
+        )
+
+    row, reason = _lookup_reset_token(body.token)
+    if row is None:
+        raise HTTPException(status_code=400,
+                            detail=_RESET_TOKEN_MESSAGES.get(reason, "Invalid token."))
+
+    password_hash = bcrypt.hashpw(new_password.encode("utf-8"),
+                                  bcrypt.gensalt()).decode("utf-8")
+    now = datetime.datetime.utcnow().isoformat()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET password_hash = ? WHERE id = ?",
+                (password_hash, row["user_id"]))
+    cur.execute("UPDATE password_reset_tokens SET used_at = ? "
+                "WHERE user_id = ? AND used_at IS NULL",
+                (now, row["user_id"]))
+    conn.commit()
+    conn.close()
+
+    logger.info("reset-password: password changed for user %s (%s)",
+                row["user_id"], _mask_email(row["email"]))
+    return {
+        "message": "Password updated. You can now log in with your new password.",
+        "email": row["email"],
+        "username": row["username"],
+    }
+
+
+# The page the emailed link opens. Served by the API itself so password reset
+# works even with no frontend deployed (the web app is hosted separately) —
+# point PASSWORD_RESET_URL_BASE at the web app to use that instead.
+_RESET_PAGE_HTML = """\
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reset your Swapify password</title>
+<style>
+ *{box-sizing:border-box} body{margin:0;min-height:100vh;display:flex;align-items:center;
+  justify-content:center;background:#f5f4fb;font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:#222;padding:20px}
+ .card{background:#fff;border-radius:16px;box-shadow:0 10px 40px rgba(30,20,80,.10);padding:32px;width:100%;max-width:420px}
+ .logo{font-size:26px;font-weight:800;color:#5b3df5;text-align:center}
+ .sub{text-align:center;color:#888;font-size:13px;margin:4px 0 22px}
+ label{display:block;font-size:13px;font-weight:600;margin:14px 0 6px}
+ input{width:100%;padding:12px;border:1.5px solid #e3e1ef;border-radius:9px;font-size:15px}
+ input:focus{outline:none;border-color:#5b3df5}
+ button{width:100%;margin-top:20px;padding:13px;border:0;border-radius:9px;background:#5b3df5;
+  color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+ button:disabled{opacity:.55;cursor:not-allowed}
+ .msg{margin-top:16px;padding:11px 13px;border-radius:9px;font-size:13.5px;display:none}
+ .msg.err{display:block;background:#fdecec;color:#b3261e}
+ .msg.ok{display:block;background:#e8f5ec;color:#1c6b34}
+ .hint{font-size:12px;color:#999;margin-top:8px}
+</style></head><body>
+<div class="card">
+  <div class="logo">Swap<span style="color:#222">ify</span></div>
+  <div class="sub">Choose a new password</div>
+  <div id="form">
+    <label for="pw1">New password</label>
+    <input id="pw1" type="password" autocomplete="new-password" placeholder="At least __MINLEN__ characters">
+    <label for="pw2">Confirm new password</label>
+    <input id="pw2" type="password" autocomplete="new-password" placeholder="Type it again">
+    <button id="go" onclick="submitReset()">Update password</button>
+    <div class="hint">This link can only be used once.</div>
+  </div>
+  <div id="msg" class="msg"></div>
+</div>
+<script>
+var TOKEN = new URLSearchParams(location.search).get('token') || '';
+var MINLEN = __MINLEN__;
+function show(kind, text){ var m=document.getElementById('msg'); m.className='msg '+kind; m.textContent=text; }
+function hideForm(){ document.getElementById('form').style.display='none'; }
+if(!TOKEN){ hideForm(); show('err','No reset token in this link. Request a new one from the app.'); }
+else {
+  fetch('/reset-password/validate?token='+encodeURIComponent(TOKEN))
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if(!d.valid){ hideForm(); show('err', d.message); }
+                       else { document.querySelector('.sub').textContent='Choose a new password for '+d.email; } })
+    .catch(function(){});
+}
+async function submitReset(){
+  var p1=document.getElementById('pw1').value, p2=document.getElementById('pw2').value;
+  if(p1.length < MINLEN){ show('err','Password must be at least '+MINLEN+' characters.'); return; }
+  if(p1 !== p2){ show('err','The two passwords do not match.'); return; }
+  var btn=document.getElementById('go'); btn.disabled=true; btn.textContent='Updating...';
+  try{
+    var res = await fetch('/reset-password', {method:'POST', headers:{'Content-Type':'application/json'},
+                          body: JSON.stringify({token:TOKEN, new_password:p1})});
+    var data = await res.json();
+    if(!res.ok){ show('err', data.detail || 'Could not reset the password.'); btn.disabled=false; btn.textContent='Update password'; return; }
+    hideForm(); show('ok', 'Password updated. You can close this tab and sign in with your new password.');
+  }catch(e){ show('err','Network error — is the server reachable?'); btn.disabled=false; btn.textContent='Update password'; }
+}
+</script></body></html>"""
+
+
+@app.get("/reset-password", response_class=HTMLResponse)
+def reset_password_page():
+    """The HTML form the emailed link opens (POSTs back to /reset-password)."""
+    return HTMLResponse(_RESET_PAGE_HTML.replace("__MINLEN__", str(PASSWORD_MIN_LENGTH)))
+
+
+# ------------------------------------------------------------------------------
+# Google OAuth 2.0
+# ------------------------------------------------------------------------------
+# Two entry points, because the two clients differ:
+#
+#   * GET  /auth/google/login    -> browser redirect (authorization-code flow).
+#                                   The callback exchanges the code server-side,
+#                                   so the client secret never leaves the server.
+#   * POST /auth/google/token    -> for Google Identity Services / mobile SDKs
+#                                   that already hold an ID token.
+#
+# Both end in the same place: a Swapify JWT identical to the one /login issues.
+
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_TOKENINFO_ENDPOINT = "https://oauth2.googleapis.com/tokeninfo"
+GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v3/userinfo"
+GOOGLE_CERTS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+GOOGLE_ISSUERS = ("accounts.google.com", "https://accounts.google.com")
+GOOGLE_SCOPES = "openid email profile"
+OAUTH_STATE_TTL_S = 600  # 10 minutes to finish the Google consent screen
+
+_google_config_cache = {}
+
+
+def _google_config() -> dict:
+    """Client id/secret/redirect URI, from the environment or the downloaded JSON.
+
+    Environment wins (``GOOGLE_CLIENT_ID`` / ``GOOGLE_CLIENT_SECRET`` /
+    ``GOOGLE_REDIRECT_URI``). Falling back to the ``client_secret_*.json`` that
+    Google Cloud Console hands you means the credentials work as delivered, but
+    that file should not stay in the repo — a client secret in version control is
+    a leaked secret. Set the env vars and delete it.
+    """
+    if _google_config_cache:
+        return _google_config_cache
+
+    cfg = {
+        "client_id": (os.environ.get("GOOGLE_CLIENT_ID") or "").strip(),
+        "client_secret": (os.environ.get("GOOGLE_CLIENT_SECRET") or "").strip(),
+        "redirect_uri": (os.environ.get("GOOGLE_REDIRECT_URI") or "").strip(),
+        "source": "env",
+    }
+
+    if not (cfg["client_id"] and cfg["client_secret"]):
+        path = (os.environ.get("GOOGLE_CLIENT_SECRETS_FILE") or "").strip()
+        candidates = [path] if path else []
+        if not candidates:
+            import glob
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            candidates = sorted(glob.glob(os.path.join(root, "client_secret*.json")))
+        for candidate in candidates:
+            try:
+                with open(candidate, "r", encoding="utf-8") as fh:
+                    raw = json.load(fh)
+                block = raw.get("web") or raw.get("installed") or raw
+                cfg["client_id"] = cfg["client_id"] or (block.get("client_id") or "").strip()
+                cfg["client_secret"] = cfg["client_secret"] or (block.get("client_secret") or "").strip()
+                if not cfg["redirect_uri"]:
+                    uris = block.get("redirect_uris") or []
+                    if uris:
+                        cfg["redirect_uri"] = uris[0]
+                cfg["source"] = f"file:{os.path.basename(candidate)}"
+                break
+            except Exception as exc:
+                logger.warning("could not read Google client secrets from %s: %s",
+                               candidate, exc)
+
+    if not cfg["redirect_uri"]:
+        cfg["redirect_uri"] = f"{APP_BASE_URL}/auth/google/callback"
+    cfg["configured"] = bool(cfg["client_id"] and cfg["client_secret"])
+    _google_config_cache.update(cfg)
+    if not cfg["configured"]:
+        logger.warning(
+            "Google OAuth is not configured — /auth/google/* will return 503. "
+            "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (Google Cloud Console "
+            "> APIs & Services > Credentials > OAuth 2.0 Client IDs)."
+        )
+    return cfg
+
+
+def _require_google_config() -> dict:
+    cfg = _google_config()
+    if not cfg["configured"]:
+        raise HTTPException(
+            status_code=503,
+            detail=("Google sign-in is not configured on this server. Set "
+                    "GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET."),
+        )
+    return cfg
+
+
+def _allowed_redirect(url: str) -> bool:
+    """Whether we may hand an access token to ``url``'s origin.
+
+    An open redirect here would mail our own JWTs to whoever asked, so the
+    target must be an origin we already trust for CORS.
+    """
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    if origin == APP_BASE_URL or (FRONTEND_BASE_URL and origin == FRONTEND_BASE_URL):
+        return True
+    # Deliberately no wildcard branch: CORS_ORIGINS="*" (the default) means "any
+    # site may read our public JSON", which is a very different claim from "any
+    # site may be handed a signed-in user's token". Named origins and the
+    # localhost/mobile-shell regex only.
+    if origin in [o for o in ALLOWED_ORIGINS if o != "*"]:
+        return True
+    if CORS_ORIGIN_REGEX:
+        try:
+            if re.match(CORS_ORIGIN_REGEX, origin):
+                return True
+        except re.error:  # pragma: no cover - misconfigured regex
+            pass
+    return False
+
+
+def _make_oauth_state(return_to: str = "") -> str:
+    """Signed, self-contained CSRF state (no server-side session needed)."""
+    payload = "{}.{}.{}".format(
+        int(time.time()),
+        secrets.token_urlsafe(9),
+        base64.urlsafe_b64encode(return_to.encode()).decode().rstrip("="),
+    )
+    sig = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{payload}.{sig}"
+
+
+def _read_oauth_state(state: str):
+    """Return ``(ok, return_to)`` for a state we issued and that hasn't expired."""
+    if not state:
+        return False, ""
+    try:
+        payload, sig = state.rsplit(".", 1)
+        ts_str, _nonce, encoded = payload.split(".", 2)
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(),
+                            hashlib.sha256).hexdigest()[:32]
+        if not hmac.compare_digest(sig, expected):
+            return False, ""
+        if time.time() - int(ts_str) > OAUTH_STATE_TTL_S:
+            return False, ""
+        pad = "=" * (-len(encoded) % 4)
+        return_to = base64.urlsafe_b64decode(encoded + pad).decode() if encoded else ""
+    except Exception:
+        return False, ""
+    return True, return_to
+
+
+def _check_google_claims(claims: dict, client_id: str) -> dict:
+    """Validate issuer / audience / expiry / verified email. Raises 401."""
+    def reject(why):
+        logger.warning("google id_token rejected: %s", why)
+        raise HTTPException(status_code=401,
+                            detail="Google sign-in failed: the ID token is not valid.")
+
+    if not isinstance(claims, dict) or not claims:
+        reject("empty claims")
+    if claims.get("iss") not in GOOGLE_ISSUERS:
+        reject(f"issuer {claims.get('iss')!r}")
+    aud = claims.get("aud")
+    if client_id and aud != client_id:
+        # A token minted for a different app must never authenticate here.
+        reject(f"audience {aud!r} != our client id")
+    try:
+        exp = int(claims.get("exp", 0))
+    except (TypeError, ValueError):
+        exp = 0
+    if exp and exp < time.time() - 60:
+        reject("expired")
+    if not claims.get("email"):
+        reject("no email claim")
+    verified = claims.get("email_verified")
+    if verified in (False, "false", "False", 0, "0"):
+        reject("email not verified by Google")
+    if not claims.get("sub"):
+        reject("no subject claim")
+    return claims
+
+
+_google_jwk_client = None
+
+
+def _verify_google_id_token(id_token: str, trusted_channel: bool = False) -> dict:
+    """Return the verified claims of a Google ID token.
+
+    Three routes, in order of preference:
+
+    1. Verify the RS256 signature locally against Google's JWKS. Needs
+       ``cryptography`` (PyJWT's RSA backend); it is not in requirements.txt, so
+       this is skipped unless the deployment happens to have it.
+    2. Ask Google to validate it (``/tokeninfo``). One HTTPS round trip, no
+       extra dependency — this is the route used for tokens supplied by a
+       *client* (POST /auth/google/token), which must never be trusted unchecked.
+    3. Decode without signature verification — only for ``trusted_channel``
+       tokens, i.e. ones we just received in our own TLS response from Google's
+       token endpoint. Google documents this case as safe
+       (developers.google.com/identity/openid-connect/openid-connect#obtainuserinfo);
+       the claims below are still validated either way.
+    """
+    cfg = _google_config()
+    client_id = cfg.get("client_id", "")
+    claims = None
+
+    global _google_jwk_client
+    try:
+        import cryptography  # noqa: F401  (PyJWT needs it for RS256)
+        if _google_jwk_client is None:
+            _google_jwk_client = jwt.PyJWKClient(GOOGLE_CERTS_URL)
+        key = _google_jwk_client.get_signing_key_from_jwt(id_token).key
+        claims = jwt.decode(id_token, key, algorithms=["RS256"],
+                            audience=client_id or None,
+                            options={"verify_aud": bool(client_id)})
+    except ImportError:
+        claims = None
+    except jwt.PyJWTError as exc:
+        logger.warning("google id_token signature check failed: %s", exc)
+        raise HTTPException(status_code=401,
+                            detail="Google sign-in failed: the ID token is not valid.")
+    except Exception as exc:  # JWKS fetch problems must not block sign-in
+        logger.warning("google JWKS unavailable (%s) — falling back to tokeninfo", exc)
+        claims = None
+
+    if claims is None and not trusted_channel:
+        try:
+            resp = requests.get(GOOGLE_TOKENINFO_ENDPOINT,
+                                params={"id_token": id_token}, timeout=10)
+        except requests.RequestException as exc:
+            logger.warning("google tokeninfo unreachable: %s", exc)
+            raise HTTPException(status_code=503,
+                                detail="Could not reach Google to verify the sign-in. Try again.")
+        if resp.status_code != 200:
+            logger.warning("google tokeninfo rejected the token: HTTP %s %s",
+                           resp.status_code, resp.text[:200])
+            raise HTTPException(status_code=401,
+                                detail="Google sign-in failed: the ID token is not valid.")
+        claims = resp.json()
+        # tokeninfo stringifies everything; normalise the one field we branch on.
+        if isinstance(claims.get("email_verified"), str):
+            claims["email_verified"] = claims["email_verified"].lower() == "true"
+
+    if claims is None:
+        try:
+            claims = jwt.decode(id_token, options={"verify_signature": False})
+        except jwt.PyJWTError as exc:
+            logger.warning("google id_token could not be decoded: %s", exc)
+            raise HTTPException(status_code=401,
+                                detail="Google sign-in failed: the ID token is not valid.")
+
+    return _check_google_claims(claims, client_id)
+
+
+def _unique_username(cur, base: str) -> str:
+    """A username derived from the Google profile that isn't taken yet."""
+    base = re.sub(r"\s+", " ", (base or "").strip()) or "swapify user"
+    candidate = base[:40]
+    for suffix in range(0, 200):
+        trial = candidate if suffix == 0 else f"{candidate} {suffix}"
+        cur.execute("SELECT 1 FROM users WHERE lower(username) = lower(?)", (trial,))
+        if not cur.fetchone():
+            return trial
+    return f"{candidate} {secrets.token_hex(3)}"  # pragma: no cover - absurd collision
+
+
+def _upsert_google_user(claims: dict) -> dict:
+    """Find, link or create the account behind a verified Google identity.
+
+    Matching order matters: Google's ``sub`` first (stable even if the person
+    changes their Gmail address), then the email address — which links an
+    existing password account to Google rather than creating a duplicate row
+    that would strand their scan history.
+    """
+    google_id = str(claims["sub"])
+    email = claims["email"]
+    name = (claims.get("name") or "").strip() or email.split("@")[0]
+    picture = claims.get("picture")
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT * FROM users WHERE google_id = ?", (google_id,))
+        row = cur.fetchone()
+        created = False
+        linked = False
+
+        if row is None:
+            cur.execute("SELECT * FROM users WHERE lower(email) = lower(?)", (email,))
+            row = cur.fetchone()
+            if row is not None:
+                cur.execute("UPDATE users SET google_id = ?, avatar_url = COALESCE(?, avatar_url) "
+                            "WHERE id = ?", (google_id, picture, row["id"]))
+                linked = True
+
+        if row is None:
+            # No password login for a Google-created account: store a hash of a
+            # random secret nobody holds. The column is NOT NULL, and a real
+            # bcrypt hash keeps /login's checkpw on its normal path (a sentinel
+            # string would make it raise instead of returning False). The person
+            # can still use "forgot password" to add one.
+            placeholder = bcrypt.hashpw(secrets.token_urlsafe(32).encode("utf-8"),
+                                        bcrypt.gensalt()).decode("utf-8")
+            username = _unique_username(cur, name)
+            cur.execute(
+                "INSERT INTO users (username, email, password_hash, google_id, "
+                "auth_provider, avatar_url) VALUES (?, ?, ?, ?, 'google', ?)",
+                (username, email, placeholder, google_id, picture),
+            )
+            user_id = cur.lastrowid
+            created = True
+            conn.commit()
+            cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+        else:
+            conn.commit()
+
+        user = dict(row)
+    finally:
+        conn.close()
+
+    logger.info("google sign-in: %s (%s)", _mask_email(email),
+                "new account" if created else ("linked to existing account" if linked
+                                               else "existing account"))
+    return {
+        "user_id": user["id"],
+        "username": user["username"],
+        "email": user["email"],
+        "avatar_url": user.get("avatar_url") or picture,
+        "is_new_user": created,
+        "linked_existing_account": linked,
+    }
+
+
+@app.get("/auth/google/config")
+def google_oauth_config():
+    """What the frontend needs to render a Google button (no secrets)."""
+    cfg = _google_config()
+    return {
+        "configured": cfg["configured"],
+        "client_id": cfg["client_id"],       # public by design
+        "redirect_uri": cfg["redirect_uri"],
+        "login_url": f"{APP_BASE_URL}/auth/google/login",
+        "scopes": GOOGLE_SCOPES.split(),
+        "credentials_source": cfg["source"],
+    }
+
+
+@app.get("/auth/google/login")
+@app.get("/auth/google")
+def google_login(return_to: str = "", flow: str = ""):
+    """Start Google sign-in — 302 to Google's consent screen.
+
+    ``return_to`` is where the browser lands afterwards with the token; it must
+    be an origin already trusted for CORS (see ``_allowed_redirect``), otherwise
+    it is ignored rather than honoured. ``flow=popup`` makes the callback hand
+    the token back through ``postMessage`` instead of a redirect.
+    """
+    cfg = _require_google_config()
+    target = return_to.strip()
+    if target and not _allowed_redirect(target):
+        logger.warning("google login: ignoring untrusted return_to %r", target)
+        target = ""
+    state_payload = f"popup|{target}" if flow == "popup" else f"redirect|{target}"
+    params = {
+        "client_id": cfg["client_id"],
+        "redirect_uri": cfg["redirect_uri"],
+        "response_type": "code",
+        "scope": GOOGLE_SCOPES,
+        "state": _make_oauth_state(state_payload),
+        "access_type": "online",
+        # Always show the chooser: without it a shared browser silently reuses
+        # whichever Google account is already signed in.
+        "prompt": "select_account",
+    }
+    return RedirectResponse(
+        f"{GOOGLE_AUTH_ENDPOINT}?{urllib.parse.urlencode(params)}", status_code=302)
+
+
+# Popup close-out page: hands the token to the window that opened it. Rendered
+# only for origins that passed _allowed_redirect, and postMessage is targeted at
+# that exact origin (never "*") so no other frame can read the token.
+_OAUTH_POPUP_HTML = """\
+<!doctype html><html><head><meta charset="utf-8"><title>Signing you in…</title>
+<style>body{font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f5f4fb;
+ display:flex;align-items:center;justify-content:center;height:100vh;margin:0;color:#444}
+ .b{background:#fff;padding:26px 32px;border-radius:14px;box-shadow:0 8px 30px rgba(30,20,80,.10);text-align:center}
+ .l{font-size:22px;font-weight:800;color:#5b3df5;margin-bottom:6px}</style></head>
+<body><div class="b"><div class="l">Swapify</div><div id="m">__MESSAGE__</div></div>
+<script>
+var PAYLOAD = __PAYLOAD__;
+var TARGET = __TARGET__;
+try{
+  if(window.opener){
+    window.opener.postMessage(Object.assign({source:'swapify-oauth'}, PAYLOAD), TARGET || location.origin);
+    setTimeout(function(){ window.close(); }, 300);
+  } else if(TARGET){
+    var frag = Object.keys(PAYLOAD).map(function(k){ return k+'='+encodeURIComponent(PAYLOAD[k]); }).join('&');
+    location.replace(TARGET + '#' + frag);
+  }
+}catch(e){ document.getElementById('m').textContent = 'Signed in. You can close this window.'; }
+</script></body></html>"""
+
+
+def _oauth_result_page(payload: dict, target: str, message: str) -> HTMLResponse:
+    return HTMLResponse(
+        _OAUTH_POPUP_HTML
+        .replace("__PAYLOAD__", json.dumps(payload))
+        .replace("__TARGET__", json.dumps(target or ""))
+        .replace("__MESSAGE__", html.escape(message))
+    )
+
+
+@app.get("/auth/google/callback")
+def google_callback(code: str = "", state: str = "", error: str = ""):
+    """Google redirects here. Exchanges the code and issues a Swapify JWT."""
+    cfg = _require_google_config()
+    state_ok, state_payload = _read_oauth_state(state)
+    flow, _, return_to = state_payload.partition("|")
+    if return_to and not _allowed_redirect(return_to):  # defence in depth
+        return_to = ""
+
+    def fail(detail: str, status_code: int = 400):
+        if flow == "popup" or return_to:
+            return _oauth_result_page({"error": detail}, return_to,
+                                      "Sign-in failed. You can close this window.")
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    if error:
+        # e.g. the user pressed "Cancel" on the consent screen.
+        return fail(f"Google sign-in was cancelled or refused ({error}).")
+    if not state_ok:
+        # Missing/forged/expired state — the CSRF guard for this flow.
+        return fail("Invalid or expired sign-in state. Start the sign-in again.")
+    if not code:
+        return fail("Google did not return an authorization code.")
+
+    try:
+        token_resp = requests.post(
+            GOOGLE_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": cfg["client_id"],
+                "client_secret": cfg["client_secret"],
+                "redirect_uri": cfg["redirect_uri"],
+                "grant_type": "authorization_code",
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        logger.warning("google token exchange unreachable: %s", exc)
+        return fail("Could not reach Google to complete sign-in. Try again.", 503)
+
+    if token_resp.status_code != 200:
+        body = token_resp.text[:300]
+        logger.warning("google token exchange failed: HTTP %s %s",
+                       token_resp.status_code, body)
+        hint = ""
+        if "redirect_uri_mismatch" in body:
+            hint = (f" The redirect URI this server sends ({cfg['redirect_uri']}) is "
+                    "not on the client's authorised list in Google Cloud Console.")
+        return fail(f"Google rejected the authorization code.{hint}")
+
+    payload = token_resp.json()
+    id_token = payload.get("id_token")
+    if id_token:
+        # Straight from Google's token endpoint over TLS — trusted channel.
+        claims = _verify_google_id_token(id_token, trusted_channel=True)
+    else:
+        access_token = payload.get("access_token")
+        if not access_token:
+            return fail("Google returned neither an ID token nor an access token.")
+        info = requests.get(GOOGLE_USERINFO_ENDPOINT,
+                            headers={"Authorization": f"Bearer {access_token}"},
+                            timeout=10)
+        if info.status_code != 200:
+            return fail("Could not read the Google profile for this sign-in.")
+        claims = info.json()
+        claims.setdefault("iss", "https://accounts.google.com")
+        claims.setdefault("aud", cfg["client_id"])
+        claims = _check_google_claims(claims, cfg["client_id"])
+
+    account = _upsert_google_user(claims)
+    access_token = _create_access_token(account["user_id"], account["username"])
+    result = {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "provider": "google",
+        "user_id": account["user_id"],
+        "username": account["username"],
+        "email": account["email"],
+        "is_new_user": account["is_new_user"],
+    }
+
+    if flow == "popup" or return_to:
+        return _oauth_result_page(result, return_to,
+                                  "Signed in. You can close this window.")
+    # No frontend to hand off to (direct browser/API test): show the result.
+    return JSONResponse(result)
+
+
+@app.post("/auth/google/token")
+def google_token_login(body: GoogleTokenLogin):
+    """Sign in with an ID token obtained by the client (Google Identity Services).
+
+    The token arrives from an untrusted source, so its signature is verified
+    (against Google's JWKS, or by Google's own tokeninfo endpoint) before any
+    account is touched.
+    """
+    _require_google_config()
+    id_token = (body.credential or body.id_token or "").strip()
+    if not id_token:
+        raise HTTPException(
+            status_code=400,
+            detail="Send the Google ID token as 'credential' (or 'id_token').")
+
+    claims = _verify_google_id_token(id_token, trusted_channel=False)
+    account = _upsert_google_user(claims)
+    return {
+        "access_token": _create_access_token(account["user_id"], account["username"]),
+        "token_type": "bearer",
+        "provider": "google",
+        "user_id": account["user_id"],
+        "username": account["username"],
+        "email": account["email"],
+        "avatar_url": account["avatar_url"],
+        "is_new_user": account["is_new_user"],
+        "linked_existing_account": account["linked_existing_account"],
+    }
+
+
+@app.get("/auth/email/status")
+def auth_email_status(
+        probe: bool = False,
+        x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
+    """Is outgoing mail actually working?
+
+    Without ``probe`` this is public and says only which provider is active — a
+    password-reset feature that quietly writes to ``outbox/`` looks identical to
+    one that sends real mail, and this is how you tell them apart. ``probe=true``
+    opens a real SMTP session (and so exposes the server/username and the
+    provider's error text), which is why it needs the admin token.
+    """
+    provider = _email_provider()
+    body = {
+        "provider": provider,
+        "can_send_real_email": provider in ("sendgrid", "smtp"),
+        "password_reset_ttl_minutes": PASSWORD_RESET_TTL_MINUTES,
+        "reset_link_base": PASSWORD_RESET_URL_BASE,
+        "token_exposed_in_response": _reset_token_exposed(),
+    }
+    if provider == "outbox":
+        # If SMTP is half-configured, say exactly what is missing — "no provider"
+        # is misleading when the real answer is "SMTP_PASSWORD is empty".
+        detail = weekly_digest.provider_note() if weekly_digest is not None else ""
+        body["note"] = detail or (
+            "No mail provider configured — reset emails are written to the "
+            "outbox/ folder as .eml files instead of being sent. Set "
+            "SMTP_HOST/SMTP_USER/SMTP_PASSWORD (or SENDGRID_API_KEY).")
+    if not probe:
+        return body
+
+    expected = (os.environ.get("ADMIN_TOKEN") or "swapify-admin-dev").strip()
+    if not (x_admin_token and hmac.compare_digest(x_admin_token.strip(), expected)):
+        raise HTTPException(
+            status_code=403,
+            detail="probe=true requires the shared secret in the 'X-Admin-Token' header.",
+        )
+    if weekly_digest is None:  # pragma: no cover - the module is bundled
+        body["probe"] = {"ok": False, "reason": "email module not importable"}
+        return body
+    body["probe"] = weekly_digest.smtp_check()
+    return body
 
 
 def fetch_off_product(barcode: str):
@@ -1256,6 +2375,45 @@ AUTOFILL_TOTAL_BUDGET_S = float(os.environ.get("SWAPIFY_AUTOFILL_BUDGET", "6"))
 # own and is never allowed to blow the per-scan budget.
 AI_ESTIMATE_TIMEOUT_S = float(os.environ.get("SWAPIFY_AI_ESTIMATE_TIMEOUT", "4"))
 
+# --- Google / web safety net (Task 2) ----------------------------------------
+# The net used to be "SerpApi, else ask an LLM". SerpApi needs a paid key that is
+# not set anywhere (and never was), so in practice EVERY product that got this
+# far fell through to a free-tier LLM estimate that is usually rate-limited and
+# returns nothing — which is exactly why "products with missing data are not
+# being fetched from Google". The net now runs a provider chain and the last
+# provider needs no key at all, so it works out of the box:
+#
+#   1. SerpApi                     (SERPAPI_KEY)                  - if configured
+#   2. Google Programmable Search  (GOOGLE_API_KEY + GOOGLE_CSE_ID) - if configured
+#   3. DuckDuckGo HTML endpoint    (no key)                       - always available
+#
+# Whatever the provider returns is mined for nutrition twice: first from the
+# result snippets (free), then — only if a score-driving nutrient is still
+# missing — by fetching the top result pages and parsing their nutrition tables.
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "").strip()
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "").strip()
+WEB_SEARCH_ENABLED = os.environ.get("SWAPIFY_WEB_SEARCH", "1") not in ("0", "false", "False", "")
+WEB_SEARCH_RESULTS = int(os.environ.get("SWAPIFY_WEB_SEARCH_RESULTS", "8"))
+# How many result pages we may open when the snippets alone don't carry a full
+# nutrition panel. Fetched in parallel and bounded by the web-net budget below.
+WEB_PAGE_FETCH_LIMIT = int(os.environ.get("SWAPIFY_WEB_PAGES", "4"))
+WEB_PAGE_TIMEOUT_S = float(os.environ.get("SWAPIFY_WEB_PAGE_TIMEOUT", "5"))
+# The safety net gets a budget of its OWN rather than the crumbs left over from
+# the shared per-scan budget. It only ever runs for a product that no structured
+# source could describe at all, and against a 6s chain budget already spent on
+# OFF + USDA it was routinely handed <1s — far too little to search the web and
+# read a page, so it always came back empty. Extending here keeps fast scans fast
+# (a product OFF knows never reaches this code) while giving the genuinely
+# unknown pack a realistic chance of being resolved once, after which it is
+# stored and every later scan is local.
+WEB_NET_BUDGET_S = float(os.environ.get("SWAPIFY_WEB_NET_BUDGET", "12"))
+_WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+# Web results for the same product don't change between scans; caching them keeps
+# a retry (or a second user scanning the same unknown pack) off the network.
+_web_nutrition_cache = TTLCache(
+    maxsize=512, ttl=int(os.environ.get("SWAPIFY_WEB_NET_TTL", "3600")))
+
 # Negative-resolution cache (Issue 1): a barcode that resolves to *nothing*
 # anywhere is remembered for a short while so repeat scans of the same unknown
 # pack return a fast 404 instead of re-running the whole (slow) fallback chain
@@ -1295,27 +2453,41 @@ AUTOCOMPLETE_EXTERNAL_TIMEOUT_S = float(
 AUTOCOMPLETE_EXTERNAL_MIN_CHARS = int(
     os.environ.get("SWAPIFY_AUTOCOMPLETE_EXTERNAL_MIN_CHARS", "3"))
 
-# Category *browsing* pulls a far deeper slice of OFF than a name search does.
-# Browsing a category is a "show me everything" gesture: capping it at the 20-hit
-# search default meant the categories page only ever showed our own rows plus a
-# token 20 per category, which is what made the section look frozen at the size of
-# our catalogue. One Search-a-licious request returns up to 250 products, so the
-# default below is a single round-trip; higher values page in parallel.
-CATEGORY_EXTERNAL_LIMIT = max(0, min(
-    int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_LIMIT", "200")), 1000))
+# Category *browsing* is a "show me everything" gesture, so it is NOT capped at a
+# fixed number of Open Food Facts products any more. ``/products/by-category``
+# addresses OFF's catalogue by (offset, limit) and fetches the page the client
+# actually asked for, so a category is browsable to the depth OFF will serve
+# rather than to the depth we happened to pre-fetch. This value survives only as
+# the default page size for callers that just want the head of a category
+# (autocomplete top-ups, "alternatives"); 0 disables the external half entirely.
+CATEGORY_EXTERNAL_LIMIT = max(0, int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_LIMIT", "200")))
 CATEGORY_EXTERNAL_TIMEOUT_S = float(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TIMEOUT", "8"))
 # Category pages get their own cache rather than sharing the name-search one: a
 # page is ~0.1 MB and costs a couple of seconds to build, so it must not be evicted
 # by a burst of ad-hoc searches, and OFF's catalogue for a whole category moves far
 # too slowly to be worth re-fetching every 5 minutes.
 _category_external_cache = TTLCache(
-    maxsize=64, ttl=int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TTL", "1800")))
+    maxsize=256, ttl=int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TTL", "1800")))
 _OFF_MAX_PAGE_SIZE = 250  # Search-a-licious' per-request ceiling
-# OFF repeats the odd barcode across pages and some hits normalise away (no name,
-# no nutrition at all), so ask for more than we need — the categories listing
-# advertises CATEGORY_EXTERNAL_LIMIT as the browsable count and should be able to
-# deliver it.
-_OFF_CATEGORY_OVERFETCH = 1.25
+# Fixed page size for category paging: every (offset, limit) a client asks for is
+# served out of these pages, so two clients paging differently still share cache
+# entries instead of each forking their own buffer. 100 keeps a single page cheap
+# to fetch and score while covering the common limit=50 in one request.
+_OFF_CATEGORY_PAGE_SIZE = max(10, min(
+    int(os.environ.get("SWAPIFY_OFF_PAGE_SIZE", "100")), _OFF_MAX_PAGE_SIZE))
+# Open Food Facts' search index answers at most this many matches for a query
+# (page * page_size beyond it is an HTTP 400), so it is both the deepest a
+# category can be paged and the point at which a reported count means "or more".
+_OFF_RESULT_WINDOW = int(os.environ.get("SWAPIFY_OFF_RESULT_WINDOW", "10000"))
+
+# Exact per-category product counts from OFF, so the categories grid reports what
+# is really browsable. One cheap count request per category, cached for hours; the
+# listing endpoint fans them out in parallel under a deadline and falls back to
+# whatever it already knows rather than blocking the page on the network.
+CATEGORY_COUNT_TTL = int(os.environ.get("SWAPIFY_CATEGORY_COUNT_TTL", "21600"))
+CATEGORY_COUNT_TIMEOUT_S = float(os.environ.get("SWAPIFY_CATEGORY_COUNT_TIMEOUT", "6"))
+CATEGORY_COUNT_DEADLINE_S = float(os.environ.get("SWAPIFY_CATEGORY_COUNT_DEADLINE", "6"))
+_category_count_cache = TTLCache(maxsize=128, ttl=CATEGORY_COUNT_TTL)
 
 # Per-scan auto-fill deadline, shared with the individual source functions so each
 # network call is bounded by min(its own timeout, the budget left) — one slow
@@ -1621,9 +2793,10 @@ def _source_openfoodfacts(barcode: str, name: str):
     The name fallback only accepts a candidate that is actually relevant to the
     name we searched (see _name_is_relevant), so a loose text match can't inject
     an unrelated product's nutrition into our DB (already per-100g)."""
-    got = fetch_off_product(barcode)
-    if got is not None:
-        return got
+    if barcode:                      # name-driven resolution has no barcode to look up
+        got = fetch_off_product(barcode)
+        if got is not None:
+            return got
     name = (name or "").strip()
     if not name:
         return None
@@ -1696,113 +2869,180 @@ _OFF_CATEGORY_TAGS = {
 }
 
 
-def _off_category_page(category: str, tag: str, page: int, page_size: int):
-    """One page of raw Open Food Facts hits for a category tag (never raises)."""
+_OFF_FIELDS = ("code,product_name,product_name_en,brands,categories,"
+               "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en")
+
+
+def _off_category_query(category: str) -> str:
+    """The Search-a-licious query that selects one of our categories on OFF.
+
+    Filters go INSIDE ``q`` using Lucene syntax. Passing ``categories_tags`` as
+    its own request parameter — which is what this code used to do — is accepted
+    by the API and then silently ignored: a request for ``en:biscuits`` came back
+    with grated carrots and tinned pears, and the only reason category pages
+    looked roughly right is that the ``q`` alongside it was a plain text search
+    for the category's label. With the filter in ``q`` every hit really is in the
+    category (verified: 20/20 tagged ``en:biscuits`` vs 18/20 for the text
+    search), which is also what makes an exact result count possible."""
+    tag = _OFF_CATEGORY_TAGS.get((category or "").strip().lower())
+    if tag:
+        return f'categories_tags:"en:{tag}"'
+    # No tag mapping for this category — fall back to a text search on the label.
+    return category_label(category)
+
+
+def _off_search_page(query: str, page: int, page_size: int, label: str = ""):
+    """One page of raw Open Food Facts hits for a Search-a-licious query.
+
+    Never raises. ``label`` is only used for log messages."""
     try:
         resp = requests.get(
             "https://search.openfoodfacts.org/search",
             headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
-            params={
-                "q": category_label(category),
-                "categories_tags": f"en:{tag}",
-                "page": page,
-                "page_size": page_size,
-                "fields": (
-                    "code,product_name,product_name_en,brands,categories,"
-                    "image_front_url,image_url,nutriments,ingredients_text,ingredients_text_en"
-                ),
-            },
-            timeout=CATEGORY_EXTERNAL_TIMEOUT_S,
+            params={"q": query, "page": page, "page_size": page_size,
+                    "fields": _OFF_FIELDS},
+            timeout=_budgeted_timeout(CATEGORY_EXTERNAL_TIMEOUT_S),
         )
         if resp.status_code != 200:
-            logger.warning("OFF category fetch for %s page %s: HTTP %s",
-                           category, page, resp.status_code)
+            logger.warning("OFF fetch for %s page %s: HTTP %s",
+                           label or query, page, resp.status_code)
             return []
         data = resp.json() or {}
         return data.get("hits") or data.get("products") or []
     except (requests.RequestException, ValueError) as exc:
-        logger.warning("OFF category fetch failed for %s page %s: %s", category, page, exc)
+        logger.warning("OFF fetch failed for %s page %s: %s", label or query, page, exc)
         return []
 
 
-def _off_category_products(category: str, limit: int = None):
-    """Scored Open Food Facts products for one of our categories (Issue 6).
+def _off_result_total(query: str):
+    """Total number of Open Food Facts products a query matches, or None.
 
-    Uses OFF's category facet when we have a tag mapping, otherwise a name search
-    on the human label. Returns up to ``limit`` ``(product, score, grade,
-    breakdown)`` tuples — paging through Search-a-licious (250 hits per request,
-    pages fetched in parallel) so a category page can offer OFF's catalogue rather
-    than a token handful. Cached per (category, limit) and best-effort."""
+    One cheap ``page_size=1`` request. OFF's search index reports at most
+    ``_OFF_RESULT_WINDOW`` matches, so a bigger category comes back exactly at
+    that number, meaning "this many or more" — see ``_off_category_total``."""
+    try:
+        resp = requests.get(
+            "https://search.openfoodfacts.org/search",
+            headers={"User-Agent": "Swapify/1.0 (health-scanner; contact: dhruvrwt1211@gmail.com)"},
+            params={"q": query, "page_size": 1, "fields": "code"},
+            timeout=_budgeted_timeout(CATEGORY_COUNT_TIMEOUT_S),
+        )
+        if resp.status_code != 200:
+            return None
+        count = (resp.json() or {}).get("count")
+        return int(count) if count is not None else None
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+
+
+def _off_category_total(category: str):
+    """How many Open Food Facts products a category really holds, or None.
+
+    Cached for ``SWAPIFY_CATEGORY_COUNT_TTL`` (OFF's catalogue does not move
+    minute to minute). This replaced advertising ``CATEGORY_EXTERNAL_LIMIT`` as
+    the count, which is how the categories page came to claim a few hundred
+    products for a catalogue of millions: the number shown was our own fetch cap,
+    not anything about Open Food Facts."""
+    category = (category or "").strip().lower()
+    if not category or category == "other" or not EXTERNAL_SEARCH_ENABLED:
+        return 0
+    if category in _category_count_cache:
+        return _category_count_cache[category]
+    total = _off_result_total(_off_category_query(category))
+    if total is not None:
+        _category_count_cache[category] = total
+    return total
+
+
+def _off_category_slice(category: str, offset: int, count: int):
+    """Scored Open Food Facts products for one page of a category.
+
+    ``(offset, count)`` addresses OFF's catalogue directly rather than our own
+    fetched buffer, so browsing is not capped at "the first N we downloaded" —
+    page 40 of biscuits fetches OFF's page 40. Returns a list of ``(product,
+    score, grade, breakdown)``; short or empty when OFF is unreachable or the
+    offset is past the end. Cached per (query, page) and best-effort."""
     category = (category or "").strip().lower()
     # "other" is the taxonomy's "no known peers" bucket, not a real category —
     # searching OFF for "Other" would return noise, so it stays DB-only.
     if not category or category == "other" or not EXTERNAL_SEARCH_ENABLED:
         return []
-    limit = CATEGORY_EXTERNAL_LIMIT if limit is None else limit
-    if limit <= 0:
+    count = max(0, int(count))
+    offset = max(0, int(offset))
+    if count <= 0 or offset >= _OFF_RESULT_WINDOW:
         return []
-    key = (category, limit)
-    cached = _category_external_cache.get(key)
-    if cached is not None:
-        return cached
-    tag = _OFF_CATEGORY_TAGS.get(category)
-    if not tag:
-        # No tag mapping — fall back to a plain label search (still per-category-ish).
-        # Copy before tagging: those tuples are shared with the name-search cache.
-        tagged = [({**p, "category": category}, s, g, b)
-                  for p, s, g, b in _external_search_results(category_label(category), limit)]
-        _category_external_cache[key] = tagged
-        return tagged
+    count = min(count, _OFF_RESULT_WINDOW - offset)
 
-    # Search-a-licious with a categories filter (reliable JSON; the legacy
-    # search.pl facet endpoint returns rate-limit HTML — see _off_search_by_name).
-    want = min(int(limit * _OFF_CATEGORY_OVERFETCH) + 1, _OFF_MAX_PAGE_SIZE * 4)
-    page_size = min(want, _OFF_MAX_PAGE_SIZE)
-    n_pages = max(1, -(-want // page_size))  # ceil
-    if n_pages == 1:
-        pages = [_off_category_page(category, tag, 1, page_size)]
-    else:
-        # Sequential paging would multiply the timeout by the page count on a cold
-        # cache; these are independent GETs, so fan them out.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(n_pages, 4)) as pool:
-            pages = list(pool.map(
-                lambda pg: _off_category_page(category, tag, pg, page_size),
-                range(1, n_pages + 1),
-            ))
+    query = _off_category_query(category)
+    # Fixed page size so the same underlying pages are reused (and cached) no
+    # matter what limit/offset a client happens to ask for.
+    page_size = _OFF_CATEGORY_PAGE_SIZE
+    first_page = offset // page_size + 1
+    last_page = (offset + count - 1) // page_size + 1
 
-    cands, seen = [], set()
-    for products in pages:
-        for p in products:
+    def _page(page):
+        key = (query, page, page_size)
+        cached = _category_external_cache.get(key)
+        if cached is not None:
+            return cached
+        raw = _off_search_page(query, page, page_size, label=category)
+        cands, seen = [], set()
+        for p in raw:
             code = p.get("code") or ""
             if code and code in seen:
-                continue  # OFF can repeat a barcode across pages
+                continue      # OFF can repeat a barcode across pages
             seen.add(code)
             norm = _normalize_off_raw(p, code)
             if norm:
-                norm["category"] = category  # tag with OUR id so it groups correctly
+                norm["category"] = category   # tag with OUR id so it groups correctly
                 cands.append(norm)
-    scored = _score_external_candidates(cands, None)[:limit]
-    _category_external_cache[key] = scored
-    return scored
+        scored = _score_external_candidates(cands, None)
+        _category_external_cache[key] = scored
+        return scored
+
+    pages = range(first_page, last_page + 1)
+    if len(pages) == 1:
+        fetched = _page(first_page)
+    else:
+        # Independent GETs — fanning them out keeps a multi-page slice at the cost
+        # of one round-trip instead of one per page.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pages), 4)) as pool:
+            fetched = [row for chunk in pool.map(_page, pages) for row in chunk]
+    start = offset - (first_page - 1) * page_size
+    return fetched[start:start + count]
+
+
+def _off_category_products(category: str, limit: int = None):
+    """First ``limit`` scored Open Food Facts products in a category.
+
+    Thin wrapper over ``_off_category_slice`` for callers that only want the head
+    of a category rather than an arbitrary page of it."""
+    limit = CATEGORY_EXTERNAL_LIMIT if limit is None else limit
+    return _off_category_slice(category, 0, limit or 0)
 
 
 def _off_category_count(category: str, limit: int = None) -> int:
-    """How many Open Food Facts products category browsing will actually serve.
+    """Deprecated alias for ``_off_category_total`` (kept for callers/tests).
 
-    Exact once that category's page is cached; until then the configured ceiling,
-    which is what ``/products/by-category`` fetches on demand. Deliberately does
-    NOT hit the network: the categories listing renders one tile per category and
-    must not fan out ~25 requests to draw a grid.
-    """
-    category = (category or "").strip().lower()
-    limit = CATEGORY_EXTERNAL_LIMIT if limit is None else limit
-    if not category or category == "other" or limit <= 0 or not EXTERNAL_SEARCH_ENABLED:
-        return 0
-    cached = _category_external_cache.get((category, limit))
-    return len(cached) if cached is not None else limit
+    ``limit`` is ignored: the count is Open Food Facts' real total for the
+    category, not our fetch cap. Returns 0 rather than None when unknown."""
+    return _off_category_total(category) or 0
 
 
 # --- Source 3: USDA FoodData Central ------------------------------------------
+def _usda_gtin_matches(food: dict, barcode: str) -> bool:
+    """True when a USDA record really carries the barcode we searched for.
+
+    UPC-12 and EAN-13 are the same number with a different number of leading
+    zeros ("028400090070" == "0028400090070"), so they are compared stripped.
+    """
+    gtin = re.sub(r"\D", "", str((food or {}).get("gtinUpc") or ""))
+    bc = re.sub(r"\D", "", barcode or "")
+    if not gtin or not bc:
+        return False
+    return gtin.lstrip("0") == bc.lstrip("0")
+
+
 def _source_usda(barcode: str, name: str):
     """USDA FoodData Central: search by barcode (GTIN/UPC), then by name.
 
@@ -1829,6 +3069,16 @@ def _source_usda(barcode: str, name: str):
 
     food = _search(query)
     matched_on = "barcode" if barcode else "name"
+    # A barcode "match" here is NOT exact, despite what this code used to assume.
+    # /foods/search is full-text: it answers ANY string with a best-guess first
+    # row, and USDA's index includes literature records. Searching the barcode
+    # 0000000000000 returned the paper "A comprehensive characterization of
+    # phenolics, amino acids and other minor bioactives of selected honeys…",
+    # which was then scored and written into our products table as a real
+    # product. A genuine barcode hit is a Branded record carrying that exact
+    # GTIN, so require it and fall through to the name search when it doesn't.
+    if food and matched_on == "barcode" and not _usda_gtin_matches(food, barcode):
+        food = None
     if not food and name and query != name:
         food = _search(name)          # barcode missed -> retry on the name
         matched_on = "name"
@@ -1900,11 +3150,17 @@ _IFCT_INDEX = None
 def _load_ifct_index():
     """Lazy-load the optional IFCT 2017 dataset (528 Indian foods, NIN Hyderabad).
 
-    Looks for a JSON list at ``IFCT_DATA_PATH`` (env) or ``data/ifct2017.json``
-    beside the repo root. The dataset is not bundled — when the file is absent
-    this source is simply skipped, so the pipeline still runs. Each record:
-    ``{"name","brand","calories","sugar","protein","sodium","fiber",
-    "saturated_fat","ingredients"}`` per 100g."""
+    Reads ``IFCT_DATA_PATH`` (env) or the bundled ``data/ifct2017.json``. Accepts
+    either a bare JSON list of records or an object with a ``foods`` list, so the
+    full IFCT table can be dropped in to replace the bundled subset without any
+    code change. Each record: ``{"name","brand","calories","sugar","protein",
+    "sodium","fiber","saturated_fat","ingredients"}`` per 100g.
+
+    Nothing shipped this file until now, so ``os.path.exists`` was False on every
+    request and the IFCT step of the auto-fill chain was a silent no-op: it was
+    reported in ``sources_tried`` but could never contribute a value. An absent
+    file is still tolerated (the pipeline just skips the step), but it is now
+    logged loudly enough to notice."""
     global _IFCT_INDEX
     if _IFCT_INDEX is not None:
         return _IFCT_INDEX
@@ -1913,7 +3169,15 @@ def _load_ifct_index():
     try:
         if os.path.exists(path):
             with open(path, "r", encoding="utf-8") as fh:
-                index = json.load(fh) or []
+                data = json.load(fh)
+            if isinstance(data, dict):
+                data = data.get("foods") or data.get("records") or []
+            index = [r for r in (data or []) if isinstance(r, dict) and r.get("name")]
+            logger.info("IFCT dataset loaded: %d foods from %s", len(index), path)
+        else:
+            logger.warning(
+                "IFCT dataset missing at %s — auto-fill source 4 will contribute "
+                "nothing. Set IFCT_DATA_PATH or restore data/ifct2017.json.", path)
     except (OSError, ValueError) as exc:
         logger.warning("IFCT dataset load failed (%s): %s", path, exc)
         index = []
@@ -1922,7 +3186,15 @@ def _load_ifct_index():
 
 
 def _source_ifct(barcode: str, name: str):
-    """IFCT 2017 Indian-foods table, matched by name (per 100g)."""
+    """IFCT 2017 Indian-foods table, matched by name (per 100g).
+
+    IFCT describes *generic* foods ("Amla", "Poha", "Idli"), not branded packs,
+    so a match has to be judged the same way a fuzzy external match is (see
+    ``_name_is_relevant``): the record's name has to account for most of what the
+    product is called. Substring matching alone answered "Kapiva Wild Amla Juice"
+    with raw amla — a different food with different numbers — and, worse, filled
+    every nutrient from it so the chain stopped before the safety net ran. A
+    generic query ("Amla") still matches its generic record."""
     name = (name or "").strip().lower()
     if not name:
         return None
@@ -1932,7 +3204,9 @@ def _source_ifct(barcode: str, name: str):
     match = None
     for rec in records:
         rname = (rec.get("name") or "").strip().lower()
-        if rname and (rname in name or name in rname):
+        if not rname:
+            continue
+        if (rname in name or name in rname) and _name_is_relevant(name, rname):
             match = rec
             break
     if not match:
@@ -1952,66 +3226,629 @@ def _source_ifct(barcode: str, name: str):
     }
 
 
-# --- Source 5: Google / AI safety net -----------------------------------------
+# --- Source 5: Google / web safety net ----------------------------------------
+# Nutrition panels are written the same way everywhere ("Sugars 40 g", "Energy
+# 200 kcal", "Saturated fat 1.2g"), so one set of patterns mines both search
+# snippets and the body text of a fetched product page. `?:` groups keep group(1)
+# the number and (where present) the last group the unit.
 _NUTRI_PATTERNS = {
-    "calories_kcal_per_serving": r"(?:energy|calories|calorie)[^\d]{0,20}?(\d+(?:\.\d+)?)\s*k?cal",
-    "sugar_g_per_serving": r"sugars?\b[^\d]{0,20}?(\d+(?:\.\d+)?)\s*g",
-    "protein_g_per_serving": r"protein[^\d]{0,20}?(\d+(?:\.\d+)?)\s*g",
-    "fiber_g_per_serving": r"(?:fibre|fiber)[^\d]{0,20}?(\d+(?:\.\d+)?)\s*g",
-    "saturated_fat_g_per_serving": r"saturated[^\d]{0,25}?(\d+(?:\.\d+)?)\s*g",
-    "sodium_mg_per_serving": r"sodium[^\d]{0,20}?(\d+(?:\.\d+)?)\s*(mg|g)",
+    # kcal is preferred over kJ: match an explicit kcal/cal figure, never the kJ
+    # one that usually sits next to it (2510 kJ / 600 kcal).
+    "calories_kcal_per_serving":
+        r"(?:energy|calories|calorie|energ(?:y|ie)\s*value)[^\d\n]{0,25}?"
+        r"(\d+(?:[.,]\d+)?)\s*(?:k\s*cal|kcal|cal\b)",
+    "sugar_g_per_serving":
+        r"(?:total\s+)?sugars?(?:\s*\(.*?\))?[^\d\n]{0,25}?(\d+(?:[.,]\d+)?)\s*(?:g\b|gm\b|grams?\b)",
+    "protein_g_per_serving":
+        r"protein[s]?(?:\s*\(.*?\))?[^\d\n]{0,25}?(\d+(?:[.,]\d+)?)\s*(?:g\b|gm\b|grams?\b)",
+    "fiber_g_per_serving":
+        r"(?:dietary\s+)?(?:fibre|fiber)(?:\s*\(.*?\))?[^\d\n]{0,25}?(\d+(?:[.,]\d+)?)\s*(?:g\b|gm\b|grams?\b)",
+    "saturated_fat_g_per_serving":
+        r"saturat(?:ed|es)?[^\d\n]{0,30}?(\d+(?:[.,]\d+)?)\s*(?:g\b|gm\b|grams?\b)",
+    "sodium_mg_per_serving":
+        r"sodium(?:\s*\(.*?\))?[^\d\n]{0,25}?(\d+(?:[.,]\d+)?)\s*(mg|g)\b",
+}
+# Salt is quoted instead of sodium on most European packs; 1 g salt = 400 mg sodium.
+_SALT_PATTERN = r"\bsalt(?:\s*equivalent)?(?:\s*\(.*?\))?[^\d\n]{0,25}?(\d+(?:[.,]\d+)?)\s*(mg|g)\b"
+# Energy is the one value routinely written with the number FIRST ("200 calories",
+# "502 kcal") and, on European panels, behind a kJ figure the label-first pattern
+# above cannot step over ("Energy 2100 kJ / 502 kcal"). Applied only when that
+# pattern finds nothing, and anchored on the unit so it can't pick up a price.
+_KCAL_FALLBACK_PATTERN = r"(\d+(?:[.,]\d+)?)\s*(?:k\s?cal|calories|kilocalories)\b"
+
+# A parsed panel has to describe a *food*. These are the physical ceilings for
+# 100 g of anything edible (pure fat is 900 kcal, pure sugar 100 g/100 g); a value
+# past them means we mis-read a price, a percentage or a per-pack figure, and
+# storing it would poison both the score and the catalogue.
+_NUTRIENT_SANITY = {
+    "calories_kcal_per_serving": (0.0, 900.0),
+    "sugar_g_per_serving": (0.0, 100.0),
+    "protein_g_per_serving": (0.0, 100.0),
+    "fiber_g_per_serving": (0.0, 100.0),
+    "saturated_fat_g_per_serving": (0.0, 100.0),
+    "sodium_mg_per_serving": (0.0, 40000.0),
 }
 
 
-def _parse_nutrition_text(text: str):
-    """Pull per-100g nutrient numbers out of free-text search snippets."""
+def _sane_nutrients(values: dict) -> dict:
+    """Drop any parsed value that is not physically possible per 100 g."""
+    out = {}
+    for field, val in (values or {}).items():
+        lo, hi = _NUTRIENT_SANITY.get(field, (None, None))
+        if lo is None or (val is not None and lo <= val <= hi):
+            out[field] = val
+    return out
+
+
+def _basis_grams_ex(text: str):
+    """The reference quantity a block of nutrition text is expressed in, in grams.
+
+    Search results mix bases freely — "200 calories per 1 Bottle (500g)" sits
+    right next to "per 100 g". Reading every number as if it were per-100g (which
+    is what this parser used to do) turns a 500 g bottle's 200 kcal into a
+    200 kcal/100 g juice: a 2.5x error that then gets written into our catalogue.
+    Returns ``(grams, explicit)``. ``explicit`` says whether the text actually
+    stated a basis or we fell back to the per-100g default — which is what lets
+    the page parser prefer a block that names its own reference quantity over one
+    that merely happens to sit near some numbers."""
+    if not text:
+        return 100.0, False
+    low = text.lower()
+    if re.search(r"per\s*100\s*(?:g|gm|gram|grams|ml|millilit)", low) or re.search(
+            r"/\s*100\s*(?:g|ml)\b", low):
+        return 100.0, True
+    # "Serving size 1 Bottle 500 g" / "per 1 Bottle (500g)" / "per serve (30 g)":
+    # the quantity can trail a descriptive prefix, so scan a short window after
+    # the anchor for the first number that carries a weight/volume unit. A bare
+    # count ("1 Bottle", "2 cookies") has no unit and is skipped; the window is
+    # kept tight so the panel's own first value ("Energy 150 kcal, Protein 2.5 g")
+    # can never be mistaken for the serving size.
+    for anchor in (r"(?:serving\s*size|per\s*serve|per\s*serving|serving)\b",
+                   r"\bper\s+(?:\d+\s+)?[a-z]{2,12}\b"):
+        m = re.search(anchor, low)
+        if not m:
+            continue
+        window = low[m.end():m.end() + 60]
+        found = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:g\b|gm\b|grams?\b|ml\b|millilitres?\b)", window)
+        if found:
+            try:
+                grams = float(found.group(1).replace(",", "."))
+                if 1.0 <= grams <= 5000.0:
+                    return grams, True
+            except (TypeError, ValueError):
+                pass
+    return 100.0, False
+
+
+def _basis_grams(text: str) -> float:
+    """The reference quantity alone, in grams (see ``_basis_grams_ex``)."""
+    return _basis_grams_ex(text)[0]
+
+
+# Where a nutrition panel starts on a page. Parsing is anchored on these rather
+# than run over the whole document (see _parse_nutrition_page).
+_PANEL_ANCHORS = re.compile(
+    r"(?i)(nutrition(?:al)?\s+(?:facts|information|value)|serving\s*size|"
+    r"amount\s+per\s+serving|per\s*100\s*(?:g|ml)\b|proper\s+nutrients)")
+_PANEL_WINDOW = 1200          # a panel is a few hundred characters; this is generous
+
+
+def _parse_nutrition_page(text: str):
+    """Parse the nutrition panel out of a whole page's text.
+
+    Deliberately NOT a parse of the whole document: a product page carries
+    several reference quantities at once — a "per 100g" heading in one section, a
+    "Serving size 1 Bottle 500 g" panel in another — and running the basis
+    detector over all of it picks whichever appears first and then applies it to
+    numbers that belong to the other. That is how a 500 g bottle's "Sugars 40 g"
+    became 40 g per 100 g. Instead, take a window around each panel anchor, parse
+    each window under its OWN basis, and keep the best result — a block that
+    states its reference quantity always beating one that does not, because on a
+    real product page the FAQ prose repeating "200 calories" sits above the panel
+    that says those 200 calories are for a 500 g bottle."""
+    if not text:
+        return None
+    best, best_rank = None, None
+    for m in _PANEL_ANCHORS.finditer(text):
+        window = text[max(0, m.start() - 120):m.start() + _PANEL_WINDOW]
+        _grams, explicit = _basis_grams_ex(window)
+        parsed = _parse_nutrition_text(window)
+        if not parsed:
+            continue
+        rank = (1 if explicit else 0, len(parsed))
+        if best_rank is None or rank > best_rank:
+            best, best_rank = parsed, rank
+    return best
+
+
+def _parse_nutrition_text(text: str, basis_g: float = None):
+    """Mine per-100g nutrient values out of free text (a snippet or a page body).
+
+    ``basis_g`` overrides the auto-detected reference quantity. Returns a dict of
+    our per-100g field names, or None when nothing usable was found."""
     if not text:
         return None
     text_l = text.lower()
+    basis = float(basis_g) if basis_g else _basis_grams(text_l)
+    factor = 100.0 / basis if basis and basis > 0 else 1.0
+
     out = {}
     for field, pat in _NUTRI_PATTERNS.items():
         m = re.search(pat, text_l)
         if not m:
             continue
         try:
-            val = float(m.group(1))
+            val = float(m.group(1).replace(",", "."))
         except (TypeError, ValueError):
             continue
         if field == "sodium_mg_per_serving" and m.lastindex and m.group(m.lastindex) == "g":
-            val *= 1000.0             # snippet reported sodium in grams
-        out[field] = val
+            val *= 1000.0             # panel reported sodium in grams
+        out[field] = round(val * factor, 2)
+
+    if "calories_kcal_per_serving" not in out:
+        # ...then the unit-less US style ("Calories 120"). Two digits minimum so
+        # the counter in "calories per 1 bottle" cannot be read as an energy value.
+        for pat in (_KCAL_FALLBACK_PATTERN, r"calories[^\d\n]{0,10}?(\d{2,4}(?:[.,]\d+)?)\b"):
+            m = re.search(pat, text_l)
+            if m:
+                try:
+                    out["calories_kcal_per_serving"] = round(
+                        float(m.group(1).replace(",", ".")) * factor, 2)
+                    break
+                except (TypeError, ValueError):
+                    pass
+
+    if "sodium_mg_per_serving" not in out:
+        m = re.search(_SALT_PATTERN, text_l)
+        if m:
+            try:
+                salt = float(m.group(1).replace(",", "."))
+                if m.group(2) == "mg":
+                    salt /= 1000.0
+                out["sodium_mg_per_serving"] = round(salt * 400.0 * factor, 2)
+            except (TypeError, ValueError):
+                pass
+
+    out = _sane_nutrients(out)
     return out or None
 
 
-def _serpapi_nutrition(query: str, barcode: str):
-    """Structured Google results via SerpApi; parse nutrition from the snippets."""
+# --- Web search providers (first one that answers wins) -----------------------
+def _web_timeout(cap: float = None):
+    """requests timeout for a web-net call, inside whatever budget is left."""
+    cap = EXTERNAL_SOURCE_TIMEOUT_S if cap is None else cap
+    return _budgeted_timeout(min(cap, _autofill_remaining()))
+
+
+def _serpapi_results(query: str, limit: int):
+    """Google results via SerpApi (paid key). Returns [] when unavailable."""
+    if not SERPAPI_KEY:
+        return []
     try:
         r = requests.get(
             "https://serpapi.com/search.json",
-            params={
-                "engine": "google",
-                "q": f"{query} {barcode} nutrition facts per 100g".strip(),
-                "api_key": SERPAPI_KEY,
-                "num": 5,
-            },
-            timeout=_budgeted_timeout(min(EXTERNAL_SOURCE_TIMEOUT_S, _autofill_remaining())),
+            params={"engine": "google", "q": query, "api_key": SERPAPI_KEY, "num": limit},
+            timeout=_web_timeout(),
         )
         if r.status_code != 200:
-            return None
+            return []
         data = r.json() or {}
     except (requests.RequestException, ValueError):
+        return []
+    out = []
+    answer = data.get("answer_box")
+    if isinstance(answer, dict):
+        # The answer box is Google's own extraction — often the nutrition panel
+        # itself, so it is worth more than any organic snippet.
+        out.append({"title": answer.get("title") or query,
+                    "url": answer.get("link") or "",
+                    "snippet": json.dumps(answer)[:2000]})
+    for res in (data.get("organic_results") or [])[:limit]:
+        out.append({"title": res.get("title") or "", "url": res.get("link") or "",
+                    "snippet": res.get("snippet") or ""})
+    return out
+
+
+def _google_cse_results(query: str, limit: int):
+    """Google Programmable Search (official JSON API). Returns [] when unavailable."""
+    if not (GOOGLE_API_KEY and GOOGLE_CSE_ID):
+        return []
+    try:
+        r = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID, "q": query,
+                    "num": max(1, min(limit, 10))},
+            timeout=_web_timeout(),
+        )
+        if r.status_code != 200:
+            logger.info("Google CSE returned HTTP %s for %r", r.status_code, query)
+            return []
+        data = r.json() or {}
+    except (requests.RequestException, ValueError):
+        return []
+    return [{"title": it.get("title") or "", "url": it.get("link") or "",
+             "snippet": it.get("snippet") or ""}
+            for it in (data.get("items") or [])[:limit]]
+
+
+_DDG_LINK_RE = re.compile(r'result__a"[^>]*href="([^"]+)"')
+_DDG_SNIPPET_RE = re.compile(r'result__snippet"[^>]*>(.*?)</a>', re.S)
+_DDG_LITE_ROW_RE = re.compile(
+    r'(?is)<a[^>]+class="result-link"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
+    r'class="result-snippet"[^>]*>(.*?)</td>')
+_MOJEEK_RE = re.compile(r'(?is)<a href="(https?://[^"]+)"[^>]*class="ob"[^>]*>(.*?)</a>.*?<p class="s">(.*?)</p>')
+
+
+def _strip_html(fragment: str) -> str:
+    """Tags out, entities decoded, whitespace collapsed."""
+    text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", fragment or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _ddg_target(href: str) -> str:
+    """Unwrap DuckDuckGo's /l/?uddg=<encoded> redirect into the real URL."""
+    href = html.unescape(href or "")
+    m = re.search(r"[?&]uddg=([^&]+)", href)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    if href.startswith("//"):
+        return "https:" + href
+    return href
+
+
+def _browser_headers():
+    """Headers a plain scraper needs to look like a browser rather than a bot."""
+    return {
+        "User-Agent": _WEB_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def _duckduckgo_results(query: str, limit: int):
+    """Keyless web search via DuckDuckGo's HTML endpoint.
+
+    DuckDuckGo answers a burst of scripted requests with a 202 "challenge" page
+    instead of results, so the caller treats an empty list as "try the next
+    provider" rather than "this product has no data"."""
+    try:
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query, "kl": "wt-wt"},
+            headers={**_browser_headers(), "Referer": "https://duckduckgo.com/"},
+            timeout=_web_timeout(),
+        )
+    except requests.RequestException as exc:
+        logger.info("DuckDuckGo search failed for %r: %s", query, exc)
+        return []
+    if r.status_code != 200 or "result__a" not in r.text:
+        logger.info("DuckDuckGo gave no results for %r (HTTP %s)", query, r.status_code)
+        return []
+    links = _DDG_LINK_RE.findall(r.text)
+    snippets = [_strip_html(s) for s in _DDG_SNIPPET_RE.findall(r.text)]
+    out = []
+    for i, href in enumerate(links[:limit]):
+        snippet = snippets[i] if i < len(snippets) else ""
+        # DuckDuckGo's markup carries the title inside the same anchor as the
+        # link; the snippet alone is enough to judge relevance, and the URL
+        # supplies the rest (brand domains name the product).
+        out.append({"title": snippet[:120], "url": _ddg_target(href), "snippet": snippet})
+    return out
+
+
+def _duckduckgo_lite_results(query: str, limit: int):
+    """DuckDuckGo's Lite endpoint — different markup and a different rate limit
+    from the HTML one, so it often answers when that one is challenging us."""
+    try:
+        r = requests.post(
+            "https://lite.duckduckgo.com/lite/",
+            data={"q": query, "kl": "wt-wt"},
+            headers={**_browser_headers(), "Referer": "https://lite.duckduckgo.com/"},
+            timeout=_web_timeout(),
+        )
+    except requests.RequestException:
+        return []
+    if r.status_code != 200:
+        return []
+    out = []
+    for href, title, snippet in _DDG_LITE_ROW_RE.findall(r.text)[:limit]:
+        out.append({"title": _strip_html(title), "url": _ddg_target(href),
+                    "snippet": _strip_html(snippet)})
+    return out
+
+
+def _bing_rss_results(query: str, limit: int):
+    """Bing's RSS output — no key, no JavaScript, and it answers when the HTML
+    page (which renders results client-side) would give us an empty shell."""
+    try:
+        r = requests.get("https://www.bing.com/search",
+                         params={"q": query, "format": "rss"},
+                         headers=_browser_headers(), timeout=_web_timeout())
+    except requests.RequestException:
+        return []
+    if r.status_code != 200:
+        return []
+    out = []
+    for item in re.findall(r"(?is)<item>(.*?)</item>", r.text)[:limit]:
+        title = re.search(r"(?is)<title>(.*?)</title>", item)
+        link = re.search(r"(?is)<link>(.*?)</link>", item)
+        desc = re.search(r"(?is)<description>(.*?)</description>", item)
+        out.append({
+            "title": _strip_html(title.group(1)) if title else "",
+            "url": html.unescape(link.group(1)).strip() if link else "",
+            "snippet": _strip_html(desc.group(1)) if desc else "",
+        })
+    return out
+
+
+def _mojeek_results(query: str, limit: int):
+    """Mojeek runs its own index and is the friendliest of the keyless engines to
+    a server-side client; last in the chain because that index is the smallest."""
+    try:
+        r = requests.get("https://www.mojeek.com/search", params={"q": query},
+                         headers=_browser_headers(), timeout=_web_timeout())
+    except requests.RequestException:
+        return []
+    if r.status_code != 200:
+        return []
+    return [{"title": _strip_html(t), "url": u, "snippet": _strip_html(s)}
+            for u, t, s in _MOJEEK_RE.findall(r.text)[:limit]]
+
+
+# Ordered: paid/official APIs first (deterministic, rate-limit-free), then the
+# keyless scrapers, so the net works with no configuration at all but gets more
+# reliable the moment a key is present.
+WEB_SEARCH_PROVIDERS = (
+    ("serpapi", _serpapi_results),
+    ("google_cse", _google_cse_results),
+    ("duckduckgo", _duckduckgo_results),
+    ("duckduckgo_lite", _duckduckgo_lite_results),
+    ("bing", _bing_rss_results),
+    ("mojeek", _mojeek_results),
+)
+
+# A keyless engine that has just refused us will keep refusing for a while.
+# Remembering that skips straight to the next provider instead of spending the
+# scan's budget re-asking an engine we know is currently blocking.
+_web_provider_cooldown = TTLCache(
+    maxsize=32, ttl=int(os.environ.get("SWAPIFY_WEB_PROVIDER_COOLDOWN", "300")))
+
+
+def _web_search_iter(query: str, limit: int = None):
+    """Yield ``(provider_name, results)`` from each provider that answers.
+
+    A generator rather than a single lookup because "this engine returned ten
+    results" and "this engine returned ten *useful* results" are different
+    things: Bing's RSS answers a query about one juice with the brand's home
+    page, and the caller can only tell once it has relevance-checked them. So the
+    caller drives the chain and stops when it has something it can actually use.
+    Never raises."""
+    limit = limit or WEB_SEARCH_RESULTS
+    for name, fn in WEB_SEARCH_PROVIDERS:
+        if _autofill_remaining() <= 0:
+            return
+        if name in _web_provider_cooldown:
+            continue
+        try:
+            results = fn(query, limit)
+        except Exception as exc:      # a provider must never break the scan
+            logger.warning("web search provider %s failed for %r: %s", name, query, exc)
+            results = None
+        if results:
+            yield name, results
+        else:
+            # Blocked, throttled or simply empty — don't pay for it again on the
+            # next scan while it is in that state.
+            _web_provider_cooldown[name] = True
+
+
+def _web_search(query: str, limit: int = None):
+    """First provider that returns anything: ``(results, provider_name)``."""
+    for name, results in _web_search_iter(query, limit):
+        return results, name
+    return [], None
+
+
+# Which providers need what. Keyless entries work with no configuration but are
+# the ones search engines throttle, so "configured" and "dependable" differ.
+_WEB_PROVIDER_REQUIREMENTS = {
+    "serpapi": ("SERPAPI_KEY",),
+    "google_cse": ("GOOGLE_API_KEY", "GOOGLE_CSE_ID"),
+    "duckduckgo": (),
+    "duckduckgo_lite": (),
+    "bing": (),
+    "mojeek": (),
+}
+
+
+@app.get("/autofill/status")
+def autofill_status():
+    """Can the auto-fill chain actually reach its sources right now?
+
+    Exists because the failure mode is invisible: a product the chain cannot
+    resolve returns a plain 404, identical whether the product genuinely doesn't
+    exist or every search provider is refusing us. That ambiguity is what "the
+    Google safety net isn't fetching anything" reports come down to, and this
+    endpoint answers it in one call.
+
+    ``keyed`` providers (SerpAPI, Google Programmable Search) are the dependable
+    ones. The keyless scrapers work with no setup but get rate-limited to a
+    challenge page from a server IP, so a deployment that relies on them alone
+    will look like it works and then quietly stop.
+    """
+    providers = []
+    keyed_available = False
+    keyless_available = False
+    for name, _fn in WEB_SEARCH_PROVIDERS:
+        required = _WEB_PROVIDER_REQUIREMENTS.get(name, ())
+        missing = [k for k in required if not (os.environ.get(k) or "").strip()]
+        configured = not missing
+        entry = {
+            "provider": name,
+            "needs_key": bool(required),
+            "configured": configured,
+            "cooling_down": name in _web_provider_cooldown,
+        }
+        if missing:
+            entry["missing_env"] = missing
+        providers.append(entry)
+        if configured and not entry["cooling_down"]:
+            if required:
+                keyed_available = True
+            else:
+                keyless_available = True
+
+    ifct_path = os.environ.get("IFCT_DATA_PATH") or os.path.join(
+        _REPO_ROOT, "data", "ifct2017.json")
+    body = {
+        "autofill_enabled": AUTOFILL_ENABLED,
+        "sources": {
+            "openfoodfacts": {"available": True, "needs_key": False},
+            "usda": {"available": bool(USDA_API_KEY),
+                     "using_demo_key": USDA_API_KEY == "DEMO_KEY",
+                     "needs_key": True},
+            "ifct2017": {"available": os.path.exists(ifct_path),
+                         "foods_loaded": len(_load_ifct_index()),
+                         "path": ifct_path},
+            "google_safety_net": {"enabled": GOOGLE_FALLBACK_ENABLED,
+                                  "budget_seconds": WEB_NET_BUDGET_S},
+        },
+        "web_search_providers": providers,
+        "has_dependable_search": keyed_available,
+    }
+    if not keyed_available:
+        body["warning"] = (
+            "No keyed search provider is configured, so the Google safety net "
+            "depends on keyless engines that rate-limit server IPs — products "
+            "missing from Open Food Facts, USDA and IFCT will often return 404. "
+            "Fix: create a free Google Programmable Search engine "
+            "(https://programmablesearchengine.google.com, 'Search the entire web') "
+            "and an API key (https://console.cloud.google.com/apis/credentials), "
+            "then set GOOGLE_API_KEY and GOOGLE_CSE_ID. Free tier: 100 queries/day."
+        )
+        if keyless_available:
+            body["warning"] += " Keyless engines are answering right now, but unreliably."
+    return body
+
+
+def _fetch_page_text(url: str, timeout: float = None):
+    """Download a page and return its visible text (best-effort, never raises).
+
+    Capped in size: nutrition panels sit in the body, and a multi-megabyte page
+    would cost more to regex than it can possibly be worth."""
+    if not url or not url.lower().startswith(("http://", "https://")):
+        return ""
+    try:
+        r = requests.get(url, headers={"User-Agent": _WEB_UA},
+                         timeout=_budgeted_timeout(
+                             min(timeout or WEB_PAGE_TIMEOUT_S, _autofill_remaining())),
+                         stream=True)
+        if r.status_code != 200:
+            return ""
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "text" not in ctype:
+            return ""
+        raw = r.raw.read(2_000_000, decode_content=True) or b""
+        r.close()
+    except (requests.RequestException, ValueError, OSError):
+        return ""
+    if isinstance(raw, bytes):
+        raw = raw.decode(r.encoding or "utf-8", errors="replace")
+    return _strip_html(raw)[:400_000]
+
+
+def _web_nutrition(query: str, barcode: str):
+    """Find a product's nutrition on the open web (Task 2's safety net).
+
+    Two passes, cheapest first:
+      1. the search snippets, which for well-indexed products already carry the
+         panel ("Kapiva Amla Juice contains 200 calories per 1 Bottle (500g)");
+      2. the top *relevant* result pages, fetched in parallel, for the products
+         whose numbers only exist in a table on the page.
+
+    Every candidate is relevance-checked against the product name before its
+    numbers are used, so a search for "Kapiva Wild Amla Juice" can never be
+    answered with Dabur's amla juice panel, and every value is sanity-checked and
+    normalised to per-100g. Returns a product dict or None."""
+    query = (query or "").strip()
+    if not query or not WEB_SEARCH_ENABLED:
         return None
-    blobs = []
-    ab = data.get("answer_box")
-    if isinstance(ab, dict):
-        blobs.append(json.dumps(ab))
-    for res in (data.get("organic_results") or [])[:5]:
-        blobs.append(res.get("snippet") or "")
-    parsed = _parse_nutrition_text(" ".join(b for b in blobs if b))
-    if not parsed:
+    cache_key = (query.lower(), barcode or "")
+    if cache_key in _web_nutrition_cache:
+        cached = _web_nutrition_cache[cache_key]
+        return dict(cached) if cached else None
+
+    # Two query shapes: the phrase a nutrition page is written with, then a
+    # looser one for products only a shopping listing mentions. The second is
+    # only paid for when the first returns nothing we can use.
+    variants = [f"{query} nutrition facts per 100g"]
+    if barcode:
+        variants.append(f"{barcode} {query} nutrition information")
+    variants.append(f"{query} calories sugar protein per 100g")
+
+    provider, relevant, seen_hits = None, [], 0
+    for terms in variants:
+        for name, results in _web_search_iter(terms.strip()):
+            seen_hits += len(results)
+            hits = [r for r in results
+                    if _name_is_relevant(query, f"{r.get('title','')} {r.get('snippet','')}")]
+            if hits:
+                provider, relevant = name, hits
+                break
+        if relevant or _autofill_remaining() <= 1.0:
+            break
+    if not relevant:
+        logger.info("web net: no relevant result for %r (%d raw hits across providers)",
+                    query, seen_hits)
+        _web_nutrition_cache[cache_key] = None
         return None
-    parsed.update({"barcode": barcode, "product_name": query, "serving_size_g": 100.0})
-    return parsed
+
+    found, evidence = {}, []
+
+    def _absorb(text, url, is_page=False):
+        parsed = _parse_nutrition_page(text) if is_page else _parse_nutrition_text(text)
+        if not parsed:
+            return
+        new = {f: v for f, v in parsed.items() if f not in found}
+        if new:
+            found.update(new)
+            if url and url not in evidence:
+                evidence.append(url)
+
+    # Pass 1 — snippets (free, already downloaded).
+    for res in relevant:
+        _absorb(res.get("snippet") or "", res.get("url") or "")
+
+    # Pass 2 — open the pages, but only while a score-driving nutrient is still
+    # missing and there is budget left to spend.
+    missing_primary = any(f not in found for f in PRIMARY_NUTRIENT_FIELDS)
+    pages = [r.get("url") for r in relevant if r.get("url")][:WEB_PAGE_FETCH_LIMIT]
+    if missing_primary and pages and _autofill_remaining() > 0.5:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pages), 4)) as pool:
+            texts = list(pool.map(_fetch_page_text, pages))
+        for url, text in zip(pages, texts):
+            if not text or not _name_is_relevant(query, text[:400]):
+                continue
+            _absorb(text, url, is_page=True)
+
+    if not found:
+        logger.info("web net: searched %s for %r, no nutrition parsed", provider, query)
+        _web_nutrition_cache[cache_key] = None
+        return None
+
+    fetched = {
+        "barcode": barcode,
+        "product_name": query,
+        "serving_size_g": 100.0,
+        "source_url": evidence[0] if evidence else None,
+        "source_urls": evidence,
+    }
+    fetched.update(found)
+    logger.info("web net: %s filled %s for %r from %s",
+                provider, ",".join(sorted(found)), query, evidence[:2])
+    _web_nutrition_cache[cache_key] = dict(fetched)
+    return fetched
 
 
 def _extract_json_object(text: str):
@@ -2077,18 +3914,24 @@ def _ai_estimate_nutrition(query: str, barcode: str):
 
 
 def _source_google(barcode: str, name: str):
-    """Last-resort safety net (Task 4): SerpApi Google results when a key is set,
-    otherwise an AI estimate. Name-gated (never asks about a bare barcode) and
-    flagged as an estimate so its confidence is capped downstream."""
+    """Last-resort safety net (Task 2/4): a real web search, then an AI estimate.
+
+    Name-gated — a bare barcode is not something you can meaningfully search the
+    open web for — and everything it returns is flagged as an estimate so its
+    confidence is capped downstream.
+
+    This used to require a paid SerpApi key and, without one, went straight to a
+    free-tier LLM that is usually rate-limited: the net existed but never
+    actually fetched anything. ``_web_nutrition`` runs SerpApi -> Google
+    Programmable Search -> DuckDuckGo, so it works with no key configured."""
     if not GOOGLE_FALLBACK_ENABLED:
         return None
     query = (name or "").strip()
     if not query:                    # no product name -> nothing meaningful to search
         return None
-    if SERPAPI_KEY:
-        got = _serpapi_nutrition(query, barcode)
-        if got:
-            return got
+    got = _web_nutrition(query, barcode)
+    if got:
+        return got
     return _ai_estimate_nutrition(query, barcode)
 
 
@@ -2116,6 +3959,16 @@ def _run_autofill_chain(barcode: str, product: dict, audit: dict):
         for src_name, src_fn in FALLBACK_SOURCES:
             if product is not None and not _needs_enrichment(product):
                 break
+            if src_name == "google":
+                # The safety net only ever runs for a product the structured
+                # sources could not describe, and by this point OFF + USDA have
+                # usually spent the shared budget — leaving the net a fraction of
+                # a second to search the web and read a page, which is why it
+                # always came back empty. Give it a window of its own instead:
+                # fast scans are unaffected (they never get here), and this pack
+                # is resolved once and then served from our DB forever.
+                _autofill_ctx.deadline = time.monotonic() + WEB_NET_BUDGET_S
+                audit["web_net_budget_s"] = WEB_NET_BUDGET_S
             if _autofill_remaining() <= 0:
                 audit["budget_exhausted"] = True
                 logger.info("auto-fill budget spent for %s before trying %s",
@@ -2130,6 +3983,12 @@ def _run_autofill_chain(barcode: str, product: dict, audit: dict):
             audit["sources_tried"].append(src_name)
             if not fetched:
                 continue
+            # Keep the pages a web-derived value came from: an estimate the user
+            # can trace is worth far more than one they have to take on faith,
+            # and it is what makes a wrong auto-fill diagnosable.
+            for url in (fetched.get("source_urls") or []):
+                if url not in audit["source_urls"]:
+                    audit["source_urls"].append(url)
             _normalize_to_100g(fetched)
             if product is None:
                 product = fetched
@@ -2159,9 +4018,11 @@ def _store_resolved_product(product: dict, audit: dict):
     barcode = product.get("barcode")
     if not barcode:
         return
+    # De-duplicated so a product the same source both found AND filled is tagged
+    # "google", not "google+google" (which is what the by-name resolver produced,
+    # since it seeds a stub from the name and then enriches it).
     label = audit.get("source") or "unknown"
-    if audit.get("enriched_by"):
-        label = label + "+" + "+".join(audit["enriched_by"])
+    label = "+".join(dict.fromkeys([label] + list(audit.get("enriched_by") or [])))
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -2227,15 +4088,21 @@ def _flag_for_manual_review(barcode: str, audit: dict):
         logger.warning("could not flag %s for manual review: %s", barcode, exc)
 
 
-def resolve_raw_product(barcode: str, enrich: bool = None):
+def resolve_raw_product(barcode: str, enrich: bool = None, refresh: bool = False):
     """Resolve a barcode to a raw (unscored) per-100g product dict, DB FIRST (Task 1).
 
     Order: our database (exact, then GS1-payload) -> Open Food Facts -> USDA ->
-    IFCT 2017 -> Google/AI safety net. External sources run only when a nutrient
+    IFCT 2017 -> Google/web safety net. External sources run only when a nutrient
     is missing; anything they fill is normalized to per-100g (Task 6) and written
     back to our DB so the next scan is local. Returns ``(product, source, audit)``;
     ``product`` is None only when every source failed (then the barcode is flagged
-    for manual review)."""
+    for manual review).
+
+    ``refresh`` re-runs the chain now, ignoring the negative-resolution cache and
+    the enrichment cooldown. Those caches make repeat scans fast but also mean a
+    product that failed to fill keeps *looking* empty for the next ten minutes
+    even after the cause is fixed — there was no way to ask for another attempt
+    short of restarting the process."""
     if enrich is None:
         enrich = AUTOFILL_ENABLED
     audit = {
@@ -2248,13 +4115,17 @@ def resolve_raw_product(barcode: str, enrich: bool = None):
         "estimated": False,
         "matched_on": "barcode",
         "flagged_for_review": False,
+        "source_urls": [],
     }
 
     # A barcode we've very recently failed to resolve anywhere is returned as an
     # instant miss instead of re-running the whole (slow) fallback chain on every
     # rescan (Issue 1). A successful resolution is never cached here — those live
     # in the DB and the product cache.
-    if enrich and barcode in _negative_resolution_cache:
+    if refresh:
+        _negative_resolution_cache.pop(barcode, None)
+        _enrichment_attempt_cache.pop(barcode, None)
+    elif enrich and barcode in _negative_resolution_cache:
         audit["sources_tried"] = list(_negative_resolution_cache[barcode])
         audit["flagged_for_review"] = True
         audit["cached_miss"] = True
@@ -2282,6 +4153,8 @@ def resolve_raw_product(barcode: str, enrich: bool = None):
     # when we haven't already just tried for this barcode (cooldown), so a product
     # that stays partially incomplete isn't re-fetched on every scan.
     canonical = audit["canonical_barcode"]
+    if refresh:
+        _enrichment_attempt_cache.pop(canonical, None)
     if (enrich and _needs_enrichment(product)
             and canonical not in _enrichment_attempt_cache):
         _enrichment_attempt_cache[canonical] = True
@@ -2311,6 +4184,150 @@ def resolve_raw_product(barcode: str, enrich: bool = None):
         "filled_fields": audit["filled_fields"],
         "matched_on": audit["matched_on"],
         "estimated": audit["estimated"],
+        "source_urls": audit.get("source_urls") or [],
+    }
+    return product, audit["source"], audit
+
+
+def _synthetic_barcode(name: str) -> str:
+    """A stable catalogue key for a product resolved by NAME with no barcode.
+
+    Our `products` table is keyed by barcode, so a product nobody has a barcode
+    for (Kapiva's amla juice is on no barcode database at all) had nowhere to be
+    stored — it was re-fetched from scratch every single time, or more often not
+    fetched at all. Hashing the name gives the row a deterministic key, so the
+    same name always lands on the same row: fill it once, and it is in the
+    catalogue, in search and in its category from then on. The ``sw-`` prefix
+    keeps it out of the numeric space a real scan can ever produce."""
+    import hashlib
+    digest = hashlib.sha1(_normalize_search_text(name).encode("utf-8")).hexdigest()
+    return f"sw-{digest[:12]}"
+
+
+def _db_product_by_name(name: str):
+    """Best catalogue row for a product name, or None.
+
+    Prefers an exact (normalised) name match, then a relevance-checked LIKE, so
+    "kapiva amla" cannot be answered with an unrelated row that merely shares a
+    word."""
+    normalized = _normalize_search_text(name)
+    if not normalized:
+        return None
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT * FROM products WHERE lower(product_name) = ? LIMIT 1",
+            (name.strip().lower(),))
+        row = cursor.fetchone()
+        if row is not None:
+            return dict(row)
+        term = f"%{name.strip()}%"
+        cursor.execute(
+            "SELECT * FROM products WHERE product_name LIKE ? OR brand LIKE ? LIMIT 25",
+            (term, term))
+        candidates = [dict(r) for r in cursor.fetchall()]
+    finally:
+        conn.close()
+    for cand in candidates:
+        label = f"{cand.get('brand') or ''} {cand.get('product_name') or ''}"
+        if _name_is_relevant(name, label):
+            return cand
+    return None
+
+
+def resolve_product_by_name(name: str, refresh: bool = False):
+    """Resolve a product by NAME through the same DB-first chain as a scan.
+
+    The barcode resolver can only be reached by someone holding a barcode, and
+    the products this pipeline exists for are exactly the ones no barcode
+    database knows: searching for them returned nothing, so there was no way to
+    reach the auto-fill chain for them at all and they stayed permanently empty.
+    Same order and same guarantees as ``resolve_raw_product`` — our DB, then Open
+    Food Facts, USDA, IFCT and the web safety net — with anything found written
+    back under a stable key so the next lookup is local.
+
+    Returns ``(product, source, audit)``; ``product`` is None when nothing
+    anywhere describes the name."""
+    name = (name or "").strip()
+    audit = {
+        "scanned_barcode": None,
+        "canonical_barcode": None,
+        "query_name": name,
+        "source": None,
+        "sources_tried": [],
+        "enriched_by": [],
+        "filled_fields": [],
+        "estimated": False,
+        "matched_on": "name",
+        "flagged_for_review": False,
+        "source_urls": [],
+    }
+    if not name:
+        return None, None, audit
+
+    product = _db_product_by_name(name)
+    if product is not None:
+        audit["source"] = "database"
+        audit["sources_tried"].append("database")
+        audit["canonical_barcode"] = product.get("barcode")
+
+    barcode = (product or {}).get("barcode") or ""
+    cooldown_key = f"name:{_normalize_search_text(name)}"
+    if refresh:
+        _enrichment_attempt_cache.pop(cooldown_key, None)
+    if (AUTOFILL_ENABLED and _needs_enrichment(product)
+            and cooldown_key not in _enrichment_attempt_cache):
+        _enrichment_attempt_cache[cooldown_key] = True
+        # The chain is name-driven from here: pass the searched name through as
+        # the hint even when we have no row of our own to take it from.
+        if product is None:
+            product = {"product_name": name}
+            fresh_row = True
+        else:
+            fresh_row = False
+        product, audit = _run_autofill_chain(barcode, product, audit)
+        if fresh_row and not any(
+                _field_present((product or {}).get(f)) for f in CORE_NUTRIENT_FIELDS):
+            # Nothing but the name we started with — that is not a product.
+            product = None
+        if audit["source"] is None and audit["enriched_by"]:
+            # The chain treats a stub row as "enrich this", so the first source
+            # that contributed is really where this product came from.
+            audit["source"] = audit["enriched_by"][0]
+        if product is not None:
+            product.setdefault("product_name", name)
+            if not product.get("barcode"):
+                product["barcode"] = _synthetic_barcode(name)
+                audit["matched_on"] = "name_synthetic_key"
+            if not product.get("category"):
+                product["category"] = guess_category(
+                    product.get("product_name") or name, product.get("brand"))
+            audit["canonical_barcode"] = product["barcode"]
+            if audit["source"] != "database" or audit["filled_fields"]:
+                _store_resolved_product(product, audit)
+            # The barcode resolver keys its cooldown on the barcode, not the name,
+            # so without this the very next lookup of the product we just resolved
+            # re-runs the whole chain (measured: 6s) chasing the nutrients no source
+            # had. One attempt per cooldown window, whichever key it arrived under.
+            _enrichment_attempt_cache[product["barcode"]] = True
+
+    if product is None:
+        return None, None, audit
+
+    _normalize_to_100g(product)
+    _ensure_display_name(product)
+    product["data_source"] = audit["source"]
+    product["data_estimated"] = audit["estimated"]
+    product["resolution"] = {
+        "source": audit["source"],
+        "sources_tried": audit["sources_tried"],
+        "enriched_by": audit["enriched_by"],
+        "filled_fields": audit["filled_fields"],
+        "matched_on": audit["matched_on"],
+        "estimated": audit["estimated"],
+        "source_urls": audit.get("source_urls") or [],
+        "query_name": name,
     }
     return product, audit["source"], audit
 
@@ -2340,7 +4357,7 @@ def _score_and_decorate(raw: dict, source: str, preferences: dict = None) -> dic
     return p
 
 
-def get_scored_product(barcode: str, preferences: dict = None):
+def get_scored_product(barcode: str, preferences: dict = None, refresh: bool = False):
     """Return a fully scored product dict for a barcode (OUR DB first, then the
     auto-fill fallback chain), or None if it cannot be found anywhere. Shared
     product-context loader for /product, /chat and /compare-multiple. Does not
@@ -2349,15 +4366,15 @@ def get_scored_product(barcode: str, preferences: dict = None):
     The generic (non-personalized) result is served from a 1-hour cache; a
     personalized request always scores fresh."""
     if not preferences:
-        return generic_scored_product(barcode)
+        return generic_scored_product(barcode, refresh=refresh)
 
-    raw, source, _audit = resolve_raw_product(barcode)
+    raw, source, _audit = resolve_raw_product(barcode, refresh=refresh)
     if raw is None:
         return None
     return _score_and_decorate(raw, source, preferences)
 
 
-def generic_scored_product(barcode: str):
+def generic_scored_product(barcode: str, refresh: bool = False):
     """Fully-scored *generic* (non-personalized) product payload, cached for
     ``PRODUCT_CACHE_TTL`` seconds (Task 1C).
 
@@ -2368,11 +4385,12 @@ def generic_scored_product(barcode: str):
     the network round-trip. A fresh copy is returned each call. Returns None when
     the product cannot be found anywhere. Invalidated by
     ``invalidate_product_cache`` whenever the product changes."""
-    cached = cache_get_product(barcode)
-    if cached is not None:
-        return dict(cached)
+    if not refresh:
+        cached = cache_get_product(barcode)
+        if cached is not None:
+            return dict(cached)
 
-    raw, source, _audit = resolve_raw_product(barcode)
+    raw, source, _audit = resolve_raw_product(barcode, refresh=refresh)
     if raw is None:
         return None
 
@@ -2522,7 +4540,15 @@ def validate_barcode_endpoint(barcode: str):
 
 @app.get("/product/{barcode}")
 def get_product(barcode: str, device_id: Optional[str] = None,
+                refresh: bool = False,
                 user_id: Optional[int] = Depends(get_current_user_optional)):
+    """Scan/lookup a product by barcode.
+
+    - ``refresh=true`` forces the auto-fill chain to run again for this barcode,
+      bypassing the product cache, the negative-resolution cache and the
+      enrichment cooldown. Use it after fixing missing data (or to demonstrate the
+      pipeline); a normal scan should never need it.
+    """
     # Validate the barcode up front so we can attach a helpful correction hint to
     # the response (especially on a 404) without blocking the lookup itself.
     validation = validate_barcode(barcode)
@@ -2531,7 +4557,7 @@ def get_product(barcode: str, device_id: Optional[str] = None,
     # Resolve DB-FIRST (Task 1), then auto-fill from OFF -> USDA -> IFCT -> Google
     # only when a nutrient is missing (Tasks 3/4). The result is normalized to
     # per-100g (Task 6) and any fetched data is written back to our DB.
-    raw, source, audit = resolve_raw_product(barcode)
+    raw, source, audit = resolve_raw_product(barcode, refresh=refresh)
 
     if raw is None:
         # Not found anywhere (already flagged for manual review by the resolver).
@@ -2580,7 +4606,7 @@ def get_product(barcode: str, device_id: Optional[str] = None,
     if preferences:
         p_dict = _score_and_decorate(raw, source, preferences)
     else:
-        cached = cache_get_product(barcode)
+        cached = None if refresh else cache_get_product(barcode)
         if cached is not None:
             p_dict = dict(cached)
         else:
@@ -2606,6 +4632,36 @@ def get_product(barcode: str, device_id: Optional[str] = None,
                 "against the physical pack."
             ),
         }
+    return p_dict
+
+
+@app.get("/product/by-name/{name}")
+def get_product_by_name(name: str, refresh: bool = False,
+                        user_id: Optional[int] = Depends(get_current_user_optional)):
+    """Look up (and auto-fill) a product by NAME rather than barcode.
+
+    Same DB-first chain as a scan — our catalogue, then Open Food Facts, USDA,
+    IFCT 2017 and the Google/web safety net — for the products no barcode
+    database indexes, which are precisely the ones that show no data today. A
+    product resolved this way is stored under a stable key derived from its name,
+    so it appears in search and in its category from the next request on.
+
+    - ``refresh=true``: ignore the enrichment cooldown and resolve again.
+
+    Returns the same payload shape as ``GET /product/{barcode}`` (score, grade,
+    breakdown, per-100g nutrition, confidence) plus ``resolution``, which names
+    every source tried and the pages any web-derived value came from. 404 when
+    nothing anywhere describes the name.
+    """
+    raw, source, audit = resolve_product_by_name(name, refresh=refresh)
+    if raw is None:
+        return JSONResponse(status_code=404, content={
+            "error": "Product not found",
+            "query": name,
+            "sources_tried": audit.get("sources_tried") or [],
+        })
+    p_dict = _score_and_decorate(raw, source, load_user_preferences(user_id))
+    p_dict["image_url"] = image_or_placeholder(p_dict.get("image_url"))
     return p_dict
 
 
@@ -4872,6 +6928,11 @@ def health_check():
         # forgets SENTRY_DSN looks completely healthy otherwise — the errors just go
         # nowhere, which you'd only discover when you needed them.
         "error_tracking": "sentry" if SENTRY_ENABLED else "disabled",
+        # Same reasoning for the auth features: a deploy that forgets the mail or
+        # Google credentials serves password-reset and sign-in requests that can
+        # never complete. /auth/email/status has the detail.
+        "email_provider": _email_provider(),
+        "google_oauth": "configured" if _google_config()["configured"] else "not_configured",
         "pid": os.getpid(),
     }
 
@@ -5430,28 +7491,74 @@ def category_label(category) -> str:
     return (category or "").replace("_", " ").replace("-", " ").strip().title()
 
 
+def _category_external_counts(names, want_external: bool):
+    """Exact Open Food Facts product counts for ``names``, best-effort.
+
+    Fans the per-category count requests out in parallel under one deadline and
+    returns ``{category: count_or_None}`` — None meaning "not known yet", which
+    the caller reports rather than guessing. Anything that lands after the
+    deadline still populates the cache, so the next request has it. Cached
+    categories cost nothing, which is the normal case: OFF's catalogue moves far
+    more slowly than ``CATEGORY_COUNT_TTL``."""
+    counts = {}
+    if not want_external:
+        return {n: 0 for n in names}
+    pending = []
+    for name in names:
+        if name == "other":
+            counts[name] = 0
+        elif name in _category_count_cache:
+            counts[name] = _category_count_cache[name]
+        else:
+            pending.append(name)
+    if not pending:
+        return counts
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pending), 12))
+    try:
+        futures = {pool.submit(_off_category_total, n): n for n in pending}
+        done, _not_done = concurrent.futures.wait(
+            futures, timeout=CATEGORY_COUNT_DEADLINE_S)
+        for fut in futures:
+            name = futures[fut]
+            if fut in done:
+                try:
+                    counts[name] = fut.result()
+                except Exception:
+                    counts[name] = None
+            else:
+                counts[name] = None
+    finally:
+        # Don't join: a straggler keeps running and warms the cache for next time.
+        pool.shutdown(wait=False)
+    return counts
+
+
 @app.get("/products/categories")
 def list_product_categories(external: Optional[bool] = None):
     """List every product category with its product count (Feature 4).
 
     Counts cover **both** halves of what a category page serves: our own
     catalogue and Open Food Facts' (Issue 6). Each entry carries ``db_count``
-    (curated rows), ``external_count`` (how many OFF products browsing that
-    category will add) and ``count`` = the two combined — so the grid reflects
-    what is actually browsable rather than the size of our seed catalogue.
+    (curated rows), ``external_count`` (the products Open Food Facts holds in that
+    category) and ``count`` = the two combined — so the grid reflects what is
+    actually browsable rather than the size of our seed catalogue.
+
+    ``external_count`` is now Open Food Facts' **real** count for the category,
+    queried from its search index and cached for hours. It used to be
+    ``SWAPIFY_CATEGORY_EXTERNAL_LIMIT`` — our own fetch cap — which is why the
+    section reported a few hundred products for a database of millions. Where a
+    category holds more than OFF's search index will report
+    (``_OFF_RESULT_WINDOW``), ``external_count_capped`` is true and the number
+    means "this many or more".
 
     - ``external``: include the Open Food Facts half. Defaults to the
       ``SWAPIFY_EXTERNAL_SEARCH`` setting; pass ``external=false`` for our
       curated counts only.
 
     Returns ``{"count", "total_products", "db_products", "external_products",
-    "external_limit", "categories": [...]}`` ordered by product count (largest
-    first). Powers the frontend categories page's grid of category tiles.
-
-    ``external_count`` is the ceiling ``/products/by-category`` fetches on demand
-    (``SWAPIFY_CATEGORY_EXTERNAL_LIMIT``); it becomes exact once that category has
-    been browsed and its OFF page is cached. Listing categories never itself calls
-    out to OFF, so this endpoint stays a single local query.
+    "external_source", "counts_pending", "categories": [...]}`` ordered by product
+    count (largest first). Powers the frontend categories page's grid of tiles.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -5463,25 +7570,37 @@ def list_product_categories(external: Optional[bool] = None):
     conn.close()
 
     want_external = EXTERNAL_SEARCH_ENABLED if external is None else external
-    ext_limit = CATEGORY_EXTERNAL_LIMIT if want_external else 0
 
     # Categories we can browse on OFF but happen to curate nothing for still get a
     # tile — they are browsable, so hiding them would under-report the catalogue.
     names = set(db_counts)
-    if ext_limit:
+    if want_external:
         names |= set(_OFF_CATEGORY_TAGS)
 
-    categories = []
+    ext_counts = _category_external_counts(names, want_external)
+
+    categories, pending = [], 0
     for name in names:
         db_count = db_counts.get(name, 0)
-        external_count = _off_category_count(name, ext_limit)
-        categories.append({
+        raw_count = ext_counts.get(name)
+        known = raw_count is not None
+        if not known:
+            pending += 1
+        # Always an integer, so ``count == db_count + external_count`` holds even
+        # when Open Food Facts is unreachable; ``external_count_known`` is how a
+        # client tells "this category has none" from "we could not ask".
+        external_count = raw_count or 0
+        entry = {
             "category": name,
             "label": category_label(name),
             "count": db_count + external_count,
             "db_count": db_count,
             "external_count": external_count,
-        })
+            "external_count_known": known,
+        }
+        if known and external_count >= _OFF_RESULT_WINDOW:
+            entry["external_count_capped"] = True
+        categories.append(entry)
     categories.sort(key=lambda c: (-c["count"], c["category"]))
 
     return {
@@ -5489,7 +7608,8 @@ def list_product_categories(external: Optional[bool] = None):
         "total_products": sum(c["count"] for c in categories),
         "db_products": sum(c["db_count"] for c in categories),
         "external_products": sum(c["external_count"] for c in categories),
-        "external_limit": ext_limit,
+        "external_source": "openfoodfacts" if want_external else None,
+        "counts_pending": pending,
         "categories": categories,
     }
 
@@ -5505,31 +7625,67 @@ def products_by_category(
     """Paginated, scored products within a category (Feature 4).
 
     - ``category``: category id (case-insensitive, e.g. ``soft_drink``).
-    - ``sort``: ``score_desc`` (default, healthiest first), ``score_asc`` or ``name``.
-    - ``limit`` (1-500, default 50) / ``offset``: pagination.
+    - ``sort``: ``score_desc`` (default, healthiest first), ``score_asc`` or
+      ``name``. Applies to our curated rows, which are ranked as a whole and come
+      first; the Open Food Facts rows that follow keep OFF's own ordering and are
+      sorted within the page. Globally ranking millions of external products would
+      mean downloading them all, so this is the trade for browsing the full
+      catalogue.
+    - ``limit`` (1-500, default 50) / ``offset``: pagination over the WHOLE
+      category — our rows first, then Open Food Facts'. An offset past our
+      catalogue fetches the corresponding page from OFF on demand.
     - ``external``: include Open Food Facts' global catalogue for this category
       (Issue 6). Defaults to the ``SWAPIFY_EXTERNAL_SEARCH`` setting; pass
-      ``external=false`` for our curated list only. Up to
-      ``SWAPIFY_CATEGORY_EXTERNAL_LIMIT`` (default 200) OFF products are merged in,
-      matching the ``external_count`` advertised by ``/products/categories``.
+      ``external=false`` for our curated list only.
+
+    There is no longer a ceiling on how many external products a category can
+    serve: ``total`` is our count plus Open Food Facts' real count for the
+    category, and paging addresses OFF directly instead of a pre-fetched buffer of
+    200. ``external_total_capped`` is true when the category holds more than OFF's
+    search index will report or page through (``_OFF_RESULT_WINDOW``).
 
     Each product carries its generic health ``score``/``grade``, the ``recommended``
     (7+) and ``is_better_for_you`` (Feature 2) flags, key nutrients and per-100g
-    nutrition. Returns ``{"category", "label", "total", "count", "limit",
-    "offset", "has_more", "products"}``.
+    nutrition. Returns ``{"category", "label", "total", "db_total",
+    "external_total", "external_count", "count", "limit", "offset", "has_more",
+    "products"}``.
     """
     cat = (category or "").strip().lower()
     scored = _score_catalogue(cat)  # cached, generic score, healthiest-first
 
-    items = list(scored)  # copy before re-sorting (the cached list is shared)
+    db_items = list(scored)  # copy before re-sorting (the cached list is shared)
+    if sort == "score_asc":
+        db_items.sort(key=lambda x: (x["score"], (x.get("product_name") or "").lower()))
+    elif sort == "name":
+        db_items.sort(key=lambda x: (x.get("product_name") or "").lower())
+    else:  # score_desc — healthiest first
+        db_items.sort(key=lambda x: (-x["score"], (x.get("product_name") or "").lower()))
 
-    # Append Open Food Facts products for this category so browsing isn't capped at
-    # our curated catalogue (Issue 6). De-duplicated against our own rows by barcode.
+    limit = max(1, min(limit, SEARCH_MAX_LIMIT))
+    offset = max(0, offset)
+    db_total = len(db_items)
+
     want_external = EXTERNAL_SEARCH_ENABLED if external is None else external
+    external_total = _off_category_total(cat) if want_external else 0
+    # An unknown count (OFF unreachable) must not make the category look empty
+    # beyond our own rows — assume it is at least pageable and let a short page
+    # tell the client where the end is.
+    external_known = external_total is not None
+    if not external_known:
+        external_total = 0
+
+    page = db_items[offset:offset + limit]
     external_count = 0
-    if want_external:
-        seen = {p.get("barcode") for p in items if p.get("barcode")}
-        for p_dict, score, grade_val, breakdown in _off_category_products(cat, CATEGORY_EXTERNAL_LIMIT):
+    need = limit - len(page)
+    if want_external and need > 0:
+        off_offset = max(0, offset - db_total)
+        seen = {p.get("barcode") for p in db_items if p.get("barcode")}
+        # Over-fetch a little: rows that duplicate our catalogue are dropped, and
+        # without slack a full page would come back short.
+        for p_dict, score, grade_val, _breakdown in _off_category_slice(
+                cat, off_offset, need + 10):
+            if external_count >= need:
+                break
             bc = p_dict.get("barcode")
             if not bc or bc in seen:
                 continue
@@ -5538,29 +7694,27 @@ def products_by_category(
             entry = dict(p_dict)
             entry["score"] = score
             entry["grade"] = grade_val
-            entry["recommended"] = score >= 7.0
+            entry["recommended"] = score >= RECOMMENDED_MIN_SCORE
             entry["is_better_for_you"] = is_better_for_you(score)
             entry["image_url"] = image_or_placeholder(p_dict.get("image_url"))
             entry["source"] = "openfoodfacts"
             attach_nutrition_per_100g(entry)
-            items.append(entry)
+            page.append(entry)
 
     if sort == "score_asc":
-        items.sort(key=lambda x: (x["score"], (x.get("product_name") or "").lower()))
+        page.sort(key=lambda x: (x["score"], (x.get("product_name") or "").lower()))
     elif sort == "name":
-        items.sort(key=lambda x: (x.get("product_name") or "").lower())
-    else:  # score_desc — healthiest first (re-sort because external rows were added)
-        items.sort(key=lambda x: (-x["score"], (x.get("product_name") or "").lower()))
+        page.sort(key=lambda x: (x.get("product_name") or "").lower())
+    else:
+        page.sort(key=lambda x: (-x["score"], (x.get("product_name") or "").lower()))
 
-    limit = max(1, min(limit, SEARCH_MAX_LIMIT))
-    offset = max(0, offset)
-    total = len(items)
-    page = items[offset:offset + limit]
-
-    return {
+    total = db_total + external_total
+    response = {
         "category": cat,
         "label": category_label(cat),
         "total": total,
+        "db_total": db_total,
+        "external_total": external_total if external_known else None,
         "external_count": external_count,
         "count": len(page),
         "limit": limit,
@@ -5568,6 +7722,9 @@ def products_by_category(
         "has_more": offset + len(page) < total,
         "products": page,
     }
+    if external_known and external_total >= _OFF_RESULT_WINDOW:
+        response["external_total_capped"] = True
+    return response
 
 
 # ==============================================================================
@@ -10310,6 +12467,8 @@ ensure_performance_and_image_schema()
 ensure_experiment_schema()
 # Feature 3 — weekly digest email subscription state.
 ensure_email_schema()
+# Password reset tokens + Google sign-in columns on users.
+ensure_auth_schema()
 
 if __name__ == "__main__":
     import uvicorn
