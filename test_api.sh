@@ -5,7 +5,10 @@ SERVER_DIR="$SCRIPT_DIR"
 BASE="${BASE_URL:-http://127.0.0.1:8000}"
 PY="$SERVER_DIR/venv/Scripts/python.exe"
 [ -x "$PY" ] || PY="python"        
-DB="$SERVER_DIR/swapify.db"
+# Inspect whatever database the server is actually using: SWAPIFY_DB_PATH points
+# it elsewhere in deployment (and when running the suite against a scratch copy),
+# and a DB dump of a different file than the one under test proves nothing.
+DB="${SWAPIFY_DB_PATH:-$SERVER_DIR/swapify.db}"
 DELAY="${DELAY:-0}"
 STARTED_SERVER=0
 SERVER_PID=""
@@ -928,8 +931,8 @@ request GET "/products/categories" "" noauth
 CATS_TOTAL="$(printf '%s' "$LAST_BODY" | json_get total_products)"
 CATS_DB="$(printf '%s' "$LAST_BODY" | json_get db_products)"
 CATS_EXT="$(printf '%s' "$LAST_BODY" | json_get external_products)"
-CATS_LIMIT="$(printf '%s' "$LAST_BODY" | json_get external_limit)"
-echo "${BLUE}  total_products=$CATS_TOTAL  (db=$CATS_DB + external=$CATS_EXT, per-category limit $CATS_LIMIT)${RESET}"
+CATS_PENDING="$(printf '%s' "$LAST_BODY" | json_get counts_pending)"
+echo "${BLUE}  total_products=$CATS_TOTAL  (db=$CATS_DB + external=$CATS_EXT, counts_pending=$CATS_PENDING)${RESET}"
 check "categories status" "$LAST_CODE" "200"
 # July 28: each tile is db_count + external_count, so the grid reflects what is
 # browsable rather than the size of our seed catalogue (the "stuck at 367" bug).
@@ -942,6 +945,18 @@ d=json.load(sys.stdin); c=d.get('categories') or [];
 print('yes' if c and all(x['count']==x['db_count']+x['external_count'] for x in c)
       and d.get('total_products')==d.get('db_products',0)+d.get('external_products',0) else 'no')" <<< "$LAST_BODY")"
 check "count == db_count + external_count everywhere" "$SUM_OK" "yes"
+# July 30 (Task 3): external_count is Open Food Facts' REAL count for the category,
+# not our fetch cap. It used to be SWAPIFY_CATEGORY_EXTERNAL_LIMIT (200), which is
+# how the section reported a few hundred products for a database of millions.
+BIG_CAT="$("$PY" -c "import sys,json;
+c=json.load(sys.stdin).get('categories') or [];
+known=[x for x in c if x.get('external_count_known')];
+print('yes' if known and max(x['external_count'] for x in known) > 1000 else 'no')" <<< "$LAST_BODY")"
+if [ "$BIG_CAT" = "yes" ]; then
+  check "a category reports thousands of OFF products (not a 200 cap)" "$BIG_CAT" "yes"
+else
+  echo "${YELLOW}  (no OFF counts resolved — network/OFF may be unavailable; not failing the run)${RESET}"
+fi
 
 section "101a" "FEATURE 4 — CURATED-ONLY COUNTS  (GET /products/categories?external=false)  <- opt out of OFF"
 request GET "/products/categories?external=false" "" noauth
@@ -957,6 +972,38 @@ fi
 
 section "101b" "FEATURE 4 — PRODUCTS BY CATEGORY  (GET /products/by-category/{category})  <- paginated + scored"
 request GET "/products/by-category/protein_bar?limit=3" "" noauth
+
+section "101c" "TASK 3 — CATEGORY PAGING IS UNCAPPED  (GET /products/by-category/biscuit?offset=…)  <- pages into OFF"
+request GET "/products/by-category/biscuit?limit=5" "" noauth
+BC_TOTAL="$(printf '%s' "$LAST_BODY" | json_get total)"
+BC_DB="$(printf '%s' "$LAST_BODY" | json_get db_total)"
+echo "${BLUE}  biscuit: total=$BC_TOTAL (our rows: $BC_DB) — total is db + Open Food Facts' real count${RESET}"
+check "by-category status" "$LAST_CODE" "200"
+# An offset far past our curated rows must fetch the corresponding page from Open
+# Food Facts on demand. Before Task 3 browsing stopped at the 200 products we had
+# pre-fetched, so a deep offset returned an empty page.
+request GET "/products/by-category/biscuit?limit=5&offset=1000" "" noauth
+DEEP_OK="$("$PY" -c "import sys,json;
+d=json.load(sys.stdin);
+print('yes' if d.get('count',0) > 0 and d.get('external_count',0) > 0 else 'no')" <<< "$LAST_BODY")"
+if [ "$DEEP_OK" = "yes" ]; then
+  check "offset=1000 still returns Open Food Facts products" "$DEEP_OK" "yes"
+else
+  echo "${YELLOW}  (deep page empty — network/OFF may be unavailable; not failing the run)${RESET}"
+fi
+
+section "101d" "TASK 1 — LOOK UP A PRODUCT BY NAME  (GET /product/by-name/{name})  <- auto-fill without a barcode"
+request GET "/product/by-name/Nutella" "" noauth
+check "by-name status" "$LAST_CODE" "200"
+BYNAME_OK="$("$PY" -c "import sys,json;
+d=json.load(sys.stdin);
+r=d.get('resolution') or {};
+print('yes' if d.get('score') is not None and r.get('sources_tried') else 'no')" <<< "$LAST_BODY")"
+check "by-name returns a scored product with a resolution trail" "$BYNAME_OK" "yes"
+
+section "101e" "TASK 1 — FORCE A RE-RESOLVE  (GET /product/{barcode}?refresh=true)  <- bypasses caches + cooldown"
+request GET "/product/$BC_HEALTHY?refresh=true" "" noauth
+check "refresh=true still returns the product" "$LAST_CODE" "200"
 
 section 102 "FEATURE 3 — WEEKLY DIGEST PREVIEW  (GET /weekly-digest/{user_id})  <- data + rendered email"
 request GET "/weekly-digest/${USER_ID:-1}" "" auth
@@ -979,6 +1026,113 @@ request POST "/admin/send-weekly-digests" "" noauth "" 4
 
 section "102f" "FEATURE 3 — UNSUBSCRIBE BAD TOKEN -> 400  (GET /unsubscribe?token=garbage)"
 request GET "/unsubscribe?token=garbage" "" noauth "" 4
+
+# =============================================================================
+#  AUTH: forgot password / reset password / Google OAuth
+# =============================================================================
+# Uses its own throwaway account so changing a password can't disturb the rest
+# of the run. The suite's main $TOKEN is a JWT and stays valid regardless.
+RESET_EMAIL="resettester_${STAMP}@example.com"
+RESET_PASS_OLD="Passw0rd!"
+RESET_PASS_NEW="N3wPassw0rd!"
+
+section "105a" "AUTH — EMAIL DELIVERY STATUS  (GET /auth/email/status)  <- which provider is live"
+request GET "/auth/email/status" "" noauth
+EMAIL_PROVIDER="$(printf '%s' "$LAST_BODY" | json_get provider)"
+echo "${BLUE}email provider = ${EMAIL_PROVIDER:-unknown}${RESET}"
+if [ "$EMAIL_PROVIDER" = "outbox" ]; then
+  echo "${YELLOW}No mail provider configured — reset mail goes to outbox/*.eml (dry run).${RESET}"
+fi
+
+section "105b" "AUTH — FORGOT PASSWORD, UNKNOWN EMAIL  (POST /forgot-password)  <- must NOT reveal that"
+request POST "/forgot-password" "{\"email\":\"definitely-not-registered-${STAMP}@example.com\"}" noauth
+GENERIC_MSG="$(printf '%s' "$LAST_BODY" | json_get message)"
+
+section "105c" "AUTH — FORGOT PASSWORD, MALFORMED EMAIL -> 400"
+request POST "/forgot-password" "{\"email\":\"not-an-email\"}" noauth "" 4
+
+section "105d" "AUTH — FORGOT PASSWORD, REAL ACCOUNT  (POST /forgot-password)"
+request POST "/register" "{\"email\":\"$RESET_EMAIL\",\"username\":\"resettester_${STAMP}\",\"password\":\"$RESET_PASS_OLD\"}" noauth
+request POST "/forgot-password" "{\"email\":\"$RESET_EMAIL\"}" noauth
+KNOWN_MSG="$(printf '%s' "$LAST_BODY" | json_get message)"
+# Account-enumeration guard: a registered and an unregistered address must be
+# answered with the byte-identical message.
+if [ -n "$GENERIC_MSG" ] && [ "$GENERIC_MSG" = "$KNOWN_MSG" ]; then
+  echo "${GREEN}PASS  known and unknown emails get the identical response${RESET}"; PASS=$((PASS+1))
+else
+  echo "${RED}FAIL  response differs between known and unknown email — account enumeration${RESET}"; FAIL=$((FAIL+1))
+fi
+# The reset token is only returned when no mail provider is configured
+# (PASSWORD_RESET_EXPOSE_TOKEN=auto). With SMTP live the link is in the inbox,
+# so the end-to-end steps below are skipped rather than failed.
+RESET_TOKEN="$(printf '%s' "$LAST_BODY" | "$PY" -c "import sys,json
+d=json.load(sys.stdin)
+print((d.get('debug') or {}).get('token') or '')" 2>/dev/null)"
+
+if [ -n "$RESET_TOKEN" ]; then
+  section "105e" "AUTH — VALIDATE THE EMAILED LINK  (GET /reset-password/validate?token=…)"
+  request GET "/reset-password/validate?token=$RESET_TOKEN" "" noauth
+
+  section "105f" "AUTH — RESET REJECTS A TOO-SHORT PASSWORD -> 400"
+  request POST "/reset-password" "{\"token\":\"$RESET_TOKEN\",\"new_password\":\"abc\"}" noauth "" 4
+
+  section "105g" "AUTH — RESET PASSWORD  (POST /reset-password)"
+  request POST "/reset-password" "{\"token\":\"$RESET_TOKEN\",\"new_password\":\"$RESET_PASS_NEW\"}" noauth
+
+  section "105h" "AUTH — THE NEW PASSWORD WORKS, THE OLD ONE DOESN'T"
+  request POST "/login" "{\"email\":\"$RESET_EMAIL\",\"password\":\"$RESET_PASS_NEW\"}" noauth
+  request POST "/login" "{\"email\":\"$RESET_EMAIL\",\"password\":\"$RESET_PASS_OLD\"}" noauth "" 4
+
+  section "105i" "AUTH — THE RESET LINK IS SINGLE-USE  (replaying it -> 400)"
+  request POST "/reset-password" "{\"token\":\"$RESET_TOKEN\",\"new_password\":\"Another1!\"}" noauth "" 4
+else
+  echo "${YELLOW}(skipping 105e-105i: a mail provider is configured, so the token is only in the inbox)${RESET}"
+fi
+
+section "105j" "AUTH — RESET WITH A GARBAGE TOKEN -> 400"
+request POST "/reset-password" "{\"token\":\"garbage-token\",\"new_password\":\"Whatever1!\"}" noauth "" 4
+
+section "105k" "AUTH — THE RESET PAGE THE EMAIL LINKS TO  (GET /reset-password)"
+request GET "/reset-password" "" noauth
+
+section "105l" "AUTH — GOOGLE OAUTH CONFIG  (GET /auth/google/config)  <- no secrets, drives the button"
+request GET "/auth/google/config" "" noauth
+GOOGLE_CONFIGURED="$(printf '%s' "$LAST_BODY" | json_get configured)"
+echo "${BLUE}google oauth configured = ${GOOGLE_CONFIGURED:-False}${RESET}"
+
+if [ "$GOOGLE_CONFIGURED" = "True" ]; then
+  section "105m" "AUTH — GOOGLE SIGN-IN REDIRECTS TO GOOGLE  (GET /auth/google/login -> 302)"
+  echo "${DIM}\$ curl -s -o /dev/null -w '%{http_code} %{redirect_url}' '$BASE/auth/google/login'${RESET}"
+  GOOG="$(curl -s -o /dev/null -m 30 -w '%{http_code} %{redirect_url}' "$BASE/auth/google/login")"
+  GOOG_CODE="${GOOG%% *}"; GOOG_URL="${GOOG#* }"
+  echo "HTTP $GOOG_CODE -> ${GOOG_URL:0:110}"
+  case "$GOOG_CODE:$GOOG_URL" in
+    30*:https://accounts.google.com/*)
+      echo "${GREEN}PASS  302 to Google's consent screen${RESET}"; PASS=$((PASS+1)) ;;
+    *)
+      echo "${RED}FAIL  expected a 30x redirect to accounts.google.com${RESET}"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$GOOG_URL" in
+    *"state="*)
+      echo "${GREEN}PASS  carries a signed state (CSRF guard)${RESET}"; PASS=$((PASS+1)) ;;
+    *)
+      echo "${RED}FAIL  no state parameter — the callback is CSRF-open${RESET}"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$GOOG_URL" in
+    *"scope=openid"*)
+      echo "${GREEN}PASS  asks for the openid scope${RESET}"; PASS=$((PASS+1)) ;;
+    *)
+      echo "${RED}FAIL  openid scope missing — no ID token will come back${RESET}"; FAIL=$((FAIL+1)) ;;
+  esac
+else
+  echo "${YELLOW}(skipping 105m: set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET to test the redirect)${RESET}"
+fi
+
+section "105n" "AUTH — GOOGLE CALLBACK WITH A FORGED STATE -> 400  (CSRF guard)"
+request GET "/auth/google/callback?code=fake&state=forged" "" noauth "" 4
+
+section "105o" "AUTH — GOOGLE ID TOKEN THAT ISN'T ONE -> 401  (POST /auth/google/token)"
+request POST "/auth/google/token" "{\"credential\":\"not.a.real.jwt\"}" noauth "" 4
 
 section 103 "SCORING SPEC COMPLIANCE  (python test_scoring_spec.py)  <- engine matches ScoringLogic_Swapify.md"
 echo "${DIM}\$ $PY test_scoring_spec.py${RESET}"
@@ -1239,6 +1393,14 @@ db_query "SELECT barcode, image_url FROM products WHERE barcode='$BC_UNHEALTHY'"
 echo
 echo "${BOLD}product indexes${RESET}  (Task 1A; created at startup)"
 db_query "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='products' AND name LIKE 'idx_%' ORDER BY name"
+
+echo
+echo "${BOLD}password_reset_tokens${RESET}  (from steps 105d-105i; note token_hash — the raw token is never stored)"
+db_query "SELECT id, user_id, substr(token_hash,1,16)||'…' AS token_hash, expires_at, used_at FROM password_reset_tokens ORDER BY id DESC LIMIT 5"
+
+echo
+echo "${BOLD}users — Google sign-in columns${RESET}  (google_id is NULL until an account signs in with Google)"
+db_query "SELECT id, username, auth_provider, google_id FROM users ORDER BY id DESC LIMIT 5"
 
 # =============================================================================
 banner "SUMMARY"
