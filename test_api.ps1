@@ -125,8 +125,11 @@ function Invoke-Api {
     Show-Json $content $Head
 
     # A status matching the expected prefix (default 2xx) is a pass. Tests that
-    # deliberately expect a client error pass -Expect '4'.
-    if (("$code").StartsWith($Expect)) { $script:Pass++ } else { $script:Fail++ }
+    # deliberately expect a client error pass -Expect '4'. Matched as an anchored
+    # regex rather than a literal prefix so a test with two acceptable outcomes can
+    # say so: -Expect '[24]' passes on either, which is what a lookup whose honest
+    # answer may legitimately be "no source publishes this" (404) needs.
+    if (("$code") -match "^$Expect") { $script:Pass++ } else { $script:Fail++ }
     $script:LastBody = $content
     $script:LastCode = $code
     if ($Delay -gt 0) { Start-Sleep -Seconds $Delay }
@@ -1179,15 +1182,25 @@ try {
 
     if ($googleConfigured) {
         Write-Section "105m" "AUTH - GOOGLE SIGN-IN REDIRECTS TO GOOGLE  (GET /auth/google/login -> 302)"
-        # -MaximumRedirection 0 so the 302 itself is observed, not followed.
+        # The 302 itself must be observed, not followed. Invoke-WebRequest cannot do
+        # this reliably: on Windows PowerShell 5.1 `-MaximumRedirection 0` raises a
+        # PSInvalidOperationException ("Windows PowerShell is in NonInteractive mode")
+        # instead of returning the response, so $_.Exception.Response is null and the
+        # whole section reported HTTP 0 and three failures on every non-interactive
+        # run. HttpWebRequest.AllowAutoRedirect never prompts and exposes both the
+        # status and the Location header on 5.1 and 7.
         $loc = ''; $code = 0
         try {
-            $r = Invoke-WebRequest -Uri "$Base/auth/google/login" -MaximumRedirection 0 -ErrorAction Stop
-            $code = [int]$r.StatusCode; $loc = $r.Headers.Location
-        } catch {
+            $req = [System.Net.HttpWebRequest]::Create("$Base/auth/google/login")
+            $req.AllowAutoRedirect = $false
+            $req.Timeout = 30000
+            $resp = $req.GetResponse()
+            $code = [int]$resp.StatusCode; $loc = "" + $resp.Headers['Location']
+            $resp.Close()
+        } catch [System.Net.WebException] {
             if ($_.Exception.Response) {
                 $code = [int]$_.Exception.Response.StatusCode
-                $loc  = "" + $_.Exception.Response.Headers.Location
+                $loc  = "" + $_.Exception.Response.Headers['Location']
             }
         }
         Write-Host "  HTTP $code -> $($loc.Substring(0, [Math]::Min(110, $loc.Length)))" -ForegroundColor DarkGray
@@ -1397,6 +1410,86 @@ try {
 
     Write-Host "  FIX #9 (sodium vs salt): a frontend-only change - bare 'Salt' is no longer flagged" -ForegroundColor DarkGray
     Write-Host "  when the sodium panel reads 0mg (static/script.js calculateScore). Not an API check." -ForegroundColor DarkGray
+
+    # =========================================================================
+    Write-Banner "2 AUGUST REVIEWER FIXES  (auto-fill coverage, safety-net honesty, cross-brand guard)"
+
+    Write-Section "128a" "AUTO-FILL SOURCE HEALTH  (GET /autofill/status)  <- why a product came back empty"
+    Write-Host "  A product the chain cannot resolve returns a plain 404, identical whether the product" -ForegroundColor DarkGray
+    Write-Host "  genuinely has no published data or every search provider is refusing us. This endpoint" -ForegroundColor DarkGray
+    Write-Host "  is what tells those two apart, so it must always answer." -ForegroundColor DarkGray
+    Invoke-Api GET "/autofill/status"
+    try { $af = $script:LastBody | ConvertFrom-Json } catch { $af = $null }
+    $afOff = if ($af) { [bool]$af.sources.openfoodfacts.available } else { $false }
+    $afDep = if ($af) { $af.has_dependable_search } else { $null }
+    Write-Host "  openfoodfacts.available=$afOff   has_dependable_search=$afDep" -ForegroundColor Blue
+    Assert-Equal "auto-fill status reports Open Food Facts as a source" $afOff $true
+    # has_dependable_search is False until GOOGLE_API_KEY + GOOGLE_CSE_ID are set; the
+    # assertion is that the field is present and boolean, not which way it points.
+    Assert-Equal "has_dependable_search is reported as a boolean" ($afDep -is [bool]) $true
+    if ($afDep -eq $false) {
+        $afWarn = if ($af -and $af.warning) { ("" + $af.warning).Trim().Length -gt 0 } else { $false }
+        Assert-Equal "no keyed provider -> a warning explains the consequence" $afWarn $true
+    }
+
+    Write-Section "128b" "PROVIDER PROBE IS ADMIN-GATED -> 403  (GET /autofill/status?probe=true)"
+    Write-Host "  The probe opens real pages and exposes provider error text, so it needs the shared secret." -ForegroundColor DarkGray
+    Invoke-Api GET "/autofill/status?probe=true" -Expect '4'
+
+    Write-Section "128c" "PROVIDER PROBE MEASURES USEFULNESS, NOT HITS  (?probe=true with X-Admin-Token)"
+    Write-Host "  A provider returning five results is not a working safety net: Bing's keyless RSS answers" -ForegroundColor DarkGray
+    Write-Host "  every packaged-product query with the brand's HOME PAGE, which has no nutrition panel on" -ForegroundColor DarkGray
+    Write-Host "  it, and it ignores 'site:' filters entirely. So the probe opens the top hits and tries to" -ForegroundColor DarkGray
+    Write-Host "  extract nutrition - 'ok' must mean that succeeded, never merely that results came back." -ForegroundColor DarkGray
+    $adminToken2 = if ($env:ADMIN_TOKEN) { $env:ADMIN_TOKEN } else { 'swapify-admin-dev' }
+    Invoke-Admin GET "/autofill/status?probe=true" -AdminToken $adminToken2
+    try { $pr = @(($script:LastBody | ConvertFrom-Json).probe) } catch { $pr = @() }
+    $live = @($pr | Where-Object { -not $_.PSObject.Properties['skipped'] -and -not $_.PSObject.Properties['error'] })
+    $fieldOk = ($live.Count -gt 0) -and (@($live | Where-Object { -not $_.PSObject.Properties['nutrition_parsed'] }).Count -eq 0)
+    # ok must never be true while nothing could be parsed - that is the exact way the
+    # old count-based probe reported a dead provider as healthy.
+    $okHonest = (@($live | Where-Object { [bool]$_.ok -ne [bool]$_.nutrition_parsed }).Count -eq 0)
+    Write-Host "  probed $($pr.Count) providers ($($live.Count) live)" -ForegroundColor Blue
+    Assert-Equal "probe reports every live provider" ($pr.Count -gt 0) $true
+    Assert-Equal "each probed provider reports nutrition_parsed" $fieldOk $true
+    Assert-Equal "'ok' means nutrition was extracted, not just that hits came back" $okHonest $true
+
+    Write-Section "128d" "CROSS-BRAND GUARD - a branded query is never answered by a generic product"
+    Write-Host "  Open Food Facts holds Kapiva's Amla Juice (8901207034145) with an EMPTY nutriments object," -ForegroundColor DarkGray
+    Write-Host "  and its search returns unrelated amla juices that do carry panels. 'juice' is a stopword," -ForegroundColor DarkGray
+    Write-Host "  so a generic 'Amla Juice' shared exactly half of the query's identifying words and cleared" -ForegroundColor DarkGray
+    Write-Host "  the old '>= 0.5' relevance bar - filling Kapiva with another product's numbers under a" -ForegroundColor DarkGray
+    Write-Host "  confident 'openfoodfacts' label. A strict majority is now required. Empty is the correct" -ForegroundColor DarkGray
+    Write-Host "  answer here; wrong data would be worse than none." -ForegroundColor DarkGray
+    # 404 is a legitimate PASS here - "no source publishes this" is the honest answer.
+    Invoke-Api GET "/product/by-name/Kapiva%20Amla%20Juice" -Expect '[24]'
+    try { $kp = $script:LastBody | ConvertFrom-Json } catch { $kp = $null }
+    if (-not $kp -or $kp.error) {
+        $kapClean = $true                     # 404 = honest "no data", which is fine
+    } else {
+        # Judge the BRAND, not the name: the by-name resolver echoes the query back as
+        # the product_name, so 'Kapiva' is present even when the panel came from someone
+        # else. The production symptom was exactly that - product_name 'Kapiva Amla
+        # Juice' with brand 'Dabur' - so a name check would pass the very bug it must catch.
+        $kapBrand = ("" + $kp.brand).Trim().ToLower()
+        $kapClean = ([string]::IsNullOrWhiteSpace($kapBrand) -or 'kapiva amla juice'.Contains($kapBrand))
+    }
+    Write-Host "  HTTP $($script:LastCode) -> not-another-brand: $kapClean" -ForegroundColor Blue
+    Assert-Equal "Kapiva query is answered by Kapiva or by nothing" $kapClean $true
+
+    Write-Section "128e" "OFF EMPTY-ROW FALLBACK - a nutrition-less barcode row no longer ends the lookup"
+    Write-Host "  OFF lists many Indian packs as name+image with no nutriments, and the SAME pack again under" -ForegroundColor DarkGray
+    Write-Host "  a neighbouring GTIN with the full panel (Amul Butter: ...0153 is empty, ...0030 is complete)." -ForegroundColor DarkGray
+    Write-Host "  The old code returned the empty row and stopped, so the source 'succeeded' with no data." -ForegroundColor DarkGray
+    Invoke-Api GET "/product/by-name/Amul%20Butter"
+    try { $ab = $script:LastBody | ConvertFrom-Json } catch { $ab = $null }
+    $abCal = if ($ab -and $null -ne $ab.calories_kcal_per_serving) { $true } else { $false }
+    Write-Host "  HTTP $($script:LastCode)  has_calories=$abCal" -ForegroundColor Blue
+    if ($script:LastCode -eq 200) {
+        Assert-Equal "a widely-stocked pack resolves with real calories" $abCal $true
+    } else {
+        Write-Host "  (Open Food Facts unreachable - skipping the auto-fill assert)" -ForegroundColor Yellow
+    }
 
     # =========================================================================
     Write-Banner "DATABASE VERIFICATION  (proving the writes actually persisted)"
