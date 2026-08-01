@@ -139,8 +139,11 @@ function Invoke-Api {
     Show-Json $content $Head
 
     # A status matching the expected prefix (default 2xx) is a pass. Tests that
-    # deliberately expect a client error pass -Expect '4'.
-    if (("$code").StartsWith($Expect)) { $script:Pass++ } else { $script:Fail++ }
+    # deliberately expect a client error pass -Expect '4'. Matched as an anchored
+    # regex rather than a literal prefix so a test with two acceptable outcomes can
+    # say so: -Expect '[24]' passes on either, which is what a lookup whose honest
+    # answer may legitimately be "no source publishes this" (404) needs.
+    if (("$code") -match "^$Expect") { $script:Pass++ } else { $script:Fail++ }
     $script:LastBody = $content
     $script:LastCode = $code
     if ($Delay -gt 0) { Start-Sleep -Seconds $Delay }
@@ -173,7 +176,7 @@ function Invoke-Upload {
     elseif ($code -lt 200 -or  $code -ge 500) { $col = 'Red' }
     Write-Host "HTTP $code" -ForegroundColor $col
     Show-Json $body
-    if (("$code").StartsWith($Expect)) { $script:Pass++ } else { $script:Fail++ }
+    if (("$code") -match "^$Expect") { $script:Pass++ } else { $script:Fail++ }
     $script:LastBody = $body
 }
 
@@ -1258,6 +1261,86 @@ try {
     Write-Host "  when the sodium panel reads 0mg (static/script.js calculateScore). Not an API check." -ForegroundColor DarkGray
 
     # =========================================================================
+    Write-Banner "2 AUGUST REVIEWER FIXES  (available after redeploy)"
+    Write-Host "These check the 2 August auto-fill work. Against a build that predates it the" -ForegroundColor Yellow
+    Write-Host "new fields are simply absent - each section says so explicitly rather than" -ForegroundColor Yellow
+    Write-Host "failing with a confusing message, so a red run here dates the deployed build." -ForegroundColor Yellow
+
+    Write-Section "128a" "AUTO-FILL SOURCE HEALTH  (GET /autofill/status)  <- why a product came back empty"
+    Write-Host "  A product the chain cannot resolve returns a plain 404, identical whether the product" -ForegroundColor DarkGray
+    Write-Host "  genuinely has no published data or every provider is refusing us. This tells them apart." -ForegroundColor DarkGray
+    Invoke-Api GET "/autofill/status"
+    try { $af = $script:LastBody | ConvertFrom-Json } catch { $af = $null }
+    $afOff = if ($af) { [bool]$af.sources.openfoodfacts.available } else { $false }
+    $afDep = if ($af) { $af.has_dependable_search } else { $null }
+    Write-Host "  openfoodfacts.available=$afOff   has_dependable_search=$afDep" -ForegroundColor Blue
+    Assert-Equal "auto-fill status reports Open Food Facts as a source" $afOff $true
+    if ($afDep -eq $false) {
+        Write-Host "  has_dependable_search=False: no keyed search provider on this deploy. Products" -ForegroundColor Yellow
+        Write-Host "  missing from OFF/USDA/IFCT cannot be rescued by the safety net until" -ForegroundColor Yellow
+        Write-Host "  GOOGLE_API_KEY + GOOGLE_CSE_ID are set in the Render dashboard." -ForegroundColor Yellow
+    }
+
+    Write-Section "128b" "PROVIDER PROBE IS ADMIN-GATED -> 403  (GET /autofill/status?probe=true)"
+    Invoke-Api GET "/autofill/status?probe=true" -Expect '4'
+
+    Write-Section "128c" "PROVIDER PROBE MEASURES USEFULNESS, NOT HITS  (?probe=true with X-Admin-Token)"
+    Write-Host "  A provider returning five results is not a working safety net: Bing's keyless RSS answers" -ForegroundColor DarkGray
+    Write-Host "  every packaged-product query with the brand's HOME PAGE, and ignores 'site:' filters. The" -ForegroundColor DarkGray
+    Write-Host "  probe therefore opens the top hits and tries to extract nutrition; 'ok' means that worked." -ForegroundColor DarkGray
+    if ($haveAdmin) {
+        Invoke-Api GET "/autofill/status?probe=true" -ExtraHeaders $admin
+        try { $pr = @(($script:LastBody | ConvertFrom-Json).probe) } catch { $pr = @() }
+        $live = @($pr | Where-Object { -not $_.PSObject.Properties['skipped'] -and -not $_.PSObject.Properties['error'] })
+        $hasField = ($live.Count -gt 0) -and (@($live | Where-Object { -not $_.PSObject.Properties['nutrition_parsed'] }).Count -eq 0)
+        if (-not $hasField) {
+            Write-Host "  This build predates the 2 August probe rework (no 'nutrition_parsed' field)." -ForegroundColor Yellow
+            Write-Host "  It reports a provider as ok on hit COUNT alone, which is how a dead provider" -ForegroundColor Yellow
+            Write-Host "  looked healthy. Deploy src/app.py to fix." -ForegroundColor Yellow
+        } else {
+            $okHonest = (@($live | Where-Object { [bool]$_.ok -ne [bool]$_.nutrition_parsed }).Count -eq 0)
+            Assert-Equal "each probed provider reports nutrition_parsed" $hasField $true
+            Assert-Equal "'ok' means nutrition was extracted, not just that hits came back" $okHonest $true
+        }
+    } else {
+        Write-Host "SKIPPED - no -AdminToken. The 403 above already proves the gate works." -ForegroundColor DarkGray
+    }
+
+    Write-Section "128d" "CROSS-BRAND GUARD - a branded query is never answered by a generic product"
+    Write-Host "  OFF holds Kapiva's Amla Juice (8901207034145) with an EMPTY nutriments object, and its" -ForegroundColor DarkGray
+    Write-Host "  search returns unrelated amla juices that DO carry panels. 'juice' is a stopword, so a" -ForegroundColor DarkGray
+    Write-Host "  generic 'Amla Juice' shared exactly half the query's identifying words and cleared the" -ForegroundColor DarkGray
+    Write-Host "  old '>= 0.5' relevance bar. Empty is correct here; wrong data would be worse than none." -ForegroundColor DarkGray
+    Invoke-Api GET "/product/by-name/Kapiva%20Amla%20Juice" -Expect '[24]'
+    try { $kp = $script:LastBody | ConvertFrom-Json } catch { $kp = $null }
+    if (-not $kp -or $kp.error) {
+        $kapClean = $true                     # 404 = honest "no data", which is fine
+    } else {
+        # Judge the BRAND, not the name: the by-name resolver echoes the query back as
+        # the product_name, so 'Kapiva' is present even when the panel came from someone
+        # else. The production symptom was exactly that - product_name 'Kapiva Amla
+        # Juice' with brand 'Dabur' - so a name check would pass the very bug it must catch.
+        $kapBrand = ("" + $kp.brand).Trim().ToLower()
+        $kapClean = ([string]::IsNullOrWhiteSpace($kapBrand) -or 'kapiva amla juice'.Contains($kapBrand))
+    }
+    Write-Host "  HTTP $($script:LastCode) -> not-another-brand: $kapClean" -ForegroundColor Blue
+    Assert-Equal "Kapiva query is answered by Kapiva or by nothing" $kapClean $true
+
+    Write-Section "128e" "OFF EMPTY-ROW FALLBACK - a nutrition-less barcode row no longer ends the lookup"
+    Write-Host "  OFF lists many Indian packs as name+image with no nutriments, and the SAME pack again" -ForegroundColor DarkGray
+    Write-Host "  under a neighbouring GTIN with the full panel (Amul Butter: ...0153 empty, ...0030 full)." -ForegroundColor DarkGray
+    Invoke-Api GET "/product/by-name/Amul%20Butter" -Expect '[24]'
+    try { $ab = $script:LastBody | ConvertFrom-Json } catch { $ab = $null }
+    $abCal = if ($ab -and $null -ne $ab.calories_kcal_per_serving) { $true } else { $false }
+    Write-Host "  HTTP $($script:LastCode)  has_calories=$abCal" -ForegroundColor Blue
+    if ($abCal) {
+        Assert-Equal "a widely-stocked pack resolves with real calories" $abCal $true
+    } else {
+        Write-Host "  No calories came back. On a build predating the 2 August fix this is expected:" -ForegroundColor Yellow
+        Write-Host "  the empty OFF barcode row ended the lookup and the source 'succeeded' with no data." -ForegroundColor Yellow
+    }
+
+    # =========================================================================
     Write-Banner "AUTH - FORGOT / RESET PASSWORD + GOOGLE OAUTH"
     # Everything here is read-only against live data by default. The one step
     # that would send a real email and change a real password is gated behind
@@ -1314,14 +1397,25 @@ try {
 
     if ($googleLive) {
         Write-Section "128h" "AUTH - GOOGLE SIGN-IN REDIRECTS TO GOOGLE  (GET /auth/google/login -> 302)"
+        # The 302 itself must be observed, not followed. Invoke-WebRequest cannot do
+        # this reliably: on Windows PowerShell 5.1 `-MaximumRedirection 0` raises a
+        # PSInvalidOperationException ("Windows PowerShell is in NonInteractive mode")
+        # instead of returning the response, so $_.Exception.Response is null and the
+        # whole section reported HTTP 0 and three failures on every non-interactive
+        # run. HttpWebRequest.AllowAutoRedirect never prompts and exposes both the
+        # status and the Location header on 5.1 and 7.
         $loc = ''; $code = 0
         try {
-            $r = Invoke-WebRequest -Uri "$Base/auth/google/login" -MaximumRedirection 0 -ErrorAction Stop
-            $code = [int]$r.StatusCode; $loc = "" + $r.Headers.Location
-        } catch {
+            $req = [System.Net.HttpWebRequest]::Create("$Base/auth/google/login")
+            $req.AllowAutoRedirect = $false
+            $req.Timeout = 30000
+            $resp = $req.GetResponse()
+            $code = [int]$resp.StatusCode; $loc = "" + $resp.Headers['Location']
+            $resp.Close()
+        } catch [System.Net.WebException] {
             if ($_.Exception.Response) {
                 $code = [int]$_.Exception.Response.StatusCode
-                $loc  = "" + $_.Exception.Response.Headers.Location
+                $loc  = "" + $_.Exception.Response.Headers['Location']
             }
         }
         Write-Host "  HTTP $code -> $($loc.Substring(0, [Math]::Min(110, $loc.Length)))" -ForegroundColor DarkGray
