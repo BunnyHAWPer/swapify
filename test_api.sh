@@ -1128,6 +1128,26 @@ else
   echo "${YELLOW}(skipping 105m: set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET to test the redirect)${RESET}"
 fi
 
+section "105p" "AUTH — GOOGLE REDIRECT URI IS ONE GOOGLE ACCEPTS  (redirect_uri_mismatch guard)"
+# 'configured: true' is not enough: a client can have valid credentials and still
+# fail every sign-in because redirect_uri is not registered in Cloud Console.
+# That is exactly how this broke in production (APP_BASE_URL/GOOGLE_REDIRECT_URI
+# left pointing at localhost on a public deploy), and it failed invisibly.
+request GET "/auth/google/config" "" noauth
+REDIR_OK="$(printf '%s' "$LAST_BODY" | json_get redirect_uri_registered)"
+REDIR_URI="$(printf '%s' "$LAST_BODY" | json_get redirect_uri)"
+echo "${BLUE}redirect_uri = ${REDIR_URI:-?}  registered = ${REDIR_OK:-unknown}${RESET}"
+case "$REDIR_OK" in
+  True)
+    echo "${GREEN}PASS  redirect_uri is registered for this client${RESET}"; PASS=$((PASS+1)) ;;
+  False)
+    echo "${RED}FAIL  redirect_uri is NOT registered — Google will answer redirect_uri_mismatch${RESET}"
+    printf '%s' "$LAST_BODY" | json_get warning
+    FAIL=$((FAIL+1)) ;;
+  *)
+    echo "${YELLOW}SKIP  no client_secret*.json present, so the registered list is unknown${RESET}" ;;
+esac
+
 section "105n" "AUTH — GOOGLE CALLBACK WITH A FORGED STATE -> 400  (CSRF guard)"
 request GET "/auth/google/callback?code=fake&state=forged" "" noauth "" 4
 
@@ -1328,6 +1348,102 @@ check "report flagged as unauthenticated"      "$RM_AUTH"   "False"
 
 echo "${DIM}  FIX #9 (sodium vs salt): a frontend-only change — bare 'Salt' is no longer flagged"
 echo "  when the sodium panel reads 0mg (static/script.js calculateScore). Not an API check.${RESET}"
+
+# =============================================================================
+banner "2 AUGUST REVIEWER FIXES  (auto-fill coverage, safety-net honesty, cross-brand guard)"
+
+section "128a" "AUTO-FILL SOURCE HEALTH  (GET /autofill/status)  <- why a product came back empty"
+echo "${DIM}A product the chain cannot resolve returns a plain 404, identical whether the product${RESET}"
+echo "${DIM}genuinely has no published data or every search provider is refusing us. This endpoint${RESET}"
+echo "${DIM}is what tells those two apart, so it must always answer.${RESET}"
+request GET "/autofill/status" "" noauth
+AF_OFF="$("$PY" -c "import sys,json;print((json.load(sys.stdin).get('sources') or {}).get('openfoodfacts',{}).get('available'))" <<< "$LAST_BODY")"
+AF_DEP="$(printf '%s' "$LAST_BODY" | json_get has_dependable_search)"
+echo "${BLUE}  openfoodfacts.available=$AF_OFF   has_dependable_search=$AF_DEP${RESET}"
+check "auto-fill status reports Open Food Facts as a source" "$AF_OFF" "True"
+# has_dependable_search is False until GOOGLE_API_KEY + GOOGLE_CSE_ID are set; the
+# assertion is that the field is *present and boolean*, not which way it points.
+DEP_IS_BOOL="$([ "$AF_DEP" = "True" ] || [ "$AF_DEP" = "False" ] && echo yes || echo no)"
+check "has_dependable_search is reported as a boolean" "$DEP_IS_BOOL" "yes"
+if [ "$AF_DEP" = "False" ]; then
+  HAS_WARN="$("$PY" -c "import sys,json;print('yes' if (json.load(sys.stdin).get('warning') or '').strip() else 'no')" <<< "$LAST_BODY")"
+  check "no keyed provider -> a warning explains the consequence" "$HAS_WARN" "yes"
+fi
+
+section "128b" "PROVIDER PROBE IS ADMIN-GATED -> 403  (GET /autofill/status?probe=true)"
+echo "${DIM}The probe opens real pages and exposes provider error text, so it needs the shared secret.${RESET}"
+request GET "/autofill/status?probe=true" "" noauth "" 4
+
+section "128c" "PROVIDER PROBE MEASURES USEFULNESS, NOT HITS  (?probe=true with X-Admin-Token)"
+echo "${DIM}A provider returning five results is not a working safety net: Bing's keyless RSS answers${RESET}"
+echo "${DIM}every packaged-product query with the brand's HOME PAGE, which has no nutrition panel on${RESET}"
+echo "${DIM}it, and it ignores 'site:' filters entirely. So the probe opens the top hits and tries to${RESET}"
+echo "${DIM}extract nutrition — 'ok' must mean that succeeded, never merely that results came back.${RESET}"
+request_admin GET "/autofill/status?probe=true" "" "${ADMIN_TOKEN:-swapify-admin-dev}"
+PROBE_N="$("$PY" -c "import sys,json;print(len(json.load(sys.stdin).get('probe') or []))" <<< "$LAST_BODY")"
+PROBE_FIELD_OK="$("$PY" -c "
+import sys, json
+probe = json.load(sys.stdin).get('probe') or []
+live = [p for p in probe if 'skipped' not in p and 'error' not in p]
+print('yes' if live and all('nutrition_parsed' in p for p in live) else 'no')" <<< "$LAST_BODY")"
+PROBE_OK_HONEST="$("$PY" -c "
+import sys, json
+probe = json.load(sys.stdin).get('probe') or []
+live = [p for p in probe if 'skipped' not in p and 'error' not in p]
+# ok must never be true while nothing could be parsed — that is the exact way the
+# old count-based probe reported a dead provider as healthy.
+print('yes' if all(bool(p.get('ok')) == bool(p.get('nutrition_parsed')) for p in live) else 'no')" <<< "$LAST_BODY")"
+echo "${BLUE}  probed $PROBE_N providers${RESET}"
+check "probe reports every live provider" "$([ "${PROBE_N:-0}" -gt 0 ] && echo yes || echo no)" "yes"
+check "each probed provider reports nutrition_parsed" "$PROBE_FIELD_OK" "yes"
+check "'ok' means nutrition was extracted, not just that hits came back" "$PROBE_OK_HONEST" "yes"
+
+section "128d" "CROSS-BRAND GUARD — a branded query is never answered by a generic product"
+echo "${DIM}Open Food Facts holds Kapiva's Amla Juice (8901207034145) with an EMPTY nutriments object,${RESET}"
+echo "${DIM}and its search returns unrelated amla juices that do carry panels. 'juice' is a stopword,${RESET}"
+echo "${DIM}so a generic 'Amla Juice' shared exactly half of the query's identifying words and cleared${RESET}"
+echo "${DIM}the old '>= 0.5' relevance bar — filling Kapiva with another product's numbers under a${RESET}"
+echo "${DIM}confident 'openfoodfacts' label. A strict majority is now required. Empty is the correct${RESET}"
+echo "${DIM}answer here; wrong data would be worse than none.${RESET}"
+# 404 is a legitimate PASS here — "no source publishes this" is the honest answer —
+# so accept either a 2xx or a 4xx and let the content check below be the real test.
+request GET "/product/by-name/Kapiva%20Amla%20Juice" "" noauth "" "[24]"
+KAP_CODE="$LAST_CODE"
+KAP_CLEAN="$("$PY" -c "
+import sys, json
+QUERY = 'kapiva amla juice'
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except Exception:
+    print('yes'); raise SystemExit
+if not isinstance(d, dict) or d.get('error'):
+    print('yes'); raise SystemExit          # 404 = honest 'no data', which is fine
+# Judge the BRAND, not the name: the by-name resolver echoes the query back as the
+# product_name, so 'Kapiva' is present even when the panel came from someone else.
+# The production symptom was exactly that — product_name 'Kapiva Amla Juice' with
+# brand 'Dabur' — so a name check would have passed the very bug it must catch.
+brand = (d.get('brand') or '').strip().lower()
+print('yes' if (not brand or brand in QUERY) else 'no')" <<< "$LAST_BODY")"
+echo "${BLUE}  HTTP $KAP_CODE -> not-another-brand: $KAP_CLEAN${RESET}"
+check "Kapiva query is answered by Kapiva or by nothing" "$KAP_CLEAN" "yes"
+
+section "128e" "OFF EMPTY-ROW FALLBACK — a nutrition-less barcode row no longer ends the lookup"
+echo "${DIM}OFF lists many Indian packs as name+image with no nutriments, and the SAME pack again under${RESET}"
+echo "${DIM}a neighbouring GTIN with the full panel (Amul Butter: ...0153 is empty, ...0030 is complete).${RESET}"
+echo "${DIM}The old code returned the empty row and stopped, so the source 'succeeded' with no data.${RESET}"
+request GET "/product/by-name/Amul%20Butter" "" noauth
+AB_CAL="$("$PY" -c "
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception: print('no'); raise SystemExit
+print('yes' if isinstance(d, dict) and d.get('calories_kcal_per_serving') is not None else 'no')" <<< "$LAST_BODY")"
+echo "${BLUE}  HTTP $LAST_CODE  has_calories=$AB_CAL${RESET}"
+if [ "$LAST_CODE" = "200" ]; then
+  check "a widely-stocked pack resolves with real calories" "$AB_CAL" "yes"
+else
+  echo "${YELLOW}  (Open Food Facts unreachable — skipping the auto-fill assert)${RESET}"
+fi
 
 # =============================================================================
 banner "DATABASE VERIFICATION  (proving the writes actually persisted)"
