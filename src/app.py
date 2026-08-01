@@ -944,9 +944,56 @@ PASSWORD_RESET_TTL_MINUTES = int(os.environ.get("PASSWORD_RESET_TTL_MINUTES", "3
 PASSWORD_MIN_LENGTH = int(os.environ.get("PASSWORD_MIN_LENGTH", "6"))
 FORGOT_PASSWORD_MAX_PER_HOUR = int(os.environ.get("FORGOT_PASSWORD_MAX_PER_HOUR", "5"))
 
+def _loopback_base(url: str) -> bool:
+    """Is ``url`` a localhost address (i.e. useless to anyone but this machine)?"""
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+
+
+def _public_base_url() -> str:
+    """The base URL that is actually reachable from the internet.
+
+    ``APP_BASE_URL`` is the declared value, but a deploy can easily disagree with
+    it: Render's dashboard env vars override render.yaml and had drifted to
+    ``http://localhost:8000``, which made /auth/google/login send Google a
+    redirect_uri that is not registered for the client — every sign-in died with
+    "Error 400: redirect_uri_mismatch", and every emailed reset link pointed at
+    the reader's own machine.
+
+    A platform that puts us on a public hostname tells us so out of band
+    (``RENDER_EXTERNAL_URL``, and the equivalents elsewhere). That value is set by
+    the platform, not by the caller, so unlike the Host header it cannot be
+    spoofed into poisoning a password-reset link. When it exists and the declared
+    base is loopback, the declared value is drift: prefer the real one and say so.
+    """
+    declared = (os.environ.get("APP_BASE_URL") or "").rstrip("/")
+    external = ""
+    for key in ("RENDER_EXTERNAL_URL", "APP_PUBLIC_URL"):
+        val = (os.environ.get(key) or "").strip().rstrip("/")
+        if val:
+            external = val if "://" in val else f"https://{val}"
+            break
+    if not external:
+        host = (os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "").strip().rstrip("/")
+        if host:
+            external = f"https://{host}"
+    if external and (not declared or _loopback_base(declared)):
+        if declared:
+            logger.warning(
+                "APP_BASE_URL is %r but this service is publicly reachable at %r — "
+                "using the public URL so Google sign-in and emailed links work. "
+                "Fix APP_BASE_URL in the host's dashboard to silence this.",
+                declared, external)
+        return external
+    return declared or "http://127.0.0.1:8000"
+
+
 # Public base URL of *this* API — used for the reset link and as the default
 # OAuth redirect target. Must match what is registered in Google Cloud Console.
-APP_BASE_URL = (os.environ.get("APP_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+APP_BASE_URL = _public_base_url().rstrip("/")
 # Where the web app lives, when it is deployed separately from the API (it is:
 # Vercel frontend, Render backend). Used to hand the OAuth result back.
 FRONTEND_BASE_URL = (os.environ.get("FRONTEND_BASE_URL") or "").rstrip("/")
@@ -1472,32 +1519,58 @@ def _google_config() -> dict:
         "source": "env",
     }
 
-    if not (cfg["client_id"] and cfg["client_secret"]):
-        path = (os.environ.get("GOOGLE_CLIENT_SECRETS_FILE") or "").strip()
-        candidates = [path] if path else []
-        if not candidates:
-            import glob
-            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            candidates = sorted(glob.glob(os.path.join(root, "client_secret*.json")))
-        for candidate in candidates:
-            try:
-                with open(candidate, "r", encoding="utf-8") as fh:
-                    raw = json.load(fh)
-                block = raw.get("web") or raw.get("installed") or raw
-                cfg["client_id"] = cfg["client_id"] or (block.get("client_id") or "").strip()
-                cfg["client_secret"] = cfg["client_secret"] or (block.get("client_secret") or "").strip()
+    # The JSON is read even when the env vars already supply the credentials: it
+    # is the only local record of which redirect URIs Google will actually accept,
+    # and a redirect_uri Google does not know is the single most common way this
+    # feature fails (Error 400: redirect_uri_mismatch). Env still wins for the
+    # credentials themselves.
+    path = (os.environ.get("GOOGLE_CLIENT_SECRETS_FILE") or "").strip()
+    candidates = [path] if path else []
+    if not candidates:
+        import glob
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        candidates = sorted(glob.glob(os.path.join(root, "client_secret*.json")))
+    for candidate in candidates:
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            block = raw.get("web") or raw.get("installed") or raw
+            from_file = not (cfg["client_id"] and cfg["client_secret"])
+            cfg["client_id"] = cfg["client_id"] or (block.get("client_id") or "").strip()
+            cfg["client_secret"] = cfg["client_secret"] or (block.get("client_secret") or "").strip()
+            uris = [str(u).strip() for u in (block.get("redirect_uris") or []) if str(u).strip()]
+            if uris:
+                cfg["registered_redirect_uris"] = uris
                 if not cfg["redirect_uri"]:
-                    uris = block.get("redirect_uris") or []
-                    if uris:
-                        cfg["redirect_uri"] = uris[0]
+                    cfg["redirect_uri"] = uris[0]
+            if from_file:
                 cfg["source"] = f"file:{os.path.basename(candidate)}"
-                break
-            except Exception as exc:
-                logger.warning("could not read Google client secrets from %s: %s",
-                               candidate, exc)
+            break
+        except Exception as exc:
+            logger.warning("could not read Google client secrets from %s: %s",
+                           candidate, exc)
 
     if not cfg["redirect_uri"]:
         cfg["redirect_uri"] = f"{APP_BASE_URL}/auth/google/callback"
+    elif _loopback_base(cfg["redirect_uri"]) and not _loopback_base(APP_BASE_URL):
+        # Same drift as APP_BASE_URL, one env var further along: a public deploy
+        # inheriting a developer's GOOGLE_REDIRECT_URI=http://localhost:8000/...
+        # sends Google a URI no client registers, and every sign-in dies with
+        # redirect_uri_mismatch. We are demonstrably not on localhost, so the
+        # loopback value cannot be right — prefer a registered URI on our own
+        # origin, else rebuild it from the public base.
+        stale = cfg["redirect_uri"]
+        same_origin = [u for u in (cfg.get("registered_redirect_uris") or [])
+                       if u.startswith(APP_BASE_URL + "/")]
+        cfg["redirect_uri"] = (same_origin[0] if same_origin
+                               else f"{APP_BASE_URL}/auth/google/callback")
+        logger.warning(
+            "GOOGLE_REDIRECT_URI is %r but this service is public at %r — using "
+            "%r instead so Google does not reject sign-in with "
+            "redirect_uri_mismatch. Fix GOOGLE_REDIRECT_URI in the host's "
+            "dashboard to silence this.",
+            stale, APP_BASE_URL, cfg["redirect_uri"])
+        cfg["redirect_uri_healed_from"] = stale
     cfg["configured"] = bool(cfg["client_id"] and cfg["client_secret"])
     _google_config_cache.update(cfg)
     if not cfg["configured"]:
@@ -1506,7 +1579,29 @@ def _google_config() -> dict:
             "Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (Google Cloud Console "
             "> APIs & Services > Credentials > OAuth 2.0 Client IDs)."
         )
+    elif not _google_redirect_registered(cfg):
+        # Configured but unusable: Google rejects the round-trip with
+        # "Error 400: redirect_uri_mismatch" before the user ever sees consent.
+        logger.warning(
+            "Google OAuth redirect_uri %r is NOT among the URIs registered for "
+            "this client %s — sign-in will fail with redirect_uri_mismatch. Set "
+            "GOOGLE_REDIRECT_URI to a registered value, or add this one under "
+            "Google Cloud Console > Credentials > Authorised redirect URIs.",
+            cfg["redirect_uri"], cfg.get("registered_redirect_uris"),
+        )
     return cfg
+
+
+def _google_redirect_registered(cfg: dict):
+    """Is ``redirect_uri`` one Google will accept? ``None`` when we cannot tell.
+
+    Only answerable when the client_secret JSON is present — the env vars alone
+    carry no record of what Console has registered.
+    """
+    registered = cfg.get("registered_redirect_uris")
+    if not registered:
+        return None
+    return cfg.get("redirect_uri") in registered
 
 
 def _require_google_config() -> dict:
@@ -1768,16 +1863,44 @@ def _upsert_google_user(claims: dict) -> dict:
 
 @app.get("/auth/google/config")
 def google_oauth_config():
-    """What the frontend needs to render a Google button (no secrets)."""
+    """What the frontend needs to render a Google button (no secrets).
+
+    ``redirect_uri_registered`` is the health check that matters in practice:
+    ``configured: true`` only means credentials exist, and a client can be fully
+    configured yet still fail every sign-in because ``redirect_uri`` is not one
+    Google knows. ``null`` means we have no local copy of the registered list.
+    """
     cfg = _google_config()
-    return {
+    registered = _google_redirect_registered(cfg)
+    out = {
         "configured": cfg["configured"],
         "client_id": cfg["client_id"],       # public by design
         "redirect_uri": cfg["redirect_uri"],
+        "redirect_uri_registered": registered,
         "login_url": f"{APP_BASE_URL}/auth/google/login",
         "scopes": GOOGLE_SCOPES.split(),
         "credentials_source": cfg["source"],
     }
+    if cfg.get("redirect_uri_healed_from"):
+        # Say so out loud: the value in the dashboard is still wrong, we are just
+        # no longer obeying it, and the next person to read the env var deserves
+        # to know why it does not match what Google is being sent.
+        out["redirect_uri_healed_from"] = cfg["redirect_uri_healed_from"]
+        out["notice"] = (
+            f"GOOGLE_REDIRECT_URI is set to {cfg['redirect_uri_healed_from']!r}, "
+            f"which is a localhost address this public deploy cannot use. Using "
+            f"{cfg['redirect_uri']!r} instead. Set GOOGLE_REDIRECT_URI (and "
+            f"APP_BASE_URL) to this server's public URL to make it explicit."
+        )
+    if registered is False:
+        out["warning"] = (
+            f"redirect_uri {cfg['redirect_uri']!r} is not registered for this "
+            f"client, so Google will reject sign-in with redirect_uri_mismatch. "
+            f"Registered: {cfg.get('registered_redirect_uris')}. Fix by setting "
+            f"GOOGLE_REDIRECT_URI to a registered value (and APP_BASE_URL to this "
+            f"server's public URL), or by adding this URI in Google Cloud Console."
+        )
+    return out
 
 
 @app.get("/auth/google/login")
@@ -2469,6 +2592,19 @@ CATEGORY_EXTERNAL_TIMEOUT_S = float(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TI
 _category_external_cache = TTLCache(
     maxsize=256, ttl=int(os.environ.get("SWAPIFY_CATEGORY_EXTERNAL_TTL", "1800")))
 _OFF_MAX_PAGE_SIZE = 250  # Search-a-licious' per-request ceiling
+
+# How deep the auto-fill name fallback reads OFF's ranked hits. Six was too
+# shallow: OFF sorts on text relevance, not on data completeness, so the empty
+# duplicates of a popular Indian pack occupy the first rows and the copy that
+# carries the panel sits below them (Amul Butter's filled row is the 4th hit, and
+# for less-scanned packs it is deeper still). Every row is relevance-gated before
+# use, so reading further can only add candidates the gate then has to approve.
+_OFF_NAME_FALLBACK_LIMIT = int(os.environ.get("SWAPIFY_OFF_NAME_FALLBACK", "12"))
+
+# How many of a provider's hits /autofill/status?probe=true actually opens before
+# declaring it unusable. Two is enough to tell "found the product" from "found the
+# brand's home page" without turning a diagnostic into a crawl.
+_PROBE_PAGES_PER_PROVIDER = 2
 # Fixed page size for category paging: every (offset, limit) a client asks for is
 # served out of these pages, so two clients paging differently still share cache
 # entries instead of each forking their own buffer. 100 keeps a single page cheap
@@ -2680,8 +2816,24 @@ def _ensure_display_name(product: dict) -> dict:
 
 
 def _present_nutrient_fields(product: dict) -> list:
-    """List of fillable fields ``product`` actually has (for the audit trail)."""
+    """List of fillable fields ``product`` actually has (for the audit trail).
+
+    Spans FILLABLE_FIELDS, so an image or a category counts. That is right for an
+    audit trail and wrong for "did this source give us nutrition?" — use
+    ``_has_any_nutrition`` for the latter."""
     return [f for f in FILLABLE_FIELDS if _field_present(product.get(f))]
+
+
+def _has_any_nutrition(product: dict) -> bool:
+    """True when at least one of the six core nutrients carries a value.
+
+    The distinction from ``_present_nutrient_fields`` matters: Open Food Facts
+    returns plenty of Indian packs as a name, a category and a photo with an empty
+    ``nutriments`` object, and those rows are truthy on every fillable-field test
+    while contributing nothing a score can be computed from."""
+    if not product:
+        return False
+    return any(_field_present(product.get(f)) for f in CORE_NUTRIENT_FIELDS)
 
 
 def _fill_missing_fields(base: dict, extra: dict) -> list:
@@ -2724,11 +2876,24 @@ def _name_is_relevant(query: str, candidate: str) -> bool:
     Yogurt Parfait". Filling our DB with that is worse than filling nothing.
 
     A single shared generic word ("fruit") is not enough — that is exactly how the
-    parfait sneaks in. We require a real overlap: at least half of the query's
-    identifying words appear in the candidate (and, when the query is a single
-    word like "Frooti", that exact word must be present). With no query name to
-    judge against (a bare barcode lookup) relevance can't be assessed, so we allow
-    it — a GTIN match is already exact."""
+    parfait sneaks in. We require a *strict* majority of the query's identifying
+    words to appear in the candidate (and, when the query is a single word like
+    "Frooti", that exact word must be present). With no query name to judge
+    against (a bare barcode lookup) relevance can't be assessed, so we allow it —
+    a GTIN match is already exact.
+
+    The majority must be strict, not "at least half". On a two-word brand+product
+    query — the commonest shape in this catalogue — a half-share is exactly one
+    word, so an "at least half" test accepted any candidate that echoed the
+    product noun and dropped the brand: "Kapiva Amla Juice" matched a *generic*
+    "Amla Juice" (juice is a stopword, so the ratio was 1/2), and "Amul Butter"
+    matched "Amul Taaza", a milk. Both would have written another product's panel
+    into this one under a confident-looking source label. Requiring more than half
+    means the brand token can no longer be the one that is dropped.
+
+    Callers comparing against a source that keeps the brand in its own column
+    (Open Food Facts) should pass "<name> <brand>" as ``candidate`` so a row
+    genuinely named "Butter" by brand "Amul" still clears the higher bar."""
     q_tokens = _significant_tokens(query)
     if not q_tokens:
         return True
@@ -2738,9 +2903,10 @@ def _name_is_relevant(query: str, candidate: str) -> bool:
     overlap = q_tokens & c_tokens
     if not overlap:
         return False
-    # Need a majority of the query's identifying words, so one incidental shared
-    # word ("fruit") can't carry an otherwise-unrelated product through.
-    return len(overlap) / len(q_tokens) >= 0.5
+    # A strict majority of the query's identifying words, so neither one
+    # incidental shared word ("fruit") nor the product noun alone ("amla") can
+    # carry an otherwise-unrelated product through.
+    return len(overlap) / len(q_tokens) > 0.5
 
 
 # --- Source 2: Open Food Facts ------------------------------------------------
@@ -2792,19 +2958,40 @@ def _source_openfoodfacts(barcode: str, name: str):
 
     The name fallback only accepts a candidate that is actually relevant to the
     name we searched (see _name_is_relevant), so a loose text match can't inject
-    an unrelated product's nutrition into our DB (already per-100g)."""
+    an unrelated product's nutrition into our DB (already per-100g).
+
+    A barcode hit that carries *no* nutrition does not end the lookup. Open Food
+    Facts holds many Indian packs as a bare name+image with an empty ``nutriments``
+    object, and the same pack is often present a second time under a neighbouring
+    GTIN with the full panel (Amul Butter: 8901262010153 is empty, 8901262010030
+    has all six nutrients). Returning the empty row and stopping meant the source
+    reported success while contributing nothing, and the rest of the chain was
+    skipped because the product "had been found". We keep the barcode row for its
+    identity — barcode, name, brand, image — and look for a panel to merge into
+    it, so the stored product is still *this* GTIN."""
+    base = None
     if barcode:                      # name-driven resolution has no barcode to look up
         got = fetch_off_product(barcode)
         if got is not None:
-            return got
+            if _has_any_nutrition(got):
+                return got
+            base = got
     name = (name or "").strip()
     if not name:
-        return None
-    for cand in _off_search_by_name(name, limit=6):
-        if not _has_missing_nutrition(cand) or _present_nutrient_fields(cand):
-            if _name_is_relevant(name, cand.get("product_name") or ""):
-                return cand
-    return None
+        return base
+    for cand in _off_search_by_name(name, limit=_OFF_NAME_FALLBACK_LIMIT):
+        if not _has_any_nutrition(cand):
+            continue
+        # OFF keeps the brand in its own column, so a row named just "Butter" by
+        # "Amul" has to be judged on both or the brand token looks missing.
+        candidate_text = f"{cand.get('product_name') or ''} {cand.get('brand') or ''}"
+        if not _name_is_relevant(name, candidate_text):
+            continue
+        if base is None:
+            return cand
+        _fill_missing_fields(base, cand)
+        return base
+    return base
 
 
 def _external_search_results(query: str, limit: int = None, timeout: float = None):
@@ -2951,7 +3138,61 @@ def _off_category_total(category: str):
     total = _off_result_total(_off_category_query(category))
     if total is not None:
         _category_count_cache[category] = total
+        _store_category_count(category, total)
     return total
+
+
+def ensure_category_count_schema():
+    """Table backing the on-disk half of the category-count cache. Idempotent."""
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS category_count_cache (
+                   category   TEXT PRIMARY KEY,
+                   total      INTEGER NOT NULL,
+                   updated_at REAL    NOT NULL
+               )"""
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:  # pragma: no cover - cache is best-effort
+        logger.warning("category count cache schema failed: %s", exc)
+
+
+def _store_category_count(category: str, total: int):
+    """Persist one count so a restart does not have to re-earn it."""
+    try:
+        conn = get_db_connection()
+        conn.execute(
+            "INSERT INTO category_count_cache (category, total, updated_at) "
+            "VALUES (?, ?, ?) ON CONFLICT(category) DO UPDATE SET "
+            "total = excluded.total, updated_at = excluded.updated_at",
+            (category, int(total), time.time()),
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as exc:  # pragma: no cover
+        logger.debug("category count persist failed for %s: %s", category, exc)
+
+
+def _load_persisted_category_counts() -> dict:
+    """Counts saved by a previous process, as ``{category: (total, age_s)}``.
+
+    The in-memory TTLCache is per-process, so on a platform that sleeps idle
+    services (Render's free tier) every visit after a nap started from nothing:
+    23 categories all had to be counted inside one 6s deadline, ~8 never made it,
+    and those tiles reported our DB rows alone — "the Categories API isn't
+    returning all the products". The numbers were already paid for; they just
+    were not written down anywhere that outlived the process."""
+    try:
+        conn = get_db_connection()
+        rows = conn.execute(
+            "SELECT category, total, updated_at FROM category_count_cache").fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return {}
+    now = time.time()
+    return {r["category"]: (r["total"], now - (r["updated_at"] or 0)) for r in rows}
 
 
 def _off_category_slice(category: str, offset: int, count: int):
@@ -3662,8 +3903,73 @@ _WEB_PROVIDER_REQUIREMENTS = {
 }
 
 
+def _probe_search_providers():
+    """Run one real query through every configured provider and report what came
+    back. ``configured`` only means the env vars exist — a Google CSE key still
+    returns nothing if the Custom Search API is not enabled on the project, or if
+    the engine is not set to search the entire web, and both of those fail as a
+    silent empty list. This turns that into a visible answer.
+
+    "Returned some results" is NOT the same as "can find a nutrition panel", and
+    reporting only a count made the weakest provider look like the healthiest.
+    Measured from two different IPs, Bing's keyless RSS endpoint answers every
+    query about a packaged product with the *brand's home page* — and it ignores a
+    `site:` filter entirely, returning the identical home page for all of
+    `site:bigbasket.com`, `site:amazon.in`, `site:1mg.com` and five others. Five
+    results, zero of them a page with a panel on it.
+
+    So the probe finishes the job the safety net would do: it opens the top hits
+    and tries to extract nutrition from them, and ``ok`` means *that* succeeded.
+    Counting results, or even URL depth, cannot express this — nutella.com/in/en/
+    is a deep-looking path and still a home page. One provider's verdict costs a
+    couple of page fetches, which is why this stays admin-gated."""
+    out = []
+    for name, fn in WEB_SEARCH_PROVIDERS:
+        required = _WEB_PROVIDER_REQUIREMENTS.get(name, ())
+        if any(not (os.environ.get(k) or "").strip() for k in required):
+            out.append({"provider": name, "skipped": "not configured"})
+            continue
+        started = time.time()
+        try:
+            hits = fn("Nutella hazelnut spread nutrition facts per 100g", 5) or []
+            parsed, from_url = None, ""
+            for hit in hits[:_PROBE_PAGES_PER_PROVIDER]:
+                url = hit.get("url") or ""
+                parsed = (_parse_nutrition_text(hit.get("snippet") or "")
+                          or _parse_nutrition_page(_fetch_page_text(url)))
+                if parsed:
+                    from_url = url
+                    break
+            entry = {"provider": name, "results": len(hits),
+                     "nutrition_parsed": bool(parsed),
+                     "ok": bool(parsed), "seconds": round(time.time() - started, 2)}
+            if hits:
+                entry["sample_url"] = hits[0].get("url") or ""
+            if parsed:
+                entry["parsed_fields"] = sorted(parsed)
+                entry["parsed_from"] = from_url
+            elif hits:
+                entry["hint"] = ("Answered, but nothing on the pages it returned "
+                                 "could be parsed as nutrition — typically a brand "
+                                 "home page rather than the product's panel. This "
+                                 "provider cannot feed the safety net.")
+            else:
+                entry["hint"] = ("Reachable but returned nothing — keyless engines "
+                                 "answer a challenge page from server IPs; a keyed "
+                                 "provider here usually means the API is not enabled "
+                                 "or the engine does not search the whole web.")
+            out.append(entry)
+        except Exception as exc:
+            out.append({"provider": name, "ok": False,
+                        "error": f"{type(exc).__name__}: {str(exc)[:200]}"})
+    return out
+
+
 @app.get("/autofill/status")
-def autofill_status():
+def autofill_status(
+        probe: bool = False,
+        x_admin_token: Optional[str] = Header(default=None, alias="X-Admin-Token"),
+):
     """Can the auto-fill chain actually reach its sources right now?
 
     Exists because the failure mode is invisible: a product the chain cannot
@@ -3728,7 +4034,27 @@ def autofill_status():
             "then set GOOGLE_API_KEY and GOOGLE_CSE_ID. Free tier: 100 queries/day."
         )
         if keyless_available:
-            body["warning"] += " Keyless engines are answering right now, but unreliably."
+            body["warning"] += (
+                " Keyless engines are reachable, but do not read that as a working "
+                "safety net: measured from two IPs, DuckDuckGo answers a 202 "
+                "challenge, DuckDuckGo-Lite and Mojeek return nothing, and Bing's "
+                "RSS endpoint returns the brand's home page for every query while "
+                "ignoring `site:` filters. A home page carries no nutrition panel, "
+                "so the net finds nothing to parse. Run this endpoint with "
+                "?probe=true and compare `deep_results` against `results`."
+            )
+    if not probe:
+        return body
+
+    # A live probe spends real quota and exposes provider error text, so it is
+    # admin-gated exactly like /auth/email/status?probe=true.
+    expected = (os.environ.get("ADMIN_TOKEN") or "swapify-admin-dev").strip()
+    if not (x_admin_token and hmac.compare_digest(x_admin_token.strip(), expected)):
+        raise HTTPException(
+            status_code=403,
+            detail="probe=true requires the shared secret in the 'X-Admin-Token' header.",
+        )
+    body["probe"] = _probe_search_providers()
     return body
 
 
@@ -3779,30 +4105,22 @@ def _web_nutrition(query: str, barcode: str):
         cached = _web_nutrition_cache[cache_key]
         return dict(cached) if cached else None
 
-    # Two query shapes: the phrase a nutrition page is written with, then a
-    # looser one for products only a shopping listing mentions. The second is
-    # only paid for when the first returns nothing we can use.
+    # Query shapes, most specific first: the phrase a nutrition page is written
+    # with, then looser ones for products only a shopping listing mentions. Each
+    # is only paid for when the previous returned nothing we can use.
+    #
+    # The bare product name is last but matters more than it looks. Keyed engines
+    # (SerpAPI/CSE) handle the nutrition-keyword shapes well, but the keyless
+    # fallbacks do not: measured against Bing's RSS endpoint, every keyword shape
+    # for "Kapiva Amla Juice" returned the brand's *home page* (and the LinkedIn
+    # profile), which relevance-checks away to nothing — while the bare name
+    # returned the actual Amazon/Flipkart/1mg product pages. Without this variant
+    # a keyless deploy searches three times and can never find the product.
     variants = [f"{query} nutrition facts per 100g"]
     if barcode:
         variants.append(f"{barcode} {query} nutrition information")
     variants.append(f"{query} calories sugar protein per 100g")
-
-    provider, relevant, seen_hits = None, [], 0
-    for terms in variants:
-        for name, results in _web_search_iter(terms.strip()):
-            seen_hits += len(results)
-            hits = [r for r in results
-                    if _name_is_relevant(query, f"{r.get('title','')} {r.get('snippet','')}")]
-            if hits:
-                provider, relevant = name, hits
-                break
-        if relevant or _autofill_remaining() <= 1.0:
-            break
-    if not relevant:
-        logger.info("web net: no relevant result for %r (%d raw hits across providers)",
-                    query, seen_hits)
-        _web_nutrition_cache[cache_key] = None
-        return None
+    variants.append(query)
 
     found, evidence = {}, []
 
@@ -3816,24 +4134,53 @@ def _web_nutrition(query: str, barcode: str):
             if url and url not in evidence:
                 evidence.append(url)
 
-    # Pass 1 — snippets (free, already downloaded).
-    for res in relevant:
-        _absorb(res.get("snippet") or "", res.get("url") or "")
+    # Each variant is searched AND read before the next is considered. The
+    # earlier version stopped at the first variant whose hits merely looked
+    # name-relevant, which quietly wasted the other variants: a search for
+    # "Kapiva Amla Juice nutrition facts per 100g" returns the brand's home page,
+    # that page mentions "Kapiva" so it passes the relevance gate, it carries no
+    # panel — and the loop had already broken, so the query shapes that do find
+    # the product were never tried. Relevance is not the same as usable, so the
+    # loop now continues until nutrition is actually extracted or budget is gone.
+    provider, seen_hits = None, 0
+    for terms in variants:
+        relevant = []
+        for name, results in _web_search_iter(terms.strip()):
+            seen_hits += len(results)
+            hits = [r for r in results
+                    if _name_is_relevant(query, f"{r.get('title','')} {r.get('snippet','')}")]
+            if hits:
+                provider, relevant = name, hits
+                break
+        if relevant:
+            # Pass 1 — snippets (free, already downloaded).
+            for res in relevant:
+                _absorb(res.get("snippet") or "", res.get("url") or "")
 
-    # Pass 2 — open the pages, but only while a score-driving nutrient is still
-    # missing and there is budget left to spend.
-    missing_primary = any(f not in found for f in PRIMARY_NUTRIENT_FIELDS)
-    pages = [r.get("url") for r in relevant if r.get("url")][:WEB_PAGE_FETCH_LIMIT]
-    if missing_primary and pages and _autofill_remaining() > 0.5:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pages), 4)) as pool:
-            texts = list(pool.map(_fetch_page_text, pages))
-        for url, text in zip(pages, texts):
-            if not text or not _name_is_relevant(query, text[:400]):
-                continue
-            _absorb(text, url, is_page=True)
+            # Pass 2 — open the pages, but only while a score-driving nutrient is
+            # still missing and there is budget left to spend.
+            pages = [r.get("url") for r in relevant if r.get("url")][:WEB_PAGE_FETCH_LIMIT]
+            if (any(f not in found for f in PRIMARY_NUTRIENT_FIELDS)
+                    and pages and _autofill_remaining() > 0.5):
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(len(pages), 4)) as pool:
+                    texts = list(pool.map(_fetch_page_text, pages))
+                for url, text in zip(pages, texts):
+                    if not text or not _name_is_relevant(query, text[:400]):
+                        continue
+                    _absorb(text, url, is_page=True)
+
+        # Enough to score on, or nothing left to spend: stop paying for searches.
+        if not any(f not in found for f in PRIMARY_NUTRIENT_FIELDS):
+            break
+        if _autofill_remaining() <= 1.0:
+            break
 
     if not found:
-        logger.info("web net: searched %s for %r, no nutrition parsed", provider, query)
+        logger.info("web net: searched %s for %r across %d quer%s (%d raw hits), "
+                    "no nutrition parsed",
+                    provider or "no provider", query, len(variants),
+                    "y" if len(variants) == 1 else "ies", seen_hits)
         _web_nutrition_cache[cache_key] = None
         return None
 
@@ -7511,6 +7858,21 @@ def _category_external_counts(names, want_external: bool):
             counts[name] = _category_count_cache[name]
         else:
             pending.append(name)
+
+    # A count this service already earned in an earlier life. Fresh ones settle
+    # the category outright; expired ones are still a far better answer than
+    # None, so they are served while the refresh below races the deadline.
+    stale = {}
+    if pending:
+        for name, (total, age) in _load_persisted_category_counts().items():
+            if name not in pending:
+                continue
+            if age < CATEGORY_COUNT_TTL:
+                _category_count_cache[name] = total
+                counts[name] = total
+            else:
+                stale[name] = total
+        pending = [n for n in pending if n not in counts]
     if not pending:
         return counts
 
@@ -7525,9 +7887,9 @@ def _category_external_counts(names, want_external: bool):
                 try:
                     counts[name] = fut.result()
                 except Exception:
-                    counts[name] = None
+                    counts[name] = stale.get(name)
             else:
-                counts[name] = None
+                counts[name] = stale.get(name)
     finally:
         # Don't join: a straggler keeps running and warms the cache for next time.
         pool.shutdown(wait=False)
@@ -12469,6 +12831,9 @@ ensure_experiment_schema()
 ensure_email_schema()
 # Password reset tokens + Google sign-in columns on users.
 ensure_auth_schema()
+# Open Food Facts category counts that outlive a restart, so the categories page
+# is complete on the first request after the free tier wakes up.
+ensure_category_count_schema()
 
 if __name__ == "__main__":
     import uvicorn
