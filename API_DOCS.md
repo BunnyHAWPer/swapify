@@ -1,5 +1,77 @@
 # Swapify Backend Documentation
 
+## 2 August Update — Auto-fill coverage, safety-net honesty, cross-brand guard
+
+Two auto-fill bugs fixed and one diagnostic made truthful, all in
+[`src/app.py`](src/app.py). `python test_scoring_spec.py` still passes 100/100, and
+`test_api.sh` / `test_api.ps1` / `test_live_api.ps1` gained sections `128a`–`128e`.
+
+**An empty Open Food Facts row no longer ends the lookup.** OFF lists many Indian
+packs as a name, a category and a photo with an **empty `nutriments` object**, and
+frequently holds the *same* pack again under a neighbouring GTIN with the full panel
+— Amul Butter is `8901262010153` (empty) and `8901262010030` (all six nutrients).
+[`_source_openfoodfacts`](src/app.py) returned the empty row and stopped, so the
+source reported success having contributed nothing *and* the rest of the chain was
+skipped because the product had "been found". The barcode row is now kept for its
+identity (barcode, name, brand, image) while the search continues for a panel to
+merge into it, so the stored product is still that GTIN. The name fallback also
+reads deeper (`SWAPIFY_OFF_NAME_FALLBACK`, default 12 hits, was 6): OFF ranks on
+text relevance, not data completeness, so the empty duplicates of a popular pack
+crowd the top rows.
+
+> Measured: `/product/by-name/Amul Butter` went from **no nutrition at all** to
+> 740 kcal / 49 g saturated fat / 0.6 g protein per 100 g, sourced from Amul's own
+> OFF row. `Britannia Good Day Cashew` and `Maggi 2-Minute Noodles Masala` likewise
+> now fill from OFF.
+
+**A generic product can no longer answer a branded query.** `_name_is_relevant`
+required "at least half" of the query's identifying words. On a two-word
+brand+product query — the commonest shape in this catalogue — half is exactly one
+word, so any candidate that echoed the product noun and dropped the **brand** passed.
+`Kapiva Amla Juice` matched a *generic* `Amla Juice` (`juice` is a relevance
+stopword, making the ratio 1/2), and `Amul Butter` matched `Amul Taaza`, a milk. The
+bar is now a **strict majority**, so the brand token can no longer be the one that
+gets dropped. Callers that compare against a source keeping the brand in its own
+column pass `"<name> <brand>"`, so a row genuinely named "Butter" by brand "Amul"
+still clears the higher bar.
+
+> This was **live on production**: `GET /product/by-name/Kapiva Amla Juice` returned
+> `"brand": "Dabur"` with `data_estimated: true`. The correct answer for that product
+> is an honest 404 — see the note on Kapiva below.
+
+**[`GET /autofill/status?probe=true`](#get-autofillstatus) now measures usefulness,
+not hit count.** The probe reported a provider as `ok` when it returned *any*
+results, which made the weakest provider look like the healthiest: measured from two
+different IPs, Bing's keyless RSS endpoint answers every packaged-product query with
+the **brand's home page**, and ignores a `site:` filter entirely — the identical home
+page came back for `site:bigbasket.com`, `site:amazon.in`, `site:1mg.com` and five
+others. Five results, none of them a page with a panel on it. The probe now opens the
+top hits and tries to extract nutrition; each entry gains **`nutrition_parsed`**
+(plus `parsed_fields` and `parsed_from` when it succeeds), and **`ok` means that
+extraction succeeded**. URL depth was tried first and rejected as a proxy —
+`nutella.com/in/en/` is a deep-looking path and still a home page.
+
+| Provider | Configured | Result of a real probe |
+|---|---|---|
+| `serpapi`, `google_cse` | needs a key | skipped |
+| `duckduckgo` | keyless | HTTP 202 challenge, 0 results |
+| `duckduckgo_lite`, `mojeek` | keyless | 0 results |
+| `bing` | keyless | 5 results, **0 parseable** — brand home pages |
+
+**Consequence, stated plainly: the Google safety net cannot work without a key.**
+Every keyless engine is either refusing server IPs or returning home pages, so no
+amount of code makes the net find a nutrition page. Set `GOOGLE_API_KEY` +
+`GOOGLE_CSE_ID` (free tier, 100 queries/day — see the [30 July section](#30-july-update--auto-fill-google-net-uncapped-categories)).
+`has_dependable_search` and the `warning` field on `/autofill/status` report this
+without a probe.
+
+> **Kapiva Amla Juice specifically.** OFF holds its barcode (`8901207034145`) with an
+> empty `nutriments` object; USDA and IFCT do not carry it; FatSecret has no Kapiva
+> brand entry. With a search key its nutrition page yields **calories and sugar**;
+> saturated fat and sodium appear on no public source at all and would need a manual
+> entry from the physical label. Until then a **404 is the correct response** — the
+> previous behaviour of answering with Dabur's data was worse than answering nothing.
+
 ## 31 July Update — Password reset + Google sign-in
 
 Three new auth features, plus the diagnostics that make each of them provably
@@ -498,6 +570,31 @@ and whether it is in cooldown, and warns when no *keyed* search provider is set:
  "warning": "No keyed search provider is configured, so the Google safety net depends on keyless engines that rate-limit server IPs … set GOOGLE_API_KEY and GOOGLE_CSE_ID. Free tier: 100 queries/day."}
 ```
 
+**`?probe=true`** (admin, `X-Admin-Token`) runs a real query through every configured
+provider **and opens its top hits to try to extract nutrition**. Counting results is
+not a health check: a provider that answers every packaged-product query with the
+brand's home page returns five results and zero usable pages. `ok` therefore means
+*nutrition was extracted*, never merely that hits came back.
+
+| Field | Meaning |
+|---|---|
+| `results` | How many hits the provider returned |
+| `nutrition_parsed` | Whether a panel could actually be read from them |
+| `ok` | Alias of `nutrition_parsed` — the provider can feed the safety net |
+| `parsed_fields` / `parsed_from` | Which nutrients were read, and from which URL |
+| `sample_url` | First hit, so a home-page-only answer is visible at a glance |
+| `hint` | Why a provider is unusable (challenge page, home pages, API not enabled) |
+| `skipped` | Provider needs a key that is not set |
+
+```json
+{"provider": "bing", "results": 5, "nutrition_parsed": false, "ok": false,
+ "seconds": 1.13, "sample_url": "https://www.nutella.com/in/en/",
+ "hint": "Answered, but nothing on the pages it returned could be parsed as nutrition …"}
+```
+
+The probe costs up to `_PROBE_PAGES_PER_PROVIDER` (2) page fetches per provider,
+which is why it is admin-gated; without the header it returns **403**.
+
 ### 1. Get Product Details API
 This endpoint returns all the detailed information (ingredients, nutritional facts) for a given product by its barcode. It also records the scan in the scan history if `device_id` is provided.
 
@@ -712,6 +809,14 @@ next scan of that product is served locally with no network call. If every sourc
 fails, the product is flagged for manual review (`missing_reports`) and the endpoint
 returns `404`.
 
+> **"Found" and "has nutrition" are different things (fixed 2 August).** A source is
+> only treated as having contributed when one of the six core nutrients actually
+> carries a value. Open Food Facts returns plenty of Indian packs as a name, a
+> category and a photo with an empty `nutriments` object; those rows are non-empty on
+> every fillable-field test while contributing nothing a score can be computed from,
+> and returning one used to end the whole chain. See the
+> [2 August update](#2-august-update--auto-fill-coverage-safety-net-honesty-cross-brand-guard).
+
 **Fixes (July 30) — why products with missing data showed nothing:**
 
 - **Source 4 (IFCT) was a dead no-op.** No dataset ever shipped, so
@@ -813,6 +918,12 @@ Guards on what it will believe:
 - **Relevance** — a result's title/snippet (and a page's opening text) must pass
   the same `_name_is_relevant` check as the other sources, so a search for "Kapiva
   Wild Amla Juice" can never be answered with Dabur's amla juice panel.
+  **This guarantee only became true on 2 August.** The gate accepted "at least
+  half" of the query's identifying words, and on a two-word brand+product query
+  half is exactly one word — so a candidate that echoed the product noun and
+  dropped the brand passed. Production really was returning `"brand": "Dabur"` for
+  `/product/by-name/Kapiva Amla Juice`. A **strict majority** is now required; see
+  the [2 August update](#2-august-update--auto-fill-coverage-safety-net-honesty-cross-brand-guard).
 - **Serving-size awareness** — the reference quantity is detected per nutrition
   block and everything is rescaled to per-100g. Reading a panel as if it were
   already per-100g turns a 500 g bottle's 200 kcal into a 200 kcal/100 g juice.
